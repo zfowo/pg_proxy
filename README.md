@@ -3,19 +3,17 @@ pg_proxy.py [conf_file]
 =======================
 * 配置文件conf_file是个python文件，里面有一个dict对象pg_proxy_conf，该字典包含下面这些项：
 
-    'listen' : (host, port)                               指定监听的ip和端口。
-    'master' : (host, port)                               指定主库地址。
-    'conninfo' : {'name':value, ...}                      指定用于连接到master和promote的用户名/数据库/密码等，必须是超级用户。
-                                                          可以指定的name有：user/pw/db/conn_retry_num/conn_retry_interval/query_interval/lo_oid。user必须指定。
-    'promote' : (host, port)                              指定用于提升为主库的从库的地址。
-    'slaver_list' : [(host, port), ...]                   指定用于只读连接的从库列表。
-    'idle_cnn_timeout' : 300                              指定空闲连接的lifetime，单位是秒。
-    'active_cnn_timeout' : 300                            指定活动连接空闲时间限制，如果空闲时间超时，那么就断开fe的连接。如果为0那就不限制空闲时间。(目前不支持扩展查询协议)
-    'recv_sz_per_poll' : 4                                每次poll一个连接上最多接收多少数据，单位是K。
-    'disable_conds_list' : [[(name, value), ...], ...]    当active_cnn_timeout>0，可以用该参数指定不限制空闲时间的连接。可以指定的name有user/database以及其他可以出现在startup消息包中的项名。
-    'pg_proxy_pw' : 'pg2pg'                               指定连接到伪数据库pg_proxy的时候需要的密码。
-    'log' : {'name' : value, ...}                         指定logging相关的配置，可以指定的项有：filename, level。level可以设为logging.DEBUG/INFO/WARNING/ERROR。
-                                                          不指定filename则往stderr输出。
+        'listen' : (host, port)                               指定监听的ip和端口。
+        'master' : (host, port)                               指定主库地址。
+        'conninfo' : {'name':value, ...}                      指定用于连接到master和promote的用户名/数据库/密码等，必须是超级用户。可以指定的name有：user/pw/db/conn_retry_num/conn_retry_interval/query_interval/lo_oid。user必须指定。
+        'promote' : (host, port)                              指定用于提升为主库的从库的地址。
+        'slaver_list' : [(host, port), ...]                   指定用于只读连接的从库列表。
+        'idle_cnn_timeout' : 300                              指定空闲连接的lifetime，单位是秒。
+        'active_cnn_timeout' : 300                            指定活动连接空闲时间限制，如果空闲时间超时，那么就断开fe的连接。如果为0那就不限制空闲时间。(目前不支持扩展查询协议)
+        'recv_sz_per_poll' : 4                                每次poll一个连接上最多接收多少数据，单位是K。
+        'disable_conds_list' : [[(name, value), ...], ...]    当active_cnn_timeout>0，可以用该参数指定不限制空闲时间的连接。可以指定的name有user/database以及其他可以出现在startup消息包中的项名。
+        'pg_proxy_pw' : 'pg2pg'                               指定连接到伪数据库pg_proxy的时候需要的密码。
+        'log' : {'name' : value, ...}                         指定logging相关的配置，可以指定的项有：filename, level。level可以设为logging.DEBUG/INFO/WARNING/ERROR。不指定filename则往stderr输出。
 * 注：master/promote/slaver_list不支持unix domain socket。listen也不支持unix domain socket。
 
 * pg_proxy根据用户名把连接转发到主库或者从库，用户名以'_r'结尾的连接都转发到从库，用roundrobin方式来选择从库。
