@@ -1295,7 +1295,7 @@ class worker_process_base(object):
     def __init__(self, pid, idx):
         self.pid = pid
         self.idx = idx
-        self.ep = None
+        self.ep = None # 到子进程的socket连接。子进程在启动时会连接到主进程的UDS(unix domain socket)。
     def fileno(self):
         return self.ep.fileno()
     def close(self):
@@ -1397,6 +1397,8 @@ class proxy_worker_process(worker_process_base):
                 startup_msg_raw = msg_data[msg_len:]
                 pair_id, is_complete_disconn, status_time, main_use_idle_cnn, proxy_use_idle_cnn = (int(x) for x in sub_data.split(';'))
                 
+                if startup_msg_raw not in self.startup_msg_raw_to_conn_map:
+                    self.startup_msg_raw_to_conn_map[startup_msg_raw] = 0
                 logging.debug('(main_use_idle_cnn, proxy_use_idle_cnn) = (%d, %d)', main_use_idle_cnn, proxy_use_idle_cnn)
                 conn_info = self.proxy_conn_info_map.get(pair_id, None)
                 if not conn_info: # 全新的fe_be_pair，之前没有发送'C'消息。
@@ -1406,8 +1408,6 @@ class proxy_worker_process(worker_process_base):
                     logging.debug('can not find proxy_conn_info for pair_id(%d)', pair_id)
                     return
                 # TODO:检查conn_info中的信息是否与消息中的一致
-                if startup_msg_raw not in self.startup_msg_raw_to_conn_map:
-                    self.startup_msg_raw_to_conn_map[startup_msg_raw] = 0
                 if is_complete_disconn: # 全新的fe_be_pair，之前发送过'C'消息。或者 空闲的fe_be_pair
                     self.proxy_conn_info_map.pop(pair_id)
                     if not conn_info.fe_ip: # 空闲的fe_be_pair
@@ -2683,6 +2683,7 @@ if __name__ == '__main__':
     else:
         print('usage: %s [conf_file]' % (sys.argv[0], ))
         sys.exit(1)
+    
     g_conf = read_conf_file(g_conf_file)
     w = get_max_len(g_conf['_print_order'])
     for k in g_conf['_print_order']: 
@@ -2807,7 +2808,7 @@ if __name__ == '__main__':
                 try:
                     fobj.recv()
                 except Exception as ex:
-                    logging.info('Exception: %s', str(ex))
+                    logging.info('pending_fe_connection.recv error: Exception: %s', str(ex))
                     poll.unregister(fobj)
                     fobj.close()
                     pending_fe_conns.remove(fobj)
@@ -2824,7 +2825,7 @@ if __name__ == '__main__':
                     else:
                         poll.register(fobj, poll.POLLIN)
                 except Exception as ex:
-                    logging.info('Exception: %s', str(ex))
+                    logging.info('pseudo_pg error: Exception: %s', str(ex))
                     #traceback.print_exc()
                     poll.unregister(fobj)
                     pseudo_db_list.remove(fobj)
