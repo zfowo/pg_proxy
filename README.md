@@ -16,7 +16,7 @@ pg_proxy.py [conf_file]
         'log' : {'name' : value, ...}                         指定logging相关的配置，可以指定的项有：filename, level。level可以设为logging.DEBUG/INFO/WARNING/ERROR。不指定filename则往stderr输出。
 * 注：master/promote/slaver_list不支持unix domain socket。listen也不支持unix domain socket。
 
-* pg_proxy根据用户名把连接转发到主库或者从库，用户名以'_r'结尾的连接都转发到从库，用roundrobin方式来选择从库。
+* pg_proxy根据用户名把连接转发到主库或者从库，用户名后面添加'@ro'的连接都转发到从库，用roundrobin方式来选择从库。
 
 * 当主库down掉后，如果指定了promote配置，那么就会把它提升为主库。如果指定了promote，那么slaver_list中的
 从库必须连接到promote这个从库，而不是直接连接到master。此外在主库中必须创建一个OID为9999的内容为空的大对象。
