@@ -1213,7 +1213,7 @@ class uds_ep(object):
 #                                                         不指定filename则往stderr输出。
 #   注：master/promote/slaver_list不支持unix domain socket。listen也不支持unix domain socket。
 # 
-# pg_proxy根据用户名把连接转发到主库或者从库，用户名以'_r'结尾的连接都转发到从库，用roundrobin方式来选择从库。
+# pg_proxy根据用户名把连接转发到主库或者从库，用户名后面添加'@ro'的连接都转发到从库，用roundrobin方式来选择从库。
 # 
 # 当主库down掉后，如果指定了promote配置，那么就会把它提升为主库。如果指定了promote，那么slaver_list中的
 # 从库必须连接到promote这个从库，而不是直接连接到master。此外在主库中必须创建一个OID为9999的内容为空的大对象。
@@ -2269,6 +2269,7 @@ class pending_fe_connection(object):
         self.s.settimeout(0)
         self.startup_msg_raw = b''
         self.startup_msg = None
+        self.is_readonly_user = False
     def fileno(self):
         return self.s.fileno()
     def close(self):
@@ -2283,10 +2284,22 @@ class pending_fe_connection(object):
     def check_startup(self):
         if startup_msg_is_complete(self.startup_msg_raw):
             self.startup_msg = process_Startup(self.startup_msg_raw[4:])
+            self._process_readonly_user()
             # 重新生成消息的raw数据，因为make_StartupMessage2对参数名进行排序，这样就可以通过raw数据来比较startup msg了。
             self.startup_msg_raw = make_Startup1(self.startup_msg) 
             return True
         return False
+    def _proces_readonly_user(self):
+        if not self.is_StartupMessageV3():
+            return
+        param_list = self.startup_msg[3]
+        for i in range(len(param_list)):
+            if param_list[i][0] == b'user\x00':
+                v = param_list[i][1]
+                if v.endswith(b'@ro\x00'):
+                    param_list[i] = (b'user\x00', v[:-4] + b'\x00')
+                    self.is_readonly_user = True
+                    break
     def is_SSLRequest(self):
         return self.startup_msg[0] == 'SSLRequest'
     def is_CancelRequest(self):
@@ -2866,7 +2879,7 @@ if __name__ == '__main__':
             if dbname == b'pg_proxy\x00':
                 pseudo_db_cnns.append(cnn)
                 continue
-            if user[-3:] == b'_r\x00' and g_conf['slaver_list']:
+            if cnn.is_readonly_user and g_conf['slaver_list']:
                 slaver_selected = True
                 be_addr = g_conf['slaver_list'][next_slaver_idx%len(g_conf['slaver_list'])]
             else:
