@@ -2269,7 +2269,9 @@ class pending_fe_connection(object):
         self.s.settimeout(0)
         self.startup_msg_raw = b''
         self.startup_msg = None
-        self.is_readonly_user = False
+        self._is_readonly = False
+    def is_readonly(self):
+        return self._is_readonly
     def fileno(self):
         return self.s.fileno()
     def close(self):
@@ -2284,21 +2286,21 @@ class pending_fe_connection(object):
     def check_startup(self):
         if startup_msg_is_complete(self.startup_msg_raw):
             self.startup_msg = process_Startup(self.startup_msg_raw[4:])
-            self._process_readonly_user()
+            self._process_readonly()
             # 重新生成消息的raw数据，因为make_StartupMessage2对参数名进行排序，这样就可以通过raw数据来比较startup msg了。
             self.startup_msg_raw = make_Startup1(self.startup_msg) 
             return True
         return False
-    def _proces_readonly_user(self):
+    def _process_readonly(self):
         if not self.is_StartupMessageV3():
             return
         param_list = self.startup_msg[3]
         for i in range(len(param_list)):
-            if param_list[i][0] == b'user\x00':
+            if param_list[i][0] == b'database\x00':
                 v = param_list[i][1]
-                if v.endswith(b'@ro\x00'):
-                    param_list[i] = (b'user\x00', v[:-4] + b'\x00')
-                    self.is_readonly_user = True
+                if v.endswith(b'@\x00'):
+                    param_list[i] = (b'database\x00', v[:-2] + b'\x00')
+                    self._is_readonly = True
                     break
     def is_SSLRequest(self):
         return self.startup_msg[0] == 'SSLRequest'
@@ -2645,7 +2647,7 @@ def sigterm_handler(signum, frame):
     os.unlink(g_conf['pid_file'])
     sys.exit(0)
 def read_conf_file(conf_file):
-    f = open(conf_file)
+    f = open(conf_file, encoding='gbk')
     data = f.read()
     f.close()
     this_path = os.path.dirname(conf_file)
@@ -2879,7 +2881,7 @@ if __name__ == '__main__':
             if dbname == b'pg_proxy\x00':
                 pseudo_db_cnns.append(cnn)
                 continue
-            if cnn.is_readonly_user and g_conf['slaver_list']:
+            if cnn.is_readonly() and g_conf['slaver_list']:
                 slaver_selected = True
                 be_addr = g_conf['slaver_list'][next_slaver_idx%len(g_conf['slaver_list'])]
             else:
