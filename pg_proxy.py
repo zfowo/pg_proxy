@@ -668,6 +668,14 @@ PG_SSLREQUEST_CODE    = 80877103
 # 由于没有对应的消息类型，返回结果中用b'\x00'来代替消息类型。
 # msg_data不包含表示消息长度的那4个字节。
 # 
+# V3 StartupMsg的详情参见postmaster.c中的ProcessStartupPacket函数。
+# 可以包含下面这些：
+#   database
+#   user
+#   options       命令行选项
+#   replication   有效值true/false/1/0/database，database表示连接到database选项指定的数据库，一般用于逻辑复制。
+#   <guc option>  其他guc选项。比如: client_encoding/application_name
+# 
 def process_Startup(msg_data):
     idx = 0
     code = struct.unpack('>i', msg_data[idx:idx+4])[0]
@@ -1516,6 +1524,7 @@ class fe_be_pair(object):
             self.send_disconnect_msg_to_main(poll, False)
             return False
     # startup_msg_raw包括开头那表示消息长度的4个字节
+    # 建立到be的新的连接
     def start(self, poll, fe_be_to_pair_map, be_addr, startup_msg, fd):
         self.s_fe = socket.fromfd(fd, socket.AF_INET, socket.SOCK_STREAM)
         os.close(fd)
@@ -1539,6 +1548,7 @@ class fe_be_pair(object):
         
         if self.enable_active_cnn_timeout:
             self.query_recved_time = self.ready_for_query_recved_time = time.time()
+    # 复用be连接
     def start2(self, poll, fe_be_to_pair_map, be_addr, startup_msg, fd):
         self.auth_msg_idx = 0
         self.auth_simulate = True
@@ -1783,6 +1793,25 @@ class fe_be_pair(object):
         self.main_use_idle_cnn = -1
         self.proxy_use_idle_cnn = -1
 
+# 找到可用的匹配的idle pair
+# 返回(pair, has_matched)
+#   pair != None, has_matched = True     有匹配的可用的idle pair
+#   pair = None,  has_matched = True     有匹配的但是目前还不可能的idle pair
+#   pair = None,  has_matched = False    没有匹配的idle pair
+def find_matched_idle_pair(idle_pair_list, be_addr):
+    pair = None
+    has_matched = False
+    for p in idle_pair_list:
+        if not p.s_be:
+            logging.info('[find_matched_idle_pair] p.s_be is None')
+            continue
+        if p.s_be.getpeername() != be_addr:
+            continue
+        has_matched = True
+        if p.discard_all_command_complete_recved and p.discard_all_ready_for_query_recved:
+            pair = p
+            break
+    return (pair, has_matched)
 def proxy_worker(ipc_uds_path):
     # 先建立到主进程的连接
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -1793,7 +1822,8 @@ def proxy_worker(ipc_uds_path):
     poll = spoller()
     poll.register(ipc_ep, poll.POLLIN)
     fe_be_to_pair_map = {} # s_fe/s_be -> fe_be_pair
-    startup_msg_raw_to_pair_map = {} # 可复用的pair。startup_msg_raw -> [pair1, ...]
+    startup_msg_raw_to_idle_pair_map = {} # 可复用的pair。startup_msg_raw -> [pair1, ...]
+    idle_pair_map = {} # (startup_msg_raw, be_ip, be_port) -> [pair1, ...]
     msglist_from_main = []
     waiting_fmsg_list = [] # 等待处理的'f'消息列表
     
@@ -1826,9 +1856,9 @@ def proxy_worker(ipc_uds_path):
                     else:
                         pair.handle_event2(poll, fobj, event)
                 except (fe_disconnected_exception, be_disconnected_exception) as ex:
-                    if pair.startup_msg_raw not in startup_msg_raw_to_pair_map:
-                        startup_msg_raw_to_pair_map[pair.startup_msg_raw] = []
-                    idle_pair_list = startup_msg_raw_to_pair_map[pair.startup_msg_raw]
+                    if pair.startup_msg_raw not in startup_msg_raw_to_idle_pair_map:
+                        startup_msg_raw_to_idle_pair_map[pair.startup_msg_raw] = []
+                    idle_pair_list = startup_msg_raw_to_idle_pair_map[pair.startup_msg_raw]
                     
                     if pair.close(poll, ex, fe_be_to_pair_map):
                         if pair in idle_pair_list:
@@ -1847,9 +1877,9 @@ def proxy_worker(ipc_uds_path):
                     pair_set.add(pair)
                 oldest_time = time.time()
                 for pair in pair_set:
-                    if pair.startup_msg_raw not in startup_msg_raw_to_pair_map:
-                        startup_msg_raw_to_pair_map[pair.startup_msg_raw] = []
-                    idle_pair_list = startup_msg_raw_to_pair_map[pair.startup_msg_raw]
+                    if pair.startup_msg_raw not in startup_msg_raw_to_idle_pair_map:
+                        startup_msg_raw_to_idle_pair_map[pair.startup_msg_raw] = []
+                    idle_pair_list = startup_msg_raw_to_idle_pair_map[pair.startup_msg_raw]
                     if t - pair.ready_for_query_recved_time >= g_conf['active_cnn_timeout']:
                         logging.info('close s_fe in fe_be_pair because active_cnn_timeout: %d', pair.id)
                         pair.close(poll, fe_disconnected_exception(), fe_be_to_pair_map)
@@ -1869,15 +1899,14 @@ def proxy_worker(ipc_uds_path):
                 startup_msg = process_Startup(startup_msg_raw[4:])
                 fd = msg[2][0]
                 
-                idle_pair_list = startup_msg_raw_to_pair_map.get(startup_msg_raw, None)
-                if idle_pair_list:
-                    for pair in idle_pair_list:
-                        if pair.discard_all_command_complete_recved and pair.discard_all_ready_for_query_recved:
-                            idle_pair_list.remove(pair)
-                            pair.main_use_idle_cnn = use_idle_cnn
-                            pair.proxy_use_idle_cnn = 1
-                            pair.start2(poll, fe_be_to_pair_map, addr, startup_msg, fd)
-                            break
+                idle_pair_list = startup_msg_raw_to_idle_pair_map.get(startup_msg_raw, None)
+                pair, has_matched = find_matched_idle_pair(idle_pair_list, addr)
+                if has_matched:
+                    if pair:
+                        idle_pair_list.remove(pair)
+                        pair.main_use_idle_cnn = use_idle_cnn
+                        pair.proxy_use_idle_cnn = 1
+                        pair.start2(poll, fe_be_to_pair_map, addr, startup_msg, fd)
                     else: # 空闲的fe_be_pair目前还都不可用，需要等待。
                         waiting_fmsg_list.append((addr, startup_msg, fd, startup_msg_raw, use_idle_cnn))
                 else:
@@ -1901,17 +1930,16 @@ def proxy_worker(ipc_uds_path):
             startup_msg_raw = msg[3]
             use_idle_cnn = msg[4]
             
-            idle_pair_list = startup_msg_raw_to_pair_map.get(startup_msg_raw, None)
-            if idle_pair_list:
-                for pair in idle_pair_list:
-                    if pair.discard_all_command_complete_recved and pair.discard_all_ready_for_query_recved:
-                        idle_pair_list.remove(pair)
-                        pair.main_use_idle_cnn = use_idle_cnn
-                        pair.proxy_use_idle_cnn = 1
-                        pair.start2(poll, fe_be_to_pair_map, addr, startup_msg, fd)
-                        del_list.append(msg)
-                        break
-            else:
+            idle_pair_list = startup_msg_raw_to_idle_pair_map.get(startup_msg_raw, None)
+            pair, has_matched = find_matched_idle_pair(idle_pair_list, addr)
+            if has_matched:
+                if pair:
+                    idle_pair_list.remove(pair)
+                    pair.main_use_idle_cnn = use_idle_cnn
+                    pair.proxy_use_idle_cnn = 1
+                    pair.start2(poll, fe_be_to_pair_map, addr, startup_msg, fd)
+                    del_list.append(msg)
+            else: # 没有匹配的idle pair, 可能上次检查的时候找到匹配但还不可用的pair已经close掉了。
                 if g_conf['active_cnn_timeout'] <= 0 or match_conds(startup_msg, addr, g_conf['disable_conds_list']): # g_conf is global var
                     pair = fe_be_pair(ipc_ep, False)
                 else:
@@ -1925,9 +1953,9 @@ def proxy_worker(ipc_uds_path):
         del_list = None
         # 关闭超时的空闲fe_be_pair
         t = time.time()
-        for k in startup_msg_raw_to_pair_map:
+        for k in startup_msg_raw_to_idle_pair_map:
             close_list = []
-            idle_pair_list = startup_msg_raw_to_pair_map[k]
+            idle_pair_list = startup_msg_raw_to_idle_pair_map [k]
             for pair in idle_pair_list:
                 if t - pair.status_time >= g_conf['idle_cnn_timeout']: # g_conf is global var
                     close_list.append(pair)
