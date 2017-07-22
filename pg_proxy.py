@@ -1340,8 +1340,15 @@ class proxy_worker_process(worker_process_base):
         for cnn in del_cnns:
             self.closing_fe_cnn_list.remove(cnn)
         del_cnns.clear()
-    def has_matched_idle_conn(self, startup_msg_raw):
-        return (startup_msg_raw in self.startup_msg_raw_to_conn_map) and (self.startup_msg_raw_to_conn_map[startup_msg_raw] > 0)
+    def has_matched_idle_conn(self, startup_msg_raw, be_addr):
+        if (startup_msg_raw not in self.startup_msg_raw_to_conn_map) or 
+           (self.startup_msg_raw_to_conn_map[startup_msg_raw] <= 0):
+            return False
+        for id in self.proxy_conn_info_map:
+            ci = self.proxy_conn_info_map[id]
+            if ci.startup_msg_raw == startup_msg_raw and be_addr == (ci.be_ip, ci.be_port):
+                return True
+        return False
     def remove_idle_conn(self, startup_msg_raw):
         self.startup_msg_raw_to_conn_map[startup_msg_raw] -= 1
     def get_active_cnn_num(self):
@@ -1792,7 +1799,7 @@ class fe_be_pair(object):
         poll.register(self.ep_to_main, poll.POLLIN|poll.POLLOUT)
         self.main_use_idle_cnn = -1
         self.proxy_use_idle_cnn = -1
-
+# 
 # 找到可用的匹配的idle pair
 # 返回(pair, has_matched)
 #   pair != None, has_matched = True     有匹配的可用的idle pair
@@ -1801,6 +1808,8 @@ class fe_be_pair(object):
 def find_matched_idle_pair(idle_pair_list, be_addr):
     pair = None
     has_matched = False
+    if not idle_pair_list:
+        return (pair, has_matched)
     for p in idle_pair_list:
         if not p.s_be:
             logging.info('[find_matched_idle_pair] p.s_be is None')
@@ -2922,7 +2931,8 @@ if __name__ == '__main__':
             for p in proxy_worker_pobj_list:
                 if not p.is_connected():
                     continue
-                if p.has_matched_idle_conn(cnn.startup_msg_raw):
+                if p.has_matched_idle_conn(cnn.startup_msg_raw, be_addr):
+                    logging.info('[%d]found idle cnn to %s for %s' % (p.pid, be_addr, cnn.startup_msg))
                     p.put_msg(b'f', make_f_msg_data(be_addr, 1, cnn.startup_msg_raw), [cnn.fileno()])
                     p.add_closing_fe_cnn(cnn)
                     p.remove_idle_conn(cnn.startup_msg_raw)
@@ -2939,6 +2949,7 @@ if __name__ == '__main__':
                 logging.warning('all pobj in proxy_worker_pobj_list are not connected')
                 break
             # 发给当前活动连接数最少的proxy进程。
+            logging.info('[%d]no idle cnn to %s for %s' % (pobj.pid, be_addr, cnn.startup_msg))
             pobj.put_msg(b'f',  make_f_msg_data(be_addr, 0, cnn.startup_msg_raw), [cnn.fileno()])
             pobj.add_closing_fe_cnn(cnn)
             if pobj.pending_cnn_num < 0:
