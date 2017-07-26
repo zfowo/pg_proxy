@@ -1341,7 +1341,7 @@ class proxy_worker_process(worker_process_base):
             self.closing_fe_cnn_list.remove(cnn)
         del_cnns.clear()
     def has_matched_idle_conn(self, startup_msg_raw, be_addr):
-        if (startup_msg_raw not in self.startup_msg_raw_to_conn_map) or 
+        if (startup_msg_raw not in self.startup_msg_raw_to_conn_map) or \
            (self.startup_msg_raw_to_conn_map[startup_msg_raw] <= 0):
             return False
         for id in self.proxy_conn_info_map:
