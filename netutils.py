@@ -1,10 +1,10 @@
 #!/bin/env python3
 # -*- coding: GBK -*-
 # 
-# poller base class
+# poller classes
 # 
-import sys, os, socket, struct
-import select
+import sys, os, errno, struct
+import socket, select
 import logging
 
 if os.name == 'posix':

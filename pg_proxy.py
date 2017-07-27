@@ -1,4 +1,3 @@
-#************************************************************************************************************************************************
 #!/bin/evn python3
 # -*- coding: GBK -*-
 # 
@@ -50,9 +49,8 @@
 #    .) P->M 当连接建立或者断开的时候P会把连接信息发给M。
 # .) M和W之间主要是M向W发送工作任务消息。当前的工作任务消息有：发送CancelRequest；发送切换结果。
 # 
-import sys, os, struct, socket, time, errno, hashlib
+import sys, os, struct, socket, time, errno
 import traceback
-import select
 import signal
 import sqlite3
 import re, logging
