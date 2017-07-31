@@ -15,6 +15,17 @@ def read_conf_file(conf_file, conf_name):
     exec(data, None, local_dict)
     return local_dict.pop(conf_name)
 
+def read_conf(this_path):
+    if len(sys.argv) == 1:
+        conf_file = os.path.join(this_path, 'pg_proxy.conf.py')
+    elif len(sys.argv) == 2:
+        conf_file = sys.argv[1]
+    else:
+        print('usage: %s [conf_file]' % (sys.argv[0], ))
+        sys.exit(1)
+    x = read_conf_file(conf_file, 'all')
+    return x
+
 def close_fobjs(x_list):
     for x in x_list:
         if type(x) == list:

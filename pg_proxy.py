@@ -792,7 +792,8 @@ def process_promote_result(msg_data):
         # 这里需要发送报警邮件
         logging.warning('promote fail:%s' % (msg_data[1:], ))
     else:
-        addr_list = msg_data[1:].split(';')
+        logging.info('promote succeed:%s' % (msg_data[1:], ))
+        addr_list = [x.split(',') for x in msg_data[1:].split(';')]
         g_conf['master'] = (addr_list[0][0], int(addr_list[0][1]))
         s_list = []
         for addr in addr_list[1:]:
@@ -1044,20 +1045,13 @@ def sigterm_handler(signum, frame):
 # main
 proxy_worker_pobj_list = []
 work_worker_pobj_list = []
-g_conf_file = None
+g_all_conf = None
 g_conf = None
 # TODO: 主进程在检测到work子进程退出后，重启work子进程。
 # TODO: SIGUSR1信号重新打开日志文件。
-if __name__ == '__main__':
-    if len(sys.argv) == 1:
-        g_conf_file = os.path.join(os.path.dirname(__file__), 'pg_proxy.conf.py')
-    elif len(sys.argv) == 2:
-        g_conf_file = sys.argv[1]
-    else:
-        print('usage: %s [conf_file]' % (sys.argv[0], ))
-        sys.exit(1)
-    
-    g_conf = read_conf_file(g_conf_file, 'pg_proxy_conf')
+if __name__ == '__main__':    
+    g_all_conf = read_conf(os.path.dirname(__file__))
+    g_conf = g_all_conf['pg_proxy']
     w = get_max_len(g_conf['_print_order'])
     for k in g_conf['_print_order']: 
         print(k.ljust(w), ' = ', g_conf[k])

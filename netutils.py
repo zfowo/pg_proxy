@@ -301,6 +301,17 @@ class uds_ep(object):
             if fd in msg[2]:
                 return False
         return True
+    # 
+    # 生成一个消息
+    # 
+    @staticmethod
+    def make_msg(msg_type, msg_data):
+        msg = b'' + msg_type
+        if type(msg_data) == str:
+            msg_data = msg_data.encode('utf8')
+        msg += struct.pack('>i', len(msg_data)+4)
+        msg += msg_data
+        return msg
 # main
 if __name__ == '__main__':
     pass

@@ -6,7 +6,7 @@
 -- 当主库down掉后，需要执行下面这些：
 --   1. 把数据最新的一个从库提升为主库。
 --   2. 在新的主库上创建其他从库用到的物理复制slot。
---   3. 修改其他从库的recovery.conf，把primary_conninfo中的host/port指向新的主库，然后杀死wal receiver进程。
+--   3. 修改其他从库的recovery.conf，把primary_conninfo中的host/port指向新的主库，然后重启pg。
 -- 
 
 -- 
