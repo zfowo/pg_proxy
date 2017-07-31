@@ -9,12 +9,12 @@ import mmap
 import contextlib
 
 @contextlib.contextmanager
-def timed_acquire(shm_obj, timeout=None):
-    shm_obj.acquire(timeout)
+def timed_acquire(sem_obj, timeout=None):
+    sem_obj.acquire(timeout)
     try:
-        yield shm_obj
+        yield sem_obj
     finally:
-        shm_obj.release()
+        sem_obj.release()
 
 class shm(object):
     PAGE_SIZE = ipc.PAGE_SIZE

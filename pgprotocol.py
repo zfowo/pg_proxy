@@ -15,8 +15,9 @@
 # 
 import sys, os
 import struct, socket, hashlib
+import logging
 
-from netutils import NONBLOCK_SEND_RECV_OK
+from netutils import myrecv, recv_size, NONBLOCK_SEND_RECV_OK
 
 # 
 # utility functions
@@ -737,18 +738,6 @@ def make_SSLRequest2():
     res = struct.pack('>i', 8)
     res += struct.pack('>i', PG_SSLREQUEST_CODE)
     return res
-# 
-# 接收消息函数
-# 
-def recv_size(s, sz):
-    ret = b'';
-    while sz > 0:
-        tmp = s.recv(sz)
-        if not tmp:
-            raise RuntimeError('the peer(%s) closed the connection. last recved:[%s]' % (s.getpeername(), ret));
-        ret += tmp
-        sz -= len(tmp)
-    return ret
 # 接收FE->BE的第一个消息。
 def recv_fe_startup_msg(s):
     msg_len = recv_size(s, 4)
@@ -765,7 +754,7 @@ def startup_msg_is_complete(data):
         return False
     msg_len = struct.unpack('>i', data[:4])[0]
     return data_len == msg_len
-# 接收下一个消息。
+# 接收下一个消息。不能用于接收来自fe的startup消息，用recv_fe_startup_msg函数接收。
 # 注意：本函数的性能不好但使用方便。如果要考虑性能，那么就批量接收数据，然后用parse_pg_msg等函数。
 def recv_pg_msg(s, process, msg_type_info = None, timeout = 0):
     s.settimeout(timeout)
@@ -909,6 +898,220 @@ def execute(s, sql):
     if ex:
         raise ex
     return (cmd_status, row_desc, row_list)
+
+def get_param_val_from_startupmsg(startup_msg, param_name):
+    if not (startup_msg[0] == 'StartupMessage' and startup_msg[2] == PG_PROTO_VERSION3_NUM):
+        raise SystemError('BUG: only can call get_param_val_from_startupmsg on StartupMessage of version 3' % (startup_msg, ))
+    if type(param_name) == str:
+        param_name = param_name.encode('latin1')
+    param_name = make_cstr(param_name)
+    for n, v in startup_msg[3]:
+        if param_name == n:
+            return v
+    return None
+# 
+# 下面这些和协议无关，但是依赖于协议，所以也放在本文件里。
+# 
+# 未接收完startup消息的fe连接
+class pending_fe_connection(object):
+    def __init__(self, s):
+        self.s = s
+        self.s.settimeout(0)
+        self.startup_msg_raw = b''
+        self.startup_msg = None
+        self._is_readonly = False
+    def is_readonly(self):
+        return self._is_readonly
+    def fileno(self):
+        return self.s.fileno()
+    def close(self):
+        self.s.close()
+    def recv(self):
+        data = myrecv(self.s, 1024*4)
+        if data == None:
+            return
+        if not data:
+            raise RuntimeError('the peer(%s) closed the connection' % (self.s.getpeername(), ))
+        self.startup_msg_raw += data
+    def check_startup(self):
+        if startup_msg_is_complete(self.startup_msg_raw):
+            self.startup_msg = process_Startup(self.startup_msg_raw[4:])
+            self._process_readonly()
+            # 重新生成消息的raw数据，因为make_StartupMessage2对参数名进行排序，这样就可以通过raw数据来比较startup msg了。
+            self.startup_msg_raw = make_Startup1(self.startup_msg) 
+            return True
+        return False
+    def _process_readonly(self):
+        if not self.is_StartupMessageV3():
+            return
+        param_list = self.startup_msg[3]
+        for i in range(len(param_list)):
+            if param_list[i][0] == b'database\x00':
+                v = param_list[i][1]
+                if v.endswith(b'@\x00'):
+                    param_list[i] = (b'database\x00', v[:-2] + b'\x00')
+                    self._is_readonly = True
+                    break
+    def is_SSLRequest(self):
+        return self.startup_msg[0] == 'SSLRequest'
+    def is_CancelRequest(self):
+        return self.startup_msg[0] == 'CancelRequest'
+    def is_StartupMessageV2(self):
+        return self.startup_msg[0] == 'StartupMessage' and self.startup_msg[2] == PG_PROTO_VERSION2_NUM
+    def is_StartupMessageV3(self):
+        return self.startup_msg[0] == 'StartupMessage' and self.startup_msg[2] == PG_PROTO_VERSION3_NUM
+    def get_param_val(self, param_name):
+        return get_param_val_from_startupmsg(self.startup_msg, param_name)
+# 
+# 伪pg数据库。派生类需要提供select_table函数，在该函数内根据表名发送相关的数据。包括消息：RowDescription / DataRow / CommandComplete
+#
+# recving_StartupMessage -> sending_AuthenticationMD5Password -> recving_PasswordMessage -> sending_AuthenticationOk -> recving_Query -> sending_QueryResult
+#                                                                         |                                                      |<---------------|
+#                                                                         |-> sending_ErrorResponse
+# 
+class pseudo_pg(object):
+    def __init__(self, password, s, startup_msg = None):
+        self.password = password
+        self.s = s
+        self.send_data = b''
+        self.recv_data = b''
+        self.startup_msg = None
+        self.client_encoding = None
+        self.status = 'recving_StartupMessage'
+        if startup_msg:
+            self.startup_msg = self.startup_msg_to_dict(startup_msg)
+            self.send_data = make_AuthenticationXXX2('AuthenticationMD5Password', b'1234')
+            self.status = 'sending_AuthenticationMD5Password'
+    def fileno(self):
+        return self.s.fileno()
+    def close(self):
+        self.s.close()
+    def send(self):
+        n = self.s.send(self.send_data)
+        self.send_data = self.send_data[n:]
+        if self.send_data:
+            return 'w'
+        
+        if self.status == 'sending_AuthenticationMD5Password':
+            self.status = 'recving_PasswordMessage'
+            return 'r'
+        if self.status == 'sending_ErrorResponse':
+            raise RuntimeError('close because ErrorResponse sent')
+        if self.status == 'sending_AuthenticationOk':
+            self.status = 'recving_Query'
+            return 'r'
+        if self.status == 'sending_QueryResult':
+            self.status = 'recving_Query'
+            return 'r'
+    def recv(self):
+        data = myrecv(self.s, 4*1024)
+        if data == None:
+            return 'r'
+        if not data:
+            raise RuntimeError('the peer(%s) closed the connection' % (self.s.getpeername(), ))
+        self.recv_data += data
+        
+        if self.status == 'recving_StartupMessage':
+            if not startup_msg_is_complete(self.recv_data):
+                return 'r'
+            msg = process_Startup(self.recv_data[4:])
+            self.recv_data = b''
+            logging.debug('recv: %s', msg)
+            if not (msg[0] == 'StartupMessage' and msg[2] == PG_PROTO_VERSION3_NUM):
+                raise RuntimeError('do not support this startup msg:%s' % (msg, ))
+            self.startup_msg = self.startup_msg_to_dict(msg)
+            self.send_data = make_AuthenticationXXX2('AuthenticationMD5Password', b'1234')
+            self.status = 'sending_AuthenticationMD5Password'
+            return 'w'
+        if self.status == 'recving_PasswordMessage':
+            res = parse_fe_msg(self.recv_data)
+            if not res[1]:
+                return 'r'
+            msg = res[1][0]
+            self.recv_data = self.recv_data[res[0]:]
+            logging.debug('recv: %s  recv_data:%s', msg, self.recv_data)
+            if msg[0] != 'PasswordMessage':
+                raise RuntimeError('this msg should be PasswordMessage:%s' % (msg, ))
+            msg1 = make_PasswordMessage1(msg)
+            msg2 = make_PasswordMessage2(self.password, self.startup_msg[b'user\x00'].rstrip(b'\x00'), b'1234')
+            logging.debug('msg2: %s  msg1: %s', msg2, msg1)
+            if msg2 != msg1:
+                self.send_data = make_ErrorResponse2([(b'S', b'ERROR'), (b'C', b'28P01'), (b'M', b'invalid password')])
+                self.status = 'sending_ErrorResponse'
+                return 'w'
+            else:
+                self.send_data = self.gen_auth_ok()
+                self.status = 'sending_AuthenticationOk'
+                return 'w'
+        if self.status == 'recving_Query':
+            res = parse_fe_msg(self.recv_data)
+            if not res[1]:
+                return 'r'
+            msg = res[1][0]
+            self.recv_data = self.recv_data[res[0]:]
+            logging.debug('recv: %s  recv_data:%s', msg, self.recv_data)
+            if msg[0] == 'Terminate':
+                raise RuntimeError('close because Terminate msg recved')
+            elif msg[0] != 'Query':
+                self.send_data = make_ErrorResponse2([(b'S', b'ERROR'), (b'C', b'0A000'), (b'M', b'only suport simple Query message')])
+                self.send_data += make_ReadyForQuery2(b'I')
+                self.status = 'sending_QueryResult'
+                return 'w'
+            else:
+                sql = msg[2].rstrip(b'\x00').decode(self.client_encoding).strip().rstrip(';').lower()
+                sql_elem_list = sql.split() # 只支持select ... from tablename [...]
+                tablename = None
+                for i in range(len(sql_elem_list)):
+                    if sql_elem_list[i] == 'from':
+                        tablename = sql_elem_list[i+1]
+                        break
+                if sql_elem_list[0] != 'select' or not tablename:
+                    self.send_data = make_ErrorResponse2([(b'S', b'ERROR'), (b'C', b'0A000'), (b'M', b'only suport sql such as "select ... from tablename ..."')])
+                    self.send_data += make_ReadyForQuery2(b'I')
+                    self.status = 'sending_QueryResult'
+                    return 'w'
+                self.send_data = self.select_table(tablename, sql)
+                self.send_data += make_ReadyForQuery2(b'I')
+                self.status = 'sending_QueryResult'
+                return 'w'
+        raise RuntimeError('BUG: unknown status: %s %s' % (self.status, self.recv_data))
+    def select_table(self, tablename, sql):
+        # 需要发送 RowDescription / DataRow / CommandComplete
+        data  = make_RowDescription2([(b'colume1', 0, 0, 25, -1, -1, 0)])
+        data += make_DataRow2([(4, b'aaaa')])
+        data += make_DataRow2([(5, b'bbbbb')])
+        data += make_CommandComplete2(b'SELECT 2')
+        return data
+    def gen_auth_ok(self):
+        data  = make_AuthenticationXXX2('AuthenticationOk')
+        data += make_ParameterStatus2(b'application_name', self.startup_msg.get(b'application_name\x00', b''))
+        self.client_encoding = self.startup_msg.get(b'client_encoding\x00', b'utf8')
+        data += make_ParameterStatus2(b'client_encoding', self.client_encoding)
+        self.client_encoding = self.client_encoding.rstrip(b'\x00').decode('latin1')
+        data += make_ParameterStatus2(b'DateStyle', b'ISO, MDY')
+        data += make_ParameterStatus2(b'integer_datetimes', b'on')
+        data += make_ParameterStatus2(b'IntervalStyle', b'postgres')
+        data += make_ParameterStatus2(b'is_superuser', b'on')
+        data += make_ParameterStatus2(b'server_encoding', b'UTF8')
+        data += make_ParameterStatus2(b'server_version', b'9.5devel')
+        data += make_ParameterStatus2(b'session_authorization', self.startup_msg.get(b'user\x00'))
+        data += make_ParameterStatus2(b'standard_conforming_strings', b'on')
+        data += make_ParameterStatus2(b'TimeZone', b'Asia/Chongqing')
+        data += make_BackendKeyData2(1, 123456)
+        data += make_ReadyForQuery2(b'I')
+        return data
+    def startup_msg_to_dict(self, startup_msg):
+        res = {}
+        for param in startup_msg[3]:
+            res[param[0]] = param[1]
+        return res
+    def make_row_desc(self, col_name_list):
+        common_desc = (0, 0, 25, -1, -1, 0)
+        col_desc_list = []
+        for colname in col_name_list:
+            col_desc_list.append((colname,) + common_desc)
+        data  = make_RowDescription2(col_desc_list)
+        return data
 
 # main
 if __name__ == '__main__':

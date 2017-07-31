@@ -166,6 +166,19 @@ def myrecv(s, bufsize):
         raise
     return data
 # 
+# 接收消息函数。s应该是阻塞的，也就是s.settimeout(None)。
+# 如果对端已经close则抛出RuntimeError异常。
+# 
+def recv_size(s, sz):
+    ret = b'';
+    while sz > 0:
+        tmp = s.recv(sz)
+        if not tmp:
+            raise RuntimeError('the peer(%s) closed the connection. last recved:[%s]' % (s.getpeername(), ret));
+        ret += tmp
+        sz -= len(tmp)
+    return ret
+# 
 # 通过unix domain socket进行通信，可以传递具体的消息以及文件描述符。
 # 消息格式：一字节的消息类型 + 四个字节的消息长度(包括本四个字节) + 消息数据。
 # 'f'类型的消息后面跟有文件描述符。
