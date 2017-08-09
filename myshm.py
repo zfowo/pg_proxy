@@ -52,6 +52,15 @@ class shm(object):
         for upper_bound in part_spec:
             sem_obj = ipc.Semaphore('%s.%s.%d' % (self.prefix, self.name, upper_bound), flags=flags, initial_value=1)
             self.part_sem_obj_list.append((upper_bound, sem_obj))
+    def get_part_bound(self, part_idx):
+        if part_idx < 0:
+            return (0, self.shm_obj.size)
+        x = self.part_sem_obj_list[part_idx]
+        if part_idx > 0:
+            prev_x = self.part_sem_obj_list[part_idx-1]
+        else:
+            prev_x = (0, None)
+        return (prev_x[0], x[0])
     def close(self):
         if self.mm:
             self.mm.close()
@@ -75,6 +84,7 @@ class shm(object):
     # sidx是相对于part的起始位置
     # sz=-1表示一直读取到part结尾
     # pf(mm, sidx, sz, (start ,end))
+    # 返回读取的值或者pf的返回值
     def get(self, sidx=0, sz=-1, part_idx=-1, pf=None, timeout=None):
         ret = None
         if part_idx < 0:
@@ -106,15 +116,17 @@ class shm(object):
         return ret
     # sidx是相对于part的起始位置
     # pf(mm, data, sidx, (start, end))
+    # 返回self或者pf的返回值
     def put(self, data, sidx=0, part_idx=-1, pf=None, timeout=None):
+        ret = self
         d_len = len(data)
         if part_idx < 0:
             with timed_acquire(self.sem_obj, timeout):
                 if pf:
-                    pf(self.mm, data, sidx, (0, self.shm_obj.size))
+                    ret = pf(self.mm, data, sidx, (0, self.shm_obj.size))
                 else:
                     self.mm[sidx:sidx+d_len] = data
-            return self
+            return ret
         
         if part_idx >= len(self.part_sem_obj_list):
             raise RuntimeError('part_idx(%d) out of index' % (part_idx, ))
@@ -125,10 +137,10 @@ class shm(object):
             prev_x = (0, None)
         with timed_acquire(x[1], timeout):
             if pf:
-                pf(self.mm, data, sidx, (prev_x[0], x[0]))
+                ret = pf(self.mm, data, sidx, (prev_x[0], x[0]))
             else:
                 self.mm[prev_x[0]+sidx:prev_x[0]+sidx+d_len] = data
-        return self
+        return ret
 # main
 if __name__ == '__main__':
     pass

@@ -6,8 +6,9 @@
 #   .) 发送邮件
 # 
 import sys, os
-import signal
+import logging, signal
 from netutils import *
+from miscutils import *
 
 # 消息处理函数。
 # 参数msg : (msg_type, msg_data, fd_list)
@@ -49,6 +50,7 @@ def process_mail_msg(msg):
     msg_data = msg[1].decode('utf8')
     logging.info('mail msg:%s' % (msg_data, ))
 
+# 来自主进程的消息类型
 msg_process_map = {
     b'c' : process_cancel_request_msg,  # 发送CancelRequest
     b'P' : process_promote_result_msg,  # 提升结果
@@ -58,15 +60,12 @@ msg_process_map = {
 def work_worker(ipc_uds_path):
     signal.signal(signal.SIGTERM, signal.SIG_DFL)
     # 先建立到主进程的连接
-    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    s.connect(ipc_uds_path)
-    pid = os.getpid()
-    s.sendall(uds_dp.make_msg(b's' + 'work:' + str(pid)))
-    ipc_ep = uds_ep(s)
+    ipc_ep = connect_to_main_process(ipc_uds_path, 'work')
     
     poll = spoller()
     poll.register(ipc_ep, poll.POLLIN)
     while True:
+        msg_list = []
         x = poll.poll()
         for fobj, event in x:
             if fobj == ipc_ep:
@@ -78,19 +77,22 @@ def work_worker(ipc_uds_path):
                     x = fobj.recv()
                     if x[0] != -1:
                         continue
-                    msg = x[1]
-                    msg_type = msg[0]
-                    logging.info('[work_worker] uds_ep recved: %s', msg)
-                    if msg_type in msg_process_map:
-                        msg_process_map[msg[0]](msg)
-                    else:
-                        logging.error('unknown msg from main process: %s', msg)
+                    msg_list.append(x[1])
             else:
-                logging.error('BUG: unknown fobj: %s' % (fobj, ))
+                logging.error('BUG: unknown fobj: %s', fobj)
+        # 处理接收到的消息
+        for msg in msg_list:
+            msg_type = msg[0]
+            logging.info('[work_worker]recved msg: %s', msg)
+            if msg_type in msg_process_map:
+                msg_process_map[msg_type](msg)
+            else:
+                logging.error('BUG: unknown msg from main process: %s', msg)
     os._exit(0)
 
 # main
 g_conf = None
+
 if __name__ == '__main__':
     pass
 

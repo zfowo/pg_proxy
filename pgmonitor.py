@@ -18,7 +18,7 @@ from pgprotocol import *
 #   .) 在poller之外需要调用。
 # 
 class pg_monitor(object):
-    # addr : 主库的地址。
+    # addr : 主库/从库地址
     # conninfo : 用户名/数据库/密码等等信息
     def __init__(self, addr, conninfo):
         self.addr = addr

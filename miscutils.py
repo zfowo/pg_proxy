@@ -4,7 +4,17 @@
 # misc utils
 # 
 import sys, os
-import datetime
+import datetime, socket
+from netutils import uds_ep
+
+# 连接到主进程的uds，然后发送b's'消息。
+def connect_to_main_process(ipc_uds_path, subprocess_name):
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.connect(ipc_uds_path)
+    pid = os.getpid()
+    msg_data = '%s:%s' % (subprocess_name, str(pid))
+    s.sendall(uds_ep.make_msg(b's' + msg_data))
+    return uds_ep(s)
 
 def read_conf_file(conf_file, conf_name):
     f = open(conf_file, encoding='gbk')
