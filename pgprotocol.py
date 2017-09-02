@@ -674,7 +674,7 @@ def process_Startup(msg_data):
     idx += 4
     if code == PG_PROTO_VERSION3_NUM: # StartupMessage for version 3
         res = ('StartupMessage', b'\x00', code, [])
-        param_list = res[3]
+        param_list = res[3] # list of (param, val)，param和val以b'\x00'结尾。
         while msg_data[idx] != 0:
             param_name = get_cstr(msg_data, idx)
             idx += len(param_name)
@@ -909,6 +909,52 @@ def get_param_val_from_startupmsg(startup_msg, param_name):
         if param_name == n:
             return v
     return None
+# 
+# startup_msg_raw的简写处理，必须是V3版本的startup_msg。
+# 有时需要把startup_msg_raw保存在共享内存中，为了节省空间，对startup_msg_raw中的参数名做简写处理。
+# 
+startup_msg_param_abbr = [
+    (b'user\x00', b'u\x00'), # u
+    (b'database\x00', b'd\x00'), # d
+    (b'options\x00', b'o\x00'), # o
+    (b'replication\x00', b'r\x00'), # r
+    (b'application_name\x00', b'a\x00'), # a
+    (b'client_encoding\x00', b'e\x00'), # e
+]
+startup_msg_param2abbr_map = {}
+startup_msg_abbr2param_map = {}
+for x in startup_msg_param_abbr:
+    startup_msg_param2abbr_map[x[0]] = x[1]
+    startup_msg_abbr2param_map[x[1]] = x[0]
+# 返回简写后的startup_msg_raw
+def to_abbr_startup_msg_raw(startup_msg):
+    if type(startup_msg) == bytes:
+        startup_msg = process_Startup(startup_msg[4:])
+    if startup_msg[2] != PG_PROTO_VERSION3_NUM:
+        raise RuntimeError('startup_msg(%s) is not V3' % (startup_msg, ))
+    startup_msg_abbr = (startup_msg[0], startup_msg[1], startup_msg[2], [])
+    param_list_abbr = startup_msg_abbr[3]
+    for x in start_msg[3]:
+        if x[0] in startup_msg_param2abbr_map:
+            param_list_abbr.append((startup_msg_param2abbr_map[x[0]], x[1]))
+        else:
+            param_list_abbr.append((x[0], x[1]))
+    return make_StartupMessage1(startup_msg_abbr)
+# 返回简写前的startup_msg_raw
+def from_abbr_startup_msg_raw(startup_msg_abbr):
+    if type(startup_msg_abbr) == bytes:
+        startup_msg_abbr = process_Startup(startup_msg_abbr[4:])
+    if startup_msg_abbr[2] != PG_PROTO_VERSION3_NUM:
+        raise RuntimeError('startup_msg(%s) is not V3' % (startup_msg_abbr, ))
+    startup_msg = (startup_msg_abbr[0], startup_msg_abbr[1], startup_msg_abbr[2], [])
+    param_list = startup_msg[3]
+    for x in startup_msg_abbr[3]:
+        if x[0] in startup_msg_abbr2param_map:
+            param_list.append((startup_msg_abbr2param_map[x[0]], x[1]))
+        else:
+            param_list.append((x[0], x[1]))
+    return make_StartupMessage1(startup_msg)
+#=====================================================================================================================
 # 
 # 下面这些和协议无关，但是依赖于协议，所以也放在本文件里。
 # 

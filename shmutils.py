@@ -125,9 +125,11 @@ class idle_cnn_hash_table(object):
 # 内部item指针指向item开头，而返回给外部的是指向保存实际数据的开头位置。
 # 指针值都是相对于part_idx的起始位置的，不是相对于整个共享内存的起始位置。指针值-1表示结束。
 # 
+# idle_idx / use_idx是相对于整个共享内存的起始位置。
+# 
 class item_table(object):
     ITEM_SZ = 10 # 派生类需要定义该值
-    # sidx是part_idx中的起始位置
+    # sidx是part_idx中的起始位置，part中sidx之前的空间不用。
     def __init__(self, shm, part_idx, sidx=0):
         self.shm = shm
         self.part_idx = part_idx
@@ -147,7 +149,7 @@ class item_table(object):
         mm[part_sidx+sidx:part_sidx+sidx+4] = struct.pack('i', off) # idle list
         idx = part_sidx + off
         while idx + 5 + item_sz <= part_eidx:
-            mm[idx] = b'I'
+            mm[idx:idx+1] = b'I'
             mm[idx+1:idx+5] = struct.pack('i', off + 5 + item_sz)
             off += 5 + item_sz
             idx = part_sidx + off
@@ -155,22 +157,38 @@ class item_table(object):
         mm[idx-item_sz-4:idx-item_sz] = struct.pack('i', -1)
         return cnt
     # 查找并返回空闲的item，返回值指向item中保存实际数据的位置。如果没有空闲item，则返回-1。
-    # 此方法不加锁，适用于只有一个进程调用的场合，如果有多个进程调用则使用find_idle_item2。
-    def find_idle_item(self):
-        mm = self.shm.mm
-        x = mm[self.idle_idx:self.idle_idx+4]
-        item_idx = struct.unpack('i', x)[0]
-        if item_idx == -1:
-            return item_idx
-        
-        item_pos = self.part_sidx + item_idx
-        mm[self.idle_idx:self.idle_idx+4] = mm[item_pos+1:item_pos+5]
-        mm[item_pos] = b'U'
-        mm[item_pos+1:item_pos+5] = mm[self.use_idx:self.use_idx+4]
-        mm[self.use_idx:self.use_idx+4] = struct.pack('i', item_idx)
-        return item_idx + 5
-    def find_idle_item2(self, timeout=None):
-        pass
+    def find_idle_item(self, timeout=None):
+        def pf(mm, sidx, sz, part_bound):
+            x = mm[self.idle_idx:self.idle_idx+4]
+            item_idx = struct.unpack('i', x)[0]
+            if item_idx == -1:
+                return item_idx
+            
+            item_pos = self.part_sidx + item_idx
+            mm[self.idle_idx:self.idle_idx+4] = mm[item_pos+1:item_pos+5]
+            mm[item_pos:item_pos+1] = b'U'
+            mm[item_pos+1:item_pos+5] = mm[self.use_idx:self.use_idx+4]
+            mm[self.use_idx:self.use_idx+4] = struct.pack('i', item_idx)
+            return item_idx + 5
+        return self.shm.get(part_idx=self.part_idx, pf=pf, timeout=timeout)
+    # 把item_ptr放回到空闲链表中
+    def put_to_idle_list(self, item_ptr, timeout=None):
+        def pf(mm, sidx, sz, part_bound):
+            item_pos = self.part_sidx + item_ptr
+            # 从use_list删除item_ptr
+            prev_idx = self.use_idx
+            next_item = struct.unpack('i', mm[prev_idx:prev_idx+4])[0]
+            while next_item + 5 != item_ptr:
+                prev_idx = self.part_sidx + next_item + 1
+                next_item = struct.unpack('i', mm[prev_idx:prev_idx+4])[0]
+            mm[prev_idx:prev_idx+4] = mm[item_pos-4:item_pos]
+            # 把item_ptr添加到idle_list
+            mm[item_pos-5:item_pos+self.ITEM_SZ] = b'\x00' * (self.ITEM_SZ + 5)
+            mm[item_pos-5:item_pos-4] = b'I'
+            mm[item_pos-4:item_pos] = mm[self.idle_idx:self.idle_idx+4]
+            mm[self.idle_idx:self.idle_idx+4] = struct.pack('i', item_ptr-5)
+            return None
+        return self.shm.get(part_idx=self.part_idx, pf=pf, timeout=timeout)
     # 读取item的值，item_ptr指向item中保存实际数据的开头。
     def get(self, item_ptr, pf=None, timeout=None):
         return self.shm.get(item_ptr, self.ITEM_SZ, self.part_idx, pf, timeout)
@@ -180,6 +198,19 @@ class item_table(object):
         if pf == None and len(item_data) != self.ITEM_SZ:
             raise RuntimeError('len of item_data(%s) != %d' % (item_data, self.ITEM_SZ))
         return self.shm.put(item_data, item_ptr, self.part_idx, pf, timeout)
+    # 读取所有item
+    def getall(self, timeout=None):
+        def pf(mm, sidx, sz, part_bound):
+            res = []
+            x = mm[self.use_idx:self.use_idx+4]
+            item_idx = struct.unpack('i', x)[0]
+            while item_idx != -1:
+                item_pos = self.part_sidx + item_idx
+                res.append(mm[item_pos+5:item_pos+5+self.ITEM_SZ])
+                x = mm[item_pos+1:item_pos+5]
+                item_idx = struct.unpack('i', x)[0]
+            return res
+        return self.shm.get(part_idx=self.part_idx, pf=pf, timeout=timeout)
 # 
 # item是连接信息，包括下面这些信息: 
 #   fe_ip/fe_port    : 前端ip(4字节)和端口(2字节)。
@@ -201,8 +232,7 @@ class cnn_info_table(item_table):
     UPDATE_TIME_IDX = 16
     STARTUP_MSG_RAW_IDX = 20
     
-    def get(self, item_ptr, timeout=None):
-        item_data = super().get(item_ptr, None, timeout)
+    def parse_item(self, item_data):
         ret = {}
         ret['fe_ip'] = socket.inet_ntoa(item_data[self.FE_IP_IDX:self.FE_IP_IDX+4])
         ret['fe_port'] = struct.unpack('H', item_data[self.FE_PORT_IDX:self.FE_PORT_IDX+2])[0]
@@ -215,7 +245,22 @@ class cnn_info_table(item_table):
         sz = struct.unpack('>i', x[:4])[0]
         ret['startup_msg_raw'] = x[:sz]
         return ret
+
+    def get(self, item_ptr, timeout=None):
+        item_data = super().get(item_ptr, None, timeout)
+        return self.parse_item(item_data)
+    def getall(self, timeout=None):
+        item_data_list = super().getall(timeout)
+        return [self.parse_item(d) for d in item_data_list]
     def put(self, item_ptr, timeout=None, **kwargs):
+        def pf(mm, item_data, item_ptr, part_bound):
+            item_pos = part_bound[0] + item_ptr
+            for x in item_data:
+                s = item_pos + x[0]
+                e = item_pos + x[0] + len(x[1])
+                mm[s:e] = x[1]
+            return len(item_data)
+        
         item_data = [] # list of (idx, data)
         for k in kwargs:
             if k == 'fe_ip':
@@ -248,14 +293,7 @@ class cnn_info_table(item_table):
         x = datetime.datetime.now().timestamp()
         data = struct.pack('f', x)
         item_data.append((self.UPDATE_TIME_IDX, data))
-        return super().put(item_ptr, item_data, self._put_pf, timeout)
-    def _put_pf(self, mm, item_data, item_ptr, part_bound):
-        item_pos = part_bound[0] + item_ptr
-        for x in item_data:
-            s = item_pos + x[0]
-            e = item_pos + x[0] + len(x[1])
-            mm[s:e] = x[1]
-        return len(item_data)
+        return super().put(item_ptr, item_data, pf, timeout)
 
 # main
 if __name__ == '__main__':
