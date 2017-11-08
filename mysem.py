@@ -3,7 +3,7 @@
 #
 # 由于posix_ipc没有提供无名信号量，所以通过cffi实现。
 # 
-import sys, os, errno
+import sys, os, errno, struct
 import contextlib
 import cffi
 
@@ -80,10 +80,11 @@ def wait(mm, idx, timeout):
 # with sobj.wait():
 #    ....
 # 
-class sem(object):
+class Sem(object):
+    SIZE = semsize()
     def __len__(self):
-        return semsize()
-    def __init__(self, mm, idx, value=None):
+        return self.SIZE
+    def __init__(self, mm, idx, value=1):
         self.mm = mm
         self.idx = idx
         self.init_value = value
@@ -103,6 +104,73 @@ class sem(object):
         return self
     def __exit__(self, exc_type, exc_value, traceback):
         self.post()
+#========================================================================================================
+# 下面是一些位于匿名共享内存中的数据结构
+# 
+# Stack : 共享内存中包含：sem + top +        <data>
+#                               |->top_idx   |->data_idx
+# 
+class Stack(object):
+    @staticmethod
+    def mmsize(itemnum, itemsz):
+        return Sem.SIZE + 4 + itemnum * itemsz
+    # value=None 表示不初始化sem和topvalue
+    def __init__(self, itemsz, mm, start=0, end=0, value=1, fin=None, fout=None):
+        self.itemsz = itemsz
+        self.fin = fin
+        self.fout = fout
+        
+        self.mm = mm
+        self.mm_start = start
+        self.mm_end = end
+        if self.end <= 0:
+            self.end = len(mm)
+        
+        self.sem = Sem(mm, start, value)
+        self.top_idx = self.mm_start + Sem.SIZE
+        self.data_idx = self.mm_start + Sem.SIZE + 4
+        if value != None:
+            self._topvalue(0)
+    def _topvalue(self, *args):
+        if args:
+            v = args[0]
+            self.mm[self.top_idx:self.top_idx+4] = struct.pack('=i', v)
+        else:
+            return struct.unpack('=i', self.mm[self.top_idx:self.top_idx+4])[0]
+    def count(self, timeout=-1):
+        with self.sem.wait(timeout):
+            return self._topvalue()
+    def push(self, item, timeout=-1):
+        if self.fin:
+            item = self.fin(item)
+        if type(item) != bytes or len(item) != self.itemsz:
+            raise RuntimeError('wrong item: %s %s' % (item, type(item)))
+        with self.sem.wait(timeout):
+            topv = self._topvalue()
+            if self.data_idx + (topv + 1) * self.itemsz >= self.mm_end:
+                return None
+            item_idx = self.data_idx + topv * self.itemsz
+            self.mm[item_idx:item_idx+self.itemsz] = item
+            self._topvalue(topv + 1)
+            return item
+    def pop(self, timeout=-1):
+        with self.sem.wait(timeout):
+            topv, item = self._top()
+            if topv > 0:
+                self._topvalue(topv - 1)
+            return item
+    def top(self, timeout=-1):
+        with self.sem.wait(timeout):
+            return self._top()[1]
+    def _top(self):
+        topv = self._topvalue()
+        if topv <= 0:
+            return (topv, None)
+        item_idx = self.data_idx + (topv - 1) * self.itemsz
+        item = self.mm[item_idx:item_idx+self.itemsz]
+        if self.fout:
+            item = self.fout(item)
+        return (topv, item)
 # main
 if __name__ == '__main__':
     pass
