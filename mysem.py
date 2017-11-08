@@ -84,6 +84,7 @@ class Sem(object):
     SIZE = semsize()
     def __len__(self):
         return self.SIZE
+    # value=None 表示不初始化sem
     def __init__(self, mm, idx, value=1):
         self.mm = mm
         self.idx = idx
@@ -104,18 +105,17 @@ class Sem(object):
         return self
     def __exit__(self, exc_type, exc_value, traceback):
         self.post()
+
+# 计算mmap至少得分配多少空间
+def mmsize(itemnum, itemsz):
+    return Sem.SIZE + 4 + itemnum * itemsz
 #========================================================================================================
 # 下面是一些位于匿名共享内存中的数据结构
 # 
-# Stack : 共享内存中包含：sem + top +        <data>
-#                               |->top_idx   |->data_idx
+# 共享对象 : 在共享内存中的布局: sem + <具体类型的管理数据> + <data>
 # 
-class Stack(object):
-    @staticmethod
-    def mmsize(itemnum, itemsz):
-        return Sem.SIZE + 4 + itemnum * itemsz
-    # value=None 表示不初始化sem和topvalue
-    def __init__(self, itemsz, mm, start=0, end=0, value=1, fin=None, fout=None):
+class ShmObject(object):
+    def __init__(self, itemsz, mm, start=0, end=0, semvalue=1, fin=None, fout=None):
         self.itemsz = itemsz
         self.fin = fin
         self.fout = fout
@@ -123,31 +123,51 @@ class Stack(object):
         self.mm = mm
         self.mm_start = start
         self.mm_end = end
-        if self.end <= 0:
-            self.end = len(mm)
+        if self.mm_end <= 0:
+            self.mm_end = len(mm)
         
         self.sem = Sem(mm, start, value)
-        self.top_idx = self.mm_start + Sem.SIZE
-        self.data_idx = self.mm_start + Sem.SIZE + 4
-        if value != None:
-            self._topvalue(0)
-    def _topvalue(self, *args):
-        if args:
+    def _misc_init(self):
+        self.itemnum = (self.mm_end - self.data_idx) // self.itemsz
+    def _value_i4(self, idx, *args):
+        if args: # set value
             v = args[0]
-            self.mm[self.top_idx:self.top_idx+4] = struct.pack('=i', v)
-        else:
-            return struct.unpack('=i', self.mm[self.top_idx:self.top_idx+4])[0]
-    def count(self, timeout=-1):
-        with self.sem.wait(timeout):
-            return self._topvalue()
-    def push(self, item, timeout=-1):
+            self.mm[idx:idx+4] = struct.pack('=i', v)
+        else: # get value
+            return struct.unpack('=i', self.mm[idx:idx+4])[0]
+    def _apply_fin(self, item):
         if self.fin:
             item = self.fin(item)
         if type(item) != bytes or len(item) != self.itemsz:
             raise RuntimeError('wrong item: %s %s' % (item, type(item)))
+        return item
+    def _apply_fout(self, item):
+        if self.fout and item != None: # None表示stack/queue为空
+            item = self.fout(item)
+        return item
+# 
+# Stack : 共享内存中包含: sem + top +        <data>
+#                               |->top_idx   |->data_idx
+# 
+class Stack(ShmObject):
+    # semvalue=None 表示不初始化sem和top
+    def __init__(self, itemsz, mm, start=0, end=0, semvalue=1, fin=None, fout=None):
+        super().__init__(itemsz, mm, start, end, semvalue, fin, fout)
+        self.top_idx = self.mm_start + Sem.SIZE
+        self.data_idx = self.top_idx + 4
+        if semvalue != None:
+            self._topvalue(0)
+        self._misc_init()
+    def _topvalue(self, *args):
+        return self._value_i4(self.top_idx, *args)
+    def count(self, timeout=-1):
+        with self.sem.wait(timeout):
+            return self._topvalue()
+    def push(self, item, timeout=-1):
+        item = self._apply_fin(item)
         with self.sem.wait(timeout):
             topv = self._topvalue()
-            if self.data_idx + (topv + 1) * self.itemsz >= self.mm_end:
+            if topv >= self.itemnum: # stack is full
                 return None
             item_idx = self.data_idx + topv * self.itemsz
             self.mm[item_idx:item_idx+self.itemsz] = item
@@ -164,13 +184,88 @@ class Stack(object):
             return self._top()[1]
     def _top(self):
         topv = self._topvalue()
-        if topv <= 0:
+        if topv <= 0: # stack is empty
             return (topv, None)
         item_idx = self.data_idx + (topv - 1) * self.itemsz
         item = self.mm[item_idx:item_idx+self.itemsz]
-        if self.fout:
-            item = self.fout(item)
+        item = self._apply_fout(item)
         return (topv, item)
+# 
+# Queue : 共享内存中包含: sem + head + tail + <data>
+# 当head/tail到达结尾的时候，则从头开始。如果tail在head前面，那么tail和head之间至少留一个item空间，
+# 这个空闲item空间用于表示队列已满。所以如果要保存最多n个item，那么需要分配n+1个item的空间。
+# 
+class Queue(ShmObject):
+    # semvalue=None 表示不初始化sem和head/tail
+    def __init__(self, itemsz, mm, start=0, end=0, semvalue=1, fin=None, fout=None):
+        super().__init__(itemsz, mm, start, end, semvalue, fin, fout)
+        self.head_idx = self.mm_start + Sem.SIZE
+        self.tail_idx = self.head_idx + 4
+        self.data_idx = self.tail_idx + 4
+        if semvalue != None:
+            self._headvalue(0)
+            self._tailvalue(0)
+        self._misc_init()
+    def _headvalue(self, *args):
+        return self._value_i4(self.head_idx, *args)
+    def _tailvalue(self, *args):
+        return self._value_i4(self.tail_idx, *args)
+    def count(self, timeout=-1):
+        with self.sem.wait(timeout):
+            headv = self._headvalue()
+            tailv = self._tailvalue()
+            v = tailv - headv
+            v = (v + self.itemnum) % self.itemnum
+            return v
+    def _isempty(self):
+        headv = self._headvalue()
+        tailv = self._tailvalue()
+        if headv == tailv:
+            return (True, headv, tailv)
+        else:
+            return (False, headv, tailv)
+    def _isfull(self):
+        headv = self._headvalue()
+        tailv = self._tailvalue()
+        if (tailv + 1) % self.itemnum == headv:
+            return (True, headv, tailv)
+        else:
+            return (False, headv, tailv)
+    def push(self, item, timeout=-1):
+        item = self._apply_fin(item)
+        with self.sem.wait(timeout):
+            isfull, headv, tailv = self._isfull()
+            if isfull:
+                return None
+            item_idx = self.data_idx + tailv * self.itemsz
+            self.mm[item_idx:item_idx+self.itemsz] = item
+            tailv = (tailv + 1) % self.itemnum
+            self._tailvalue(tailv)
+            return item
+    def _itemat(self, head=True):
+        isempty, headv, tailv = self._isempty()
+        if isempty:
+            return (None, headv, tailv)
+        if head:
+            item_idx = self.data_idx + headv * self.itemsz
+        else:
+            item_idx = self.data_idx + ((tailv - 1 + self.itemnum) % self.itemnum) * self.itemsz
+        item = self.mm[item_idx:item_idx+self.itemsz]
+        item = self._apply_fout(item)
+        return (item, headv, tailv)
+    def pop(self, timeout=-1):
+        with self.sem.wait(timeout):
+            item, headv, tailv = self._itemat()
+            if headv != tailv:
+                headv = (headv + 1) % self.itemnum
+                self._headvalue(headv)
+            return item
+    def head(self, timeout=-1):
+        with self.sem.wait(timeout):
+            return self._itemat()[0]
+    def tail(self, timeout=-1):
+        with self.sem.wait(timeout):
+            return self._itemat(False)[0]
 # main
 if __name__ == '__main__':
     pass
