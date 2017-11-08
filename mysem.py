@@ -81,9 +81,9 @@ def check_errno(f):
         retval = f(*args, **kwargs)
         if type(retval) == tuple:
             if retval[0] == 0:
-                return
+                return retval
         elif retval == 0:
-            return
+            return retval
         ex = OSError()
         ex.errno = ffi.errno
         ex.strerror = os.strerror(ex.errno)
@@ -119,7 +119,35 @@ def wait(mm, idx, timeout):
     buf = ffi.from_buffer(mm)
     sem = buf + idx
     return lib.wait(sem, timeout)
-
+# 
+# sobj = sem(mm, 0)
+# with sobj.wait():
+#    ....
+# 
+class sem(object):
+    SIZE = lib.SEM_T_SZ
+    def __len__(self):
+        return self.SIZE
+    def __init__(self, mm, idx, value=None):
+        self.mm = mm
+        self.idx = idx
+        self.init_value = value
+        if self.init_value != None:
+            init(self.mm, self.idx, value)
+    def destroy(self):
+        if self.init_value != None:
+            destroy(self.mm, self.idx)
+    def getvalue(self):
+        return getvalue(self.mm, self.idx)
+    def post(self):
+        post(self.mm, self.idx)
+    def wait(self, timeout = -1):
+        wait(self.mm, self.idx, timeout)
+        return self
+    def __enter__(self):
+        return self
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.post()
 # main
 if __name__ == '__main__':
     pass
