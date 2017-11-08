@@ -73,6 +73,8 @@ def wait(mm, idx, timeout):
     buf = ffi.from_buffer(mm)
     sem = buf + idx
     return lib.wait(sem, timeout)
+def semsize():
+    return lib.semsize()
 # 
 # sobj = sem(mm, 0)
 # with sobj.wait():

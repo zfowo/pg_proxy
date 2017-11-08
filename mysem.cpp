@@ -10,6 +10,8 @@
 #include <semaphore.h>
 #include <sys/mman.h> // for mmap
 
+extern "C" {
+
 int semsize()
 {
     return sizeof(sem_t);
@@ -53,6 +55,8 @@ int wait(char *sem, double timeout)
         return sem_timedwait((sem_t *)sem, &ts);
     }
 }
+
+} // end of extern "C"
 
 int check_error(const char * func, int e)
 {
