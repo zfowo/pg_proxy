@@ -13,16 +13,16 @@ THREAD_SHARED = 0
 ffi = cffi.FFI()
 ffi.cdef('''
 int semsize();
-int init(char *sem, int pshared, unsigned int value);
-int destroy(char *sem);
-int getvalue(char *sem, int *sval);
-int post(char *sem);
+int seminit(char *sem, int pshared, unsigned int value);
+int semdestroy(char *sem);
+int semgetvalue(char *sem, int *sval);
+int sempost(char *sem);
 // timeout指定超时值，单位是秒。
 //   <  0.0 : sem_wait
 //   == 0.0 : sem_trywait
 //   >  0.0 : sem_timedwait
 // errno可能值: EINTR / EAGAIN / ETIMEOUT
-int wait(char *sem, double timeout);
+int semwait(char *sem, double timeout);
 ''')
 so = os.path.join(os.path.dirname(__file__), 'libmysem.so')
 lib = ffi.dlopen(so)
@@ -43,23 +43,25 @@ def check_errno(f):
         ex.strerror = os.strerror(ex.errno)
         raise ex
     return wrapper
+def semsize():
+    return lib.semsize()
 # 初始化位于mmap中的semaphore
 @check_errno
 def init(mm, idx, value):
     buf = ffi.from_buffer(mm)
     sem = buf + idx
-    return lib.init(sem, PROCESS_SHARED, value)
+    return lib.seminit(sem, PROCESS_SHARED, value)
 @check_errno
 def destroy(mm, idx):
     buf = ffi.from_buffer(mm)
     sem = buf + idx
-    return lib.destroy(sem)
+    return lib.semdestroy(sem)
 @check_errno
 def _getvalue(mm, idx):
     buf = ffi.from_buffer(mm)
     sem = buf + idx
     v = ffi.new('int *')
-    ret = lib.getvalue(sem, v)
+    ret = lib.semgetvalue(sem, v)
     return (ret, v[0])
 def getvalue(mm, idx):
     return _getvalue(mm, idx)[1]
@@ -67,14 +69,12 @@ def getvalue(mm, idx):
 def post(mm, idx):
     buf = ffi.from_buffer(mm)
     sem = buf + idx
-    return lib.post(sem)
+    return lib.sempost(sem)
 @check_errno
 def wait(mm, idx, timeout):
     buf = ffi.from_buffer(mm)
     sem = buf + idx
-    return lib.wait(sem, timeout)
-def semsize():
-    return lib.semsize()
+    return lib.semwait(sem, timeout)
 # 
 # sobj = sem(mm, 0)
 # with sobj.wait():

@@ -16,24 +16,24 @@ int semsize()
 {
     return sizeof(sem_t);
 }
-int init(char *sem, int pshared, unsigned int value)
+int seminit(char *sem, int pshared, unsigned int value)
 {
     return sem_init((sem_t *)sem, pshared, value);
 }
-int destroy(char *sem)
+int semdestroy(char *sem)
 {
     return sem_destroy((sem_t *)sem);
 }
-int getvalue(char *sem, int *sval)
+int semgetvalue(char *sem, int *sval)
 {
     return sem_getvalue((sem_t *)sem, sval);
 }
-int post(char *sem)
+int sempost(char *sem)
 {
     return sem_post((sem_t *)sem);
 }
 #define NSEC_PER_SEC (1000000000)
-int wait(char *sem, double timeout)
+int semwait(char *sem, double timeout)
 {
     if (timeout < 0.0)
         return sem_wait((sem_t *)sem);
@@ -77,14 +77,14 @@ int main()
         exit(1);
     }
     int val = 0;
-    check_error("init", init(addr, 1, 1));
-    check_error("getvalue", getvalue(addr, &val));
+    check_error("init", seminit(addr, 1, 1));
+    check_error("getvalue", semgetvalue(addr, &val));
     printf("sem val:%d\n", val);
     
-    check_error("wait", wait(addr, -1));
-    check_error("getvalue", getvalue(addr, &val));
+    check_error("wait", semwait(addr, -1));
+    check_error("getvalue", semgetvalue(addr, &val));
     printf("after wait, sem val:%d\n", val);
-    check_error("post", post(addr));
+    check_error("post", sempost(addr));
     
     return 0;
 }
