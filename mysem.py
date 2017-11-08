@@ -24,7 +24,7 @@ int post(char *sem);
 // errnoø…ƒ‹÷µ: EINTR / EAGAIN / ETIMEOUT
 int wait(char *sem, double timeout);
 ''')
-so = os.path.join(os.path.dirname(__file__), 'mysem.so')
+so = os.path.join(os.path.dirname(__file__), 'libmysem.so')
 lib = ffi.dlopen(so)
 # 
 # python wrapper for lib.*
@@ -79,9 +79,8 @@ def wait(mm, idx, timeout):
 #    ....
 # 
 class sem(object):
-    SIZE = lib.SEM_T_SZ
     def __len__(self):
-        return self.SIZE
+        return semsize()
     def __init__(self, mm, idx, value=None):
         self.mm = mm
         self.idx = idx

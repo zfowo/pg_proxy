@@ -1,5 +1,5 @@
 // 
-// mysem.so : g++ -pthread -shared -fPIC -o mysem.so mysem.cpp -lrt
+// libmysem.so : g++ -pthread -shared -fPIC -o libmysem.so mysem.cpp -lrt
 // 
 #include <stdio.h>
 #include <stdlib.h>
@@ -12,7 +12,7 @@
 
 int semsize()
 {
-    return sizeof(sem_t)
+    return sizeof(sem_t);
 }
 int init(char *sem, int pshared, unsigned int value)
 {
