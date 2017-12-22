@@ -5,6 +5,7 @@
 # 
 import sys, os, errno, struct
 import contextlib
+import mmap
 import cffi
 from structview import *
 
@@ -145,6 +146,11 @@ class ShmObjectBase(object):
 # 
 class Stack(ShmObjectBase):
     @classmethod
+    def create(cls, itemnum, itemsz, fin=None, fout=None):
+        sz = cls.mmsize(itemnum, itemsz)
+        mm = mmap.mmap(-1, sz)
+        return cls(itemsz, mm, fin=fin, fout=fout)
+    @classmethod
     def mmsize(cls, itemnum, itemsz):
         return Sem.SIZE + struct.calcsize('=i'), + itemnum * itemsz
     # semvalue=None 表示不初始化sem和top
@@ -194,6 +200,11 @@ class Stack(ShmObjectBase):
 # 这个空闲item空间用于表示队列已满。所以如果要保存最多n个item，那么需要分配n+1个item的空间。
 # 
 class Queue(ShmObjectBase):
+    @classmethod
+    def create(cls, itemnum, itemsz, fin=None, fout=None):
+        sz = cls.mmsize(itemnum, itemsz)
+        mm = mmap.mmap(-1, sz)
+        return cls(itemsz, mm, fin=fin, fout=fout)
     @classmethod
     def mmsize(cls, itemnum, itemsz):
         return Sem.SIZE + struct.calcsize('=ii') + itemnum * itemsz
