@@ -10,7 +10,7 @@ import struct
 import itertools
 import collections
 
-__all__ = ['mvfrombuf', 'structview', 'struct_base', 'xval']
+__all__ = ['mvfrombuf', 'structview', 'struct_base', 'xval', 'Xval']
 
 def mvfrombuf(buf, start, sz = -1):
     mv = memoryview(buf)
@@ -155,7 +155,7 @@ class xval(object):
         if self.flag not in structview.flag_list:
             raise ValueError('unknown flag:%s' % self.flag)
     def __str__(self):
-        return '<xval data:{0} c:{1} flag:{2}>'.format(self.data, self.c, self.flag)
+        return "<xval data:{0} c:{1} flag:'{2}'>".format(self.data, self.c, self.flag)
     def __repr__(self):
         return 'xval({0!r}, {1!r}, {2!r})'.format(self.data, self.c, self.flag)
     def __bytes__(self):
@@ -188,6 +188,12 @@ class Xval(object):
         self.flag = flag
         if self.c == 0 and any(len(xv)==0 for xv in self.xval_list):
             raise ValueError('Xval does not support empty byte string while c=0')
+    def __str__(self):
+        return "<Xval xval_list:{0} c:{1} flag:'{2}'>".format(len(self.xval_list), self.c, self.flag)
+    def __len__(self):
+        return len(self.xval_list)
+    def __getitem__(self, idx):
+        return self.xval_list[idx]
     def __iter__(self):
         yield from self.xval_list
     def tobuf(self):
@@ -218,67 +224,147 @@ class Xval(object):
                 data_list.append(buf[sidx:sidx+sz])
                 sidx += sz
         return cls(data_list, c, flag), sidx
+# struct attribute descriptor
+# 不用实现__get__，这样通过类访问会返回描述符本身，通过instance访问的话会返回instance字典里的同名属性。
+class struct_attr_descriptor(object):
+    def __init__(self, name, fmt_spec):
+        self.name = name
+        self.fmt_spec = fmt_spec
+    # 目前只检查是否是序列以及序列的长度，
+    # 不检查值是否有效，如果值无效那么tobytes函数会抛出异常。
+    def __set__(self, instance, val):
+        if getattr(instance, '_check_assign', True):
+            n, flag, fmt_list, fmt_str, fmt_info = self.fmt_spec
+            sz = len(fmt_str)
+            if n == 0:
+                if sz > 1:
+                    self._check_sequence(val, sz)
+            else:
+                if n < 0:
+                    n = instance._field_ref(n)
+                self._check_sequence(val, n)
+                if sz > 1:
+                    for item in val:
+                        self._check_sequence(item, sz)
+        instance.__dict__[self.name] = val
+    # sz <  0 只检查是否是序列
+    # sz >= 0 检查是否是序列，并且大小是否是sz
+    def _check_sequence(self, v, sz = -1):
+        if not isinstance(v, collections.Sequence):
+            raise ValueError('val(%s) is not sequence' % v)
+        if sz >= 0 and len(v) != sz:
+            raise ValueError('len of val(%s) is not equal %s' % (v, sz))
 # meta class for struct_base
 class struct_meta(type):
+    format_list = structview.format_list + tuple('sxX')
     def __new__(cls, name, bases, ns):
         if '_formats' not in ns or '_fields' not in ns:
             raise ValueError('class %s should has _formats and _fields' % name)
+        ns['_formats_original'] = ns['_formats']
+        ns['_fields_original'] = ns['_fields']
         
         _fields = ns['_fields']
         if type(_fields) == str:
             _fields = _fields.split()
         if set(_fields) & set(ns):
             raise ValueError('_fields can not contain class attribute')
+        for fn in _fields:
+            if fn[0] == '_':
+                raise ValueError('fieldname in _fields can not starts with undercore')
         ns['_fields'] = tuple(_fields)
         
         _formats = ns['_formats']
         if type(_formats) == str:
             _formats = _formats.split()
         _formats_res = []
-        for fmt in _formats:
-            _formats_res.append(__class__._parse_format(fmt))
+        for idx, fmt in enumerate(_formats):
+            n, flag, fmt_list, fmt_str, fmt_info = cls._parse_format(fmt)
+            if n == 'p':
+                if idx == 0:
+                    raise ValueError('first fmt(%s) can not contain p' % fmt)
+                else:
+                    n = -idx
+            elif n < 0:
+                if -n > idx:
+                    raise ValueError('fmt(%s) reference attribute behind it' % fmt)
+            _formats_res.append((n, flag, fmt_list, fmt_str, fmt_info))
         ns['_formats'] = tuple(_formats_res)
         
         if len(ns['_formats']) != len(ns['_fields']):
             raise ValueError('_formats should be equal with _fields')
+        # add descriptor
+        for name, fmt_spec in zip(ns['_fields'], ns['_formats']):
+            ns[name] = struct_attr_descriptor(name, fmt_spec)
         return super().__new__(cls, name, bases, ns)
-    @staticmethod
-    def _parse_format(fmt):
-        n = ''.join(itertools.takewhile(lambda c: c in '-0123456789', fmt))
+    @classmethod
+    def _parse_format(cls, fmt):
+        n = ''.join(itertools.takewhile(lambda c: c not in structview.flag_list, fmt))
         fmt = fmt[len(n):]
-        n = int(n) if n else 0
+        if n != 'p':
+            n = int(n) if n else 0
         
         flag = fmt[0]
         if flag not in structview.flag_list:
             raise ValueError('unknown flag:%s' % fmt[0])
         
         fmt = fmt[1:]
-        pitem = '%s[%s%s]' % (r'\d*', '|'.join(structview.format_list), r'|s|x|X')
+        pitem = '%s[%s]' % (r'\d*', '|'.join(cls.format_list))
         p = r'^(%s)+$' % pitem
         if not re.match(p, fmt):
             raise ValueError('wrong format:%s' % fmt)
-        fmt_list = tuple(re.findall(pitem, fmt))
-        return (n, flag, fmt_list)
+        fmt_list = re.findall(pitem, fmt)
+        fmt_str = ''
+        fmt_info = []
+        for fi in fmt_list:
+            c, f = fi[:-1], fi[-1:]
+            if f == 's':
+                c = int(c) if c else 1
+                fmt_str += f
+                fmt_info.append(c)
+            elif f == 'x' or f == 'X':
+                c = int(c) if c else 0
+                if c not in (0, 1, 2, 4):
+                    raise ValueError('the prefix c of x/X should be 0|1|2|4')
+                fmt_str += f
+                fmt_info.append(c)
+            else:
+                c = int(c) if c else 1
+                fmt_str += f*c
+                fmt_info.extend([c]*c)
+        return (n, flag, tuple(fmt_list), fmt_str, tuple(fmt_info))
     
 # 
 # _formats : 指定格式
 #     [n]<flag>ff...  : n指定后面的模式重复读取几次，0/1都表示读取一次，不过1是返回长度为1的列表；
-#                       如果n<0，则表示从第-n-1个属性读取n值。
+#                       如果n<0，则表示从第-n-1个属性读取n值；如果n=p，则表示从前一个属性读取n值。
 # flag必须指定，有效值是structview.flag_list里面的值。
 # f是单个字符，必须是structview.format_list里面的字符，或者下面这些自定义的字符: 
 #     [0|n]x : 单个串。0表示字节串以\x00结尾；n(1|2|4)表示开头n个字节为字节串的大小。
-#     [0|n]X : 多个串。0表示多个字节串以\x00结尾，单个字节串也以\x00结尾，也就是最后会有2个\x00；
+#     [0|n]X : 多个串。0表示多个字节串以\x00结尾，单个字节串也以\x00结尾，也就是最后会有2个\x00，不支持空串；
 #                      n(1|2|4)表示开头n个字节表示字节串数量，每个字节串前面也有表示字节串大小的n个字节。
+# struct_meta会把_formats转换成fmt_spec的列表，fmt_spec包含5部分：
+#     n, flag, fmt_list : fmt_list是单个fmt的序列
+#     fmt_str : 不包含数字前缀的格式字符组成的串。对于非s/x/X格式字符，会根据前缀数字扩展。比如3i -> iii
+#     fmt_info : 记录fmt_str中对应格式字符前面的数字
+# 例子:
+#   '>i' : 返回单个整数
+#   '1>i' : 返回包含一个整数的列表
+#   '>ii' : 返回包含两个整数的列表
+#   '2>ii' : 返回列表的列表，列表中包含两个长度为2的整数列表，比如[[1,2],[3,4]]
 # 
 # _fields : _formats中对应项的属性名。不能包含buf以及类已有的属性。
 # 
 class struct_base(metaclass=struct_meta):
-    _formats = ('>b', '2>i', '-1>i')
-    _fields = 'v1 v2 v3'
+    _check_assign = True # 如果为True或者不定义，那么在描述符里将检查属性值
+    _formats = ''
+    _fields = ''
     # 
     def __init__(self, buf=None, **kwargs):
         if buf is not None and kwargs:
-            raise ValueError('kwargs can not contain buf')
+            raise ValueError('buf and kwargs can not be given meanwhile')
+        # 允许buf和kwargs都不指定，在创建一个空对象之后对属性逐个赋值，但是必须按照_fields里面的顺序赋值。
+        #if buf is None and not kwargs:
+        #    raise ValueError('buf or kwargs should be given')
         if buf:
             self._init_from_buf(buf)
         else:
@@ -289,11 +375,12 @@ class struct_base(metaclass=struct_meta):
             sidx = self._read(fmt_spec, field, buf, sidx)
         self._sidx = sidx
     def _init_from_kwargs(self, kwargs):
-        if set(self._fields) != set(kwargs):
-            raise ValueError('wrong kwargs, should contain %s' % self._fields)
-        # 这里不检查参数值的有效性，在tobytes函数里会抛出异常。
-        for k, v in kwargs.items():
-            setattr(self, k, v)
+        if set(kwargs) - set(self._fields):
+            raise ValueError('kwargs contains keys which are not in %s' % self._fields)
+        # 按_fields里面的顺序赋值
+        for k in self._fields:
+            if k in kwargs:
+                setattr(self, k, kwargs[k])
     def _field_ref(self, n):
         fn = self._fields[(-n)-1]
         n = getattr(self, fn, None)
@@ -301,11 +388,11 @@ class struct_base(metaclass=struct_meta):
             raise ValueError('field(%s) value should be int' % fe)
         return n
     def _read(self, fmt_spec, field, buf, sidx):
-        n, flag, fmt_list = fmt_spec
+        n, flag, fmt_list, fmt_str, fmt_info = fmt_spec
         if n == 0:
             v, sidx = self._read_one(flag, fmt_list, buf, sidx)
         else:
-            if n < 0:
+            if n < 0: # 这个不能放在n==0前面，因为_field_ref可能返回0
                 n = self._field_ref(n)
             v = []
             for i in range(n):
@@ -329,8 +416,10 @@ class struct_base(metaclass=struct_meta):
             res += self._write(fmt_spec, field)
         return res
     def _write(self, fmt_spec, field):
-        n, flag, fmt_list = fmt_spec
+        n, flag, fmt_list, fmt_str, fmt_info = fmt_spec
         fval = getattr(self, field)
+        if isinstance(fval, struct_attr_descriptor):
+            raise ValueError('attribute(%s) is not assigned' % field)
         if n == 0: # fval可以是单值或者序列。
             res, leftval = self._write_one(flag, fmt_list, fval)
         else: # fval必须是序列，fval中的元素可以是单值或者序列。
@@ -371,14 +460,16 @@ class struct_base(metaclass=struct_meta):
         c = fmt[:-1]
         c = int(c) if c else 0
         v, sidx = Xval.frombuf(c, flag, buf, sidx)
-        raise [v], sidx
+        return [v], sidx
     _read_map = dict(zip(structview.format_list, itertools.repeat(_read_std)))
     _read_map['x'] = _read_x
     _read_map['X'] = _read_X
+    del _read_std, _read_x, _read_X
     # write map
     # _write_xxx函数返回结果字节串和剩余的值列表
     def _write_s(flag, fmt, val):
-        res = struct.pack(flag+fmt, val[0])
+        d = bytes(val[0])
+        res = struct.pack(flag+fmt, d)
         return res, val[1:]
     def _write_std(flag, fmt, val):
         c = fmt[:-1]
@@ -397,12 +488,20 @@ class struct_base(metaclass=struct_meta):
         c = int(c) if c else 0
         # val[0]必须是个iterable，Xval支持iterable协议
         res = Xval(val[0], c, flag).tobuf()
-        raise res, val[1:]
+        return res, val[1:]
     _write_map = dict(zip(structview.format_list, itertools.repeat(_write_std)))
     _write_map['s'] = _write_s
     _write_map['x'] = _write_x
     _write_map['X'] = _write_X
-
+    del _write_s, _write_std, _write_x, _write_X
+# examples for testing
+__all__ += ['S1', 'S2']
+class S1(struct_base):
+    _formats = '>i p>xi'
+    _fields = 'num name_age_list'
+class S2(struct_base):
+    _formats = '>i 1>i >ii 2>ii'
+    _fields = 'v1 v2 v3 v4'
 # main
 if __name__ == '__main__':
     sv = structview('=', 'iii', bytearray(12), fields = 'a b c')
