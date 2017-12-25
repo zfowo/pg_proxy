@@ -142,10 +142,16 @@ def get_cstr(buf, sidx, nullbyte=False):
     else:
         d = buf[idx:sidx-1]
     return d, sidx
-# xval表示单个字节串
+# xval表示单个字节串。在创建xval对象后不要修改它的属性值。
+# c=0表示字节串以\x00结尾，这时字节串中不能包含\x00。
+# c>0表示字节串前面有c个字节表示字节串的大小，这时字节串可以包含\x00。
+# c>0时，大小前缀支持负数，负数表示后面没有字节串，不过这个负值对某些应用可能有特别的意义。
 class xval(object):
     _c2fmt = [None, 'b', 'h', None, 'i']
-    def __init__(self, data, c=0, flag='>'):
+    # c=0时后面的flags和sz参数无意义
+    # sz不能大于0，sz<0时表示是个负值串
+    # 如果data是xval对象，那么将会丢失负值串信息。可以用make来从一个xval创建新的xval，这样可以保留负值串信息。
+    def __init__(self, data, c=1, flag='>', sz=0):
         self.data = bytes(data)
         self.c = c
         if self.c not in (0, 1, 2, 4):
@@ -156,40 +162,79 @@ class xval(object):
         self.flag = flag
         if self.flag not in struct_meta.flag_list:
             raise ValueError('unknown flag:%s' % self.flag)
+        
+        self.sz = sz
+        if self.sz > 0:
+            raise ValueError('sz can not be greater than 0')
+        if self.c == 0 and self.sz < 0:
+            raise ValueError('sz can not be less than 0 while c is 0')
+        if self.c > 0 and self.sz < 0:
+            self.data = b''
     def __str__(self):
-        return "<xval data:{0} c:{1} flag:'{2}'>".format(self.data, self.c, self.flag)
+        return "<xval data:{0} c:{1} flag:'{2}' sz:{3}>".format(self.data, self.c, self.flag, self.sz)
     def __repr__(self):
-        return 'xval({0!r}, {1!r}, {2!r})'.format(self.data, self.c, self.flag)
+        return 'xval({0!r}, {1!r}, {2!r}, {3!r})'.format(self.data, self.c, self.flag, self.sz)
     def __bytes__(self):
         return self.data
     def __len__(self):
         return len(self.data)
+    def make(self, c, flag):
+        if c == self.c and flag == self.flag:
+            return self
+        if c == 0:
+            return xval(self.data, c, flag)
+        else:
+            return xval(self.data, c, flag, self.sz)
     def tobuf(self):
         if self.c == 0:
             return self.data + b'\x00'
         else:
             fmt = self.flag + self._c2fmt[self.c]
-            return struct.pack(fmt, len(self.data)) + self.data
+            if self.sz < 0:
+                return struct.pack(fmt, self.sz)
+            else:
+                return struct.pack(fmt, len(self.data)) + self.data
     @classmethod
     def frombuf(cls, c, flag, buf, sidx):
         if c == 0:
             data, sidx = get_cstr(buf, sidx)
+            sz = 0
         else:
             fmt = flag + cls._c2fmt[c]
             sz = struct.unpack(fmt, buf[sidx:sidx+c])[0]
             sidx += c
-            data = buf[sidx:sidx+sz]
-            sidx += sz
-        return cls(data, c, flag), sidx
-# Xval表示多个字节串
-# c=0时不支持空字节串
+            data = b''
+            if sz > 0:
+                data = buf[sidx:sidx+sz]
+                sidx += sz
+                sz = 0
+        return cls(data, c, flag, sz), sidx
+# Xval表示多个字节串。
+# c1=0时，单个字节串以\x00结尾，整个Xval也以\x00结尾，所以单个字节串不允许是空串。
+# c1>0时，开头有c1个字节表示有多少个串，c2表示单个串的格式，即使c2=0也支持空串。
+# **需要特别注意的是**：
+#   如果data_list里面有c2>0的xval，那么用c2=0构造Xval的时候会导致负值串信息丢失，负值串会变成空串。
+#   所以最好用属性对应的c1/c2来初始化Xval(可以调用struct_base.fmt函数来获得c1/c2)，
+#   或者初始化Xval的时候不用c2=0，所以把c1/c2的缺省值改为非0。
 class Xval(object):
-    def __init__(self, data_list, c=0, flag='>'):
-        self.xval_list = [xval(d, c, flag) for d in data_list]
-        self.c = c
+    _c2fmt = [None, 'b', 'h', None, 'i']
+    def __init__(self, data_list, c1=1, c2=1, flag='>'):
+        if c1 not in (0, 1, 2, 4):
+            raise ValueError('wrong c1 for Xval')
+        if c1 == 0 and c2 != 0:
+            raise ValueError('c2 should be 0 while c1 is 0')
+        self.c = c1
+        
+        self.xval_list = []
+        for d in data_list:
+            if isinstance(d, xval):
+                d = d.make(c2, flag)
+            else:
+                d = xval(d, c2, flag)
+            self.xval_list.append(d)
         self.flag = flag
-        if self.c == 0 and any(len(xv)==0 for xv in self.xval_list):
-            raise ValueError('Xval does not support empty byte string while c=0')
+        if c1 == 0 and any(len(xv)==0 for xv in self.xval_list):
+            raise ValueError('Xval does not support empty byte string while c1=0')
     def __repr__(self):
         return "<Xval xval_list:{0} c:{1} flag:'{2}'>".format(len(self.xval_list), self.c, self.flag)
     def __len__(self):
@@ -201,7 +246,7 @@ class Xval(object):
     def tobuf(self):
         res = b''
         if self.c > 0:
-            fmt = self.flag + xval._c2fmt[self.c]
+            fmt = self.flag + self._c2fmt[self.c]
             res += struct.pack(fmt, len(self.xval_list))
         for v in self.xval_list:
             res += v.tobuf()
@@ -209,23 +254,21 @@ class Xval(object):
             res += b'\x00'
         return res
     @classmethod
-    def frombuf(cls, c, flag, buf, sidx):
+    def frombuf(cls, c1, c2, flag, buf, sidx):
         data_list = []
-        if c == 0:
+        if c1 == 0:
             while buf[sidx] != 0:
-                d, sidx = get_cstr(buf, sidx)
+                d, sidx = xval.frombuf(c2, flag, buf, sidx)
                 data_list.append(d)
             sidx += 1
         else:
-            fmt = flag + xval._c2fmt[c]
-            cnt = struct.unpack(fmt, buf[sidx:sidx+c])[0]
-            sidx += c
+            fmt = flag + cls._c2fmt[c1]
+            cnt = struct.unpack(fmt, buf[sidx:sidx+c1])[0]
+            sidx += c1
             for i in range(cnt):
-                sz = struct.unpack(fmt, buf[sidx:sidx+c])[0]
-                sidx += c
-                data_list.append(buf[sidx:sidx+sz])
-                sidx += sz
-        return cls(data_list, c, flag), sidx
+                d, sidx = xval.frombuf(c2, flag, buf, sidx)
+                data_list.append(d)
+        return cls(data_list, c1, c2, flag), sidx
 # struct attribute descriptor
 # 不用实现__get__，这样通过类访问会返回描述符本身，通过instance访问的话会返回instance字典里的同名属性。
 class struct_attr_descriptor(object):
@@ -265,6 +308,8 @@ class struct_meta(type):
     def __new__(cls, name, bases, ns):
         if '_formats' not in ns or '_fields' not in ns:
             raise ValueError('class %s should has _formats and _fields' % name)
+        if '_field2idx' in ns:
+            raise ValueError('class %s should not define _field2idx' % name)
         ns['_formats_original'] = ns['_formats']
         ns['_fields_original'] = ns['_fields']
         
@@ -277,6 +322,10 @@ class struct_meta(type):
             if fn[0] == '_':
                 raise ValueError('fieldname in _fields can not starts with undercore')
         ns['_fields'] = tuple(_fields)
+        field2idx = {}
+        for idx, fn in enumerate(ns['_fields']):
+            field2idx[fn] = idx
+        ns['_field2idx'] = field2idx
         
         _formats = ns['_formats']
         if type(_formats) == str:
@@ -307,7 +356,7 @@ class struct_meta(type):
         return n
     @classmethod
     def _parse_format(cls, fmt, idx):
-        p_split = '([%s])' % ''.join(struct_meta.flag_list)
+        p_split = '([%s])' % ''.join(cls.flag_list)
         split_res = re.split(p_split, fmt)
         if len(split_res) != 3:
             raise ValueError('wrong format:%s' % fmt)
@@ -330,12 +379,28 @@ class struct_meta(type):
                 fmt_info.append(c)
                 if c < 0: # 原始c可能是-0，所以需要修改fi
                     fi = '%s%s' % (c, f)
-            elif f == 'x' or f == 'X':
+            elif f == 'x':
                 c = int(c) if c else 0
                 if c not in (0, 1, 2, 4):
-                    raise ValueError('the prefix n of x/X in %s should be 0|1|2|4' % fmt)
+                    raise ValueError('the prefix n of x in %s should be 0|1|2|4' % fmt)
                 fmt_str += f
                 fmt_info.append(c)
+                fi = '%s%s' % (c, f)
+            elif f == 'X':
+                if not c:
+                    c = '00'
+                elif len(c) == 1:
+                    c = c*2
+                elif len(c) > 2:
+                    raise ValueError('wrong prefix n(%s) for X in %s' % (c, fmt))
+                c1, c2 = int(c[0]), int(c[1])
+                if c1 not in (0, 1, 2, 4) or c2 not in (0, 1, 2, 4):
+                    raise ValueError('the prefix n of X in %s should be 0|1|2|4' % fmt)
+                if c1 == 0 and c2 != 0:
+                    raise ValueError('the prefix n can not be 0(1|2|4) in %s' % fmt)
+                fmt_str += f
+                fmt_info.append(c)
+                fi = '%s%s%s' % (c1, c2, f)
             else:
                 c = int(c) if c else 1
                 if c <= 0:
@@ -352,9 +417,10 @@ class struct_meta(type):
 # flag必须指定，有效值是struct_meta.flag_list里面的值。
 # f是单个字符，必须是struct_meta.format_list里面的字符，f前面可以有数字前缀n，对于s，n<0的含义同前面一样
 # f也可以是下面这些自定义的字符: 
-#     [0|n]x : 单个串。0表示字节串以\x00结尾；n(1|2|4)表示开头n个字节为字节串的大小。
-#     [0|n]X : 多个串。0表示多个字节串以\x00结尾，单个字节串也以\x00结尾，也就是最后会有2个\x00，不支持空串；
-#                      n(1|2|4)表示开头n个字节表示字节串数量，每个字节串前面也有表示字节串大小的n个字节。
+#     [n]x : 单个串。0表示字节串以\x00结尾；(1|2|4)表示开头n个字节为字节串的大小。
+#     [n]X : 多个串。n(c1c2)包含2个数字，如果第一个数字c1为0则第二个数字c2也必须为0。
+#                    00表示多个字节串以\x00结尾，单个字节串也以\x00结尾，也就是最后会有2个\x00，不支持空串；
+#                    c1>0则表示开头c1个字节表示字节串的数目，c2=0表示字节串以\x00结尾，c2>0表示字节串的前面c2个字节表示字节串的大小。
 # struct_meta会把_formats转换成fmt_spec的列表，fmt_spec包含5部分：
 #     n, flag, fmt_list : fmt_list是单个fmt的序列
 #     fmt_str : 不包含数字前缀的格式字符组成的串。对于非s/x/X格式字符，会根据前缀数字扩展。比如3i -> iii
@@ -372,6 +438,19 @@ class struct_base(metaclass=struct_meta):
     _check_assign = True # 如果为True或者不定义，那么在描述符里将检查属性值
     _formats = ''
     _fields = ''
+    # 获得field对应的format spec中的第idx个子format
+    @classmethod
+    def fmt(cls, field, idx=0):
+        i = cls._field2idx[field]
+        fmt_list = cls._formats[i][2]
+        fi = fmt_list[idx]
+        n, f = fi[:-1], fi[-1:]
+        if f == 'X':
+            return int(n[0]), int(n[1]), f
+        elif f == 'x':
+            return int(n), f
+        n = int(n) if n else 1
+        return n, f
     # 
     def __init__(self, buf=None, **kwargs):
         if buf is not None and kwargs:
@@ -483,12 +562,12 @@ class struct_base(metaclass=struct_meta):
         res = struct.unpack(fmt, buf[sidx:sidx+sz])
         return res, sidx+sz
     def _read_x(self, flag, fmt, buf, sidx):
-        n = self._process_n(fmt[:-1], 0)
-        v, sidx = xval.frombuf(n, flag, buf, sidx)
+        c = int(fmt[0])
+        v, sidx = xval.frombuf(c, flag, buf, sidx)
         return [v], sidx
     def _read_X(self, flag, fmt, buf, sidx):
-        n = self._process_n(fmt[:-1], 0)
-        v, sidx = Xval.frombuf(n, flag, buf, sidx)
+        c1, c2 = int(fmt[0]), int(fmt[1])
+        v, sidx = Xval.frombuf(c1, c2, flag, buf, sidx)
         return [v], sidx
     _read_map = dict(zip(structview.format_list, itertools.repeat(_read_std)))
     _read_map['x'] = _read_x
@@ -508,15 +587,18 @@ class struct_base(metaclass=struct_meta):
         res = struct.pack(flag+fmt, *val[:n])
         return res, val[n:]
     def _write_x(self, flag, fmt, val):
-        n = self._process_n(fmt[:-1], 0)
-        # xval支持__bytes__,所以不需要检查val[0]是否是xval类型。
-        d = bytes(val[0])
-        res = xval(d, n, flag).tobuf()
+        c = int(fmt[0])
+        d = val[0]
+        if isinstance(d, xval):
+            d = d.make(c, flag)
+        else:
+            d = xval(d, c, flag)
+        res = d.tobuf()
         return res, val[1:]
     def _write_X(self, flag, fmt, val):
-        n = self._process_n(fmt[:-1], 0)
+        c1, c2 = int(fmt[0]), int(fmt[1])
         # val[0]必须是个iterable，Xval支持iterable协议
-        res = Xval(val[0], n, flag).tobuf()
+        res = Xval(val[0], c1, c2, flag).tobuf()
         return res, val[1:]
     _write_map = dict(zip(structview.format_list, itertools.repeat(_write_std)))
     _write_map['s'] = _write_s
