@@ -129,7 +129,7 @@ class structview(object):
         self[idx] = value
 
 # struct_base etc.
-__all__ += ['struct_base', 'xval', 'Xval', 'def_struct']
+__all__ += ['struct_meta', 'struct_base', 'xval', 'Xval', 'def_struct']
 # 获得\x00结尾的字节串，返回字节串和下一个sidx。
 # nullbyte表示返回值是否保留结尾的\x00字节。
 def get_cstr(buf, sidx, nullbyte=False):
@@ -291,6 +291,7 @@ class struct_attr_descriptor(object):
                 if sz > 1:
                     for item in val:
                         self._check_sequence(item, sz)
+            self._apply_instance_check(instance, val)
         instance.__dict__[self.name] = val
     # sz <  0 只检查是否是序列
     # sz >= 0 检查是否是序列，并且大小是否是sz
@@ -299,13 +300,22 @@ class struct_attr_descriptor(object):
             raise ValueError('val(%s) is not sequence' % v)
         if sz >= 0 and len(v) != sz:
             raise ValueError('len of val(%s) is not equal %s' % (v, sz))
+    # 检查instance是否提供了相关的检查函数，如果有就调用它。
+    def _apply_instance_check(self, instance, val):
+        m = getattr(instance, '_check_'+self.name, None)
+        if not m:
+            return
+        m(val)
 # meta class for struct_base
+# _formats和_fields必须同时指定，或者都不指定，如果都不指定，那么继承基类。
 class struct_meta(type):
     flag_list = structview.flag_list
     format_list = structview.format_list + tuple('sxX')
     def __repr__(self):
         return "<class '%s.%s' _formats='%s' _fields='%s'>" % (self.__module__, self.__name__, self._formats_original, self._fields_original)
     def __new__(cls, name, bases, ns):
+        if '_formats' not in ns and '_fields' not in ns:
+            return super().__new__(cls, name, bases, ns)
         if '_formats' not in ns or '_fields' not in ns:
             raise ValueError('class %s should has _formats and _fields' % name)
         if '_field2idx' in ns:
@@ -421,6 +431,7 @@ class struct_meta(type):
 #     [n]X : 多个串。n(c1c2)包含2个数字，如果第一个数字c1为0则第二个数字c2也必须为0。
 #                    00表示多个字节串以\x00结尾，单个字节串也以\x00结尾，也就是最后会有2个\x00，不支持空串；
 #                    c1>0则表示开头c1个字节表示字节串的数目，c2=0表示字节串以\x00结尾，c2>0表示字节串的前面c2个字节表示字节串的大小。
+#                    除了00，其他格式其实可以用x来代替，比如'>11X'和'>b -0>1x'可以达到同样的效果。
 # struct_meta会把_formats转换成fmt_spec的列表，fmt_spec包含5部分：
 #     n, flag, fmt_list : fmt_list是单个fmt的序列
 #     fmt_str : 不包含数字前缀的格式字符组成的串。对于非s/x/X格式字符，会根据前缀数字扩展。比如3i -> iii

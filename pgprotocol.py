@@ -488,7 +488,7 @@ def make_CopyFail2(errmsg):
 def process_Describe(msg_type, msg_data):
     obj_type = msg_data[:1]
     obj_name = get_cstr(msg_data, 1)
-    return ('Close', msg_type, obj_type, obj_name)
+    return ('Describe', msg_type, obj_type, obj_name)
 def make_Describe1(msg_res):
     return make_Describe2(msg_res[2], msg_res[3])
 def make_Describe2(obj_type, obj_name):

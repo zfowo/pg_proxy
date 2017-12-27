@@ -99,65 +99,73 @@ class spoller(poller_base):
         for obj in res:
             res_list.append((obj, res[obj]))
         return res_list
-# 
-# 基于select.poll
-# 
-class poller(poller_base):
-    POLLIN  = select.POLLIN
-    POLLOUT = select.POLLOUT
-    POLLERR = select.POLLERR
-    def __init__(self):
-        super().__init__()
-        self.p = select.poll()
-    def register(self, fobj, eventmask):
-        ret = super()._register(fobj, eventmask)
-        self.p.register(ret[0], eventmask)
-    def modify(self, fobj, eventmask):
-        ret = super()._modify(fobj, eventmask)
-        self.p.modify(ret[0], eventmask)
-    def unregister(self, fobj):
-        ret = super()._unregister(fobj)
-        self.p.unregister(ret[0])
-    def _poll(self, timeout = None):
-        res = self.p.poll(timeout)
-        res_list = []
-        for fd, event in res:
-            res_list.append((self.fd2objs[fd], event))
-        return res_list
-# 
-# 基于select.epoll
-# 
-class epoller(poller_base):
-    POLLIN  = select.EPOLLIN
-    POLLOUT = select.EPOLLOUT
-    POLLERR = select.EPOLLERR
-    def __init__(self):
-        super().__init__()
-        self.p = select.epoll()
-    def register(self, fobj, eventmask):
-        ret = super()._register(fobj, eventmask)
-        if ret[1]:
+
+if os.name == 'posix':
+    # 
+    # 基于select.poll
+    # 
+    class poller(poller_base):
+        POLLIN  = select.POLLIN
+        POLLOUT = select.POLLOUT
+        POLLERR = select.POLLERR
+        def __init__(self):
+            super().__init__()
+            self.p = select.poll()
+        def register(self, fobj, eventmask):
+            ret = super()._register(fobj, eventmask)
+            self.p.register(ret[0], eventmask)
+        def modify(self, fobj, eventmask):
+            ret = super()._modify(fobj, eventmask)
+            self.p.modify(ret[0], eventmask)
+        def unregister(self, fobj):
+            ret = super()._unregister(fobj)
             self.p.unregister(ret[0])
-        self.p.register(ret[0], eventmask)
-    def modify(self, fobj, eventmask):
-        ret = super()._modify(fobj, eventmask)
-        self.p.modify(ret[0], eventmask)
-    def unregister(self, fobj):
-        ret = super()._unregister(fobj)
-        self.p.unregister(ret[0])
-    def _poll(self, timeout = None, maxevents = -1):
-        if timeout == None:
-            timeout = -1
-        res = self.p.poll(timeout = timeout, maxevents = maxevents)
-        res_list = []
-        for fd, event in res:
-            res_list.append((self.fd2objs[fd], event))
-        return res_list
-    def close(self):
-        self.p.close()
-        super().close()
-# 调用者应该先检查返回值是否是None。返回None表示select返回假的可读信号或者可读的数据checksum失败，需要对方重传。
-def myrecv(s, bufsize):
+        def _poll(self, timeout = None):
+            res = self.p.poll(timeout)
+            res_list = []
+            for fd, event in res:
+                res_list.append((self.fd2objs[fd], event))
+            return res_list
+    # 
+    # 基于select.epoll
+    # 
+    class epoller(poller_base):
+        POLLIN  = select.EPOLLIN
+        POLLOUT = select.EPOLLOUT
+        POLLERR = select.EPOLLERR
+        def __init__(self):
+            super().__init__()
+            self.p = select.epoll()
+        def register(self, fobj, eventmask):
+            ret = super()._register(fobj, eventmask)
+            if ret[1]:
+                self.p.unregister(ret[0])
+            self.p.register(ret[0], eventmask)
+        def modify(self, fobj, eventmask):
+            ret = super()._modify(fobj, eventmask)
+            self.p.modify(ret[0], eventmask)
+        def unregister(self, fobj):
+            ret = super()._unregister(fobj)
+            self.p.unregister(ret[0])
+        def _poll(self, timeout = None, maxevents = -1):
+            if timeout == None:
+                timeout = -1
+            res = self.p.poll(timeout = timeout, maxevents = maxevents)
+            res_list = []
+            for fd, event in res:
+                res_list.append((self.fd2objs[fd], event))
+            return res_list
+        def close(self):
+            self.p.close()
+            super().close()
+# 
+# 如果s是非阻塞的，即使通过poll检测到可读，也可能返回None，
+# 这是因为poll可能返回假的可读信号或者可读的数据checksum失败，需要对方重传。
+# 所以需要检查返回值是否为None。
+# 
+# 如果s是阻塞的，则不会返回None。
+# 
+def myrecv(s, bufsize=4096):
     try:
         data = s.recv(bufsize)
     except OSError as ex:
@@ -166,15 +174,15 @@ def myrecv(s, bufsize):
         raise
     return data
 # 
-# 接收消息函数。s应该是阻塞的，也就是s.settimeout(None)。
-# 如果对端已经close则抛出RuntimeError异常。
+# 接收sz个字节。调用之前应该把s设为阻塞，也就是s.settimeout(None)。
+# 如果对端已经close则抛出异常。
 # 
 def recv_size(s, sz):
     ret = b'';
     while sz > 0:
         tmp = s.recv(sz)
         if not tmp:
-            raise RuntimeError('the peer(%s) closed the connection. last recved:[%s]' % (s.getpeername(), ret));
+            raise RuntimeError('the peer(%s) closed the connection. last recved:[%s]' % (s.getpeername(), ret))
         ret += tmp
         sz -= len(tmp)
     return ret
