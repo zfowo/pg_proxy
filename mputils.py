@@ -18,29 +18,39 @@ def assert_no_attr(obj, *attnames):
         if hasattr(obj, an):
             raise ValueError('%s already has attribute %s' % (obj, an))
 # 如果iterfn/getfn为None，那么就用__iter__/__getitem__，如果getfn是None，那么还要增加__len__函数。
-# 如果iterfn/getfn为空串，则函数名为get_<restype>s和get_<restype>。
-# f对属性中的每个数据先做处理一下再传给restype。
-def SeqAccess(cls=None, *, attname, iterfn=None, getfn=None, restype, resfields, f=lambda x:x):
+# 如果iterfn/getfn为空串，则函数名为get_<restype>s和get_<restype>，如果restype=None则报错。
+# 如果restype为None，那么iterfn/getfn不能为空串，此时不会创建namedtuple类型。
+# f对属性中的每个数据先做处理一下再传给restype或者直接返回。
+def SeqAccess(cls=None, *, attname, iterfn=None, getfn=None, restype=None, resfields='', f=lambda x:x):
     if cls is None:
         return functools.partial(SeqAccess, attname=attname, iterfn=iterfn, getfn=getfn, restype=restype, resfields=resfields, f=f)
     
-    assert_no_attr(cls, restype)
-    t = collections.namedtuple(restype, resfields)
-    setattr(cls, restype, t)
+    t = None
+    if restype:
+        assert_no_attr(cls, restype)
+        t = collections.namedtuple(restype, resfields)
+        setattr(cls, restype, t)
     
     if iterfn is None:
         iterfn = '__iter__'
     elif iterfn == '':
-        iterfn = 'get_%ss' % restype
+        if restype:
+            iterfn = 'get_%ss' % restype
+        else:
+            raise ValueError('iterfn can not be empty while restype is None')
     if getfn is None:
         getfn = '__getitem__'
     elif getfn == '':
-        getfn = 'get_%s' % restype
+        if restype:
+            getfn = 'get_%s' % restype
+        else:
+            raise ValueError('getfn can not be empty while restype is None')
     assert_no_attr(cls, iterfn, getfn)
     
     def MyIter(self):
         for x in getattr(self, attname):
-            yield t(*f(x))
+            v = f(x)
+            yield t(*v) if restype else v
     MyIter.__name__ = iterfn
     MyIter.__qualname__ = '%s.%s' % (cls.__name__, iterfn)
     setattr(cls, iterfn, MyIter)
@@ -48,7 +58,7 @@ def SeqAccess(cls=None, *, attname, iterfn=None, getfn=None, restype, resfields,
     def MyGet(self, idx):
         v = getattr(self, attname)
         v = f(v[idx])
-        return t(*v)
+        return t(*v) if restype else v
     MyGet.__name__ = getfn
     MyGet.__qualname__ = '%s.%s' % (cls.__name__, getfn)
     setattr(cls, getfn, MyGet)

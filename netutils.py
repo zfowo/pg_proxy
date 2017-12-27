@@ -124,7 +124,7 @@ if os.name == 'posix':
             res = self.p.poll(timeout)
             res_list = []
             for fd, event in res:
-                res_list.append((self.fd2objs[fd], event))
+                res_list.append((self.fd2objs[fd][0], event))
             return res_list
     # 
     # 基于select.epoll
@@ -153,11 +153,14 @@ if os.name == 'posix':
             res = self.p.poll(timeout = timeout, maxevents = maxevents)
             res_list = []
             for fd, event in res:
-                res_list.append((self.fd2objs[fd], event))
+                res_list.append((self.fd2objs[fd][0], event))
             return res_list
         def close(self):
             self.p.close()
             super().close()
+else:
+    poller = spoller
+    epoller = spoller
 # 
 # 如果s是非阻塞的，即使通过poll检测到可读，也可能返回None，
 # 这是因为poll可能返回假的可读信号或者可读的数据checksum失败，需要对方重传。

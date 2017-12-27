@@ -170,14 +170,19 @@ class xval(object):
             raise ValueError('sz can not be less than 0 while c is 0')
         if self.c > 0 and self.sz < 0:
             self.data = b''
-    def __str__(self):
-        return "<xval data:{0} c:{1} flag:'{2}' sz:{3}>".format(self.data, self.c, self.flag, self.sz)
     def __repr__(self):
-        return 'xval({0!r}, {1!r}, {2!r}, {3!r})'.format(self.data, self.c, self.flag, self.sz)
+        if self.sz < 0:
+            return "<xval data:-1>"
+        else:
+            return "<xval data:{}>".format(self.data,)
+    def _info(self):
+        return "<xval data:{} c:{} flag:'{}' sz:{}>".format(self.data, self.c, self.flag, self.sz)
     def __bytes__(self):
         return self.data
     def __len__(self):
         return len(self.data)
+    def __getitem__(self, idx):
+        return self.data[idx]
     def make(self, c, flag):
         if c == self.c and flag == self.flag:
             return self
@@ -236,7 +241,9 @@ class Xval(object):
         if c1 == 0 and any(len(xv)==0 for xv in self.xval_list):
             raise ValueError('Xval does not support empty byte string while c1=0')
     def __repr__(self):
-        return "<Xval xval_list:{0} c:{1} flag:'{2}'>".format(len(self.xval_list), self.c, self.flag)
+        return "<Xval xval_list:{}>".format(self.xval_list)
+    def _info(self):
+        return "<Xval xval_list:{} c:{} flag:'{}'>".format(len(self.xval_list), self.c, self.flag)
     def __len__(self):
         return len(self.xval_list)
     def __getitem__(self, idx):
@@ -581,6 +588,7 @@ class struct_base(metaclass=struct_meta):
         v, sidx = Xval.frombuf(c1, c2, flag, buf, sidx)
         return [v], sidx
     _read_map = dict(zip(structview.format_list, itertools.repeat(_read_std)))
+    _read_map['s'] = _read_s
     _read_map['x'] = _read_x
     _read_map['X'] = _read_X
     del _read_std, _read_x, _read_X

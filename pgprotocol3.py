@@ -49,16 +49,17 @@ class BeMsgType(metaclass=mputils.V2SMapMeta, skip=(b'',), strip=3):
     MT_CommandComplete = b'C'      # CommandComplete
     MT_CopyData = b'd'             # CopyData
     MT_CopyDone = b'c'             # CopyDone
-    MT_CopyResponse = b''          # placeholder for CopyResponse base class
+    MT_CopyResponse = b''          # placeholder for Copy[In|Out|Both]Response base class
     MT_CopyInResponse = b'G'       # CopyInResponse
     MT_CopyOutResponse = b'H'      # CopyOutResponse
-    MT_CopyBothResponse = b'W'     # CopyBothResponse
+    MT_CopyBothResponse = b'W'     # CopyBothResponse (only for Streaming Replication)
     MT_DataRow = b'D'              # DataRow
     MT_EmptyQueryResponse = b'I'   # EmptyQueryResponse
+    MT_ErrorNoticeResponse = b''   # placeholder for ErrorResponse/NoticeResponse base class
     MT_ErrorResponse = b'E'        # ErrorResponse
+    MT_NoticeResponse = b'N'       # NoticeResponse
     MT_FunctionCallResponse = b'V' # FunctionCallResponse
     MT_NoData = b'n'               # NoData
-    MT_NoticeResponse = b'N'       # NoticeResponse
     MT_NotificationResponse = b'A' # NotificationResponse (async message)
     MT_ParameterDescription = b't' # ParameterDescription
     MT_ParameterStatus = b'S'      # ParameterStatus (async message while reloading configure file)
@@ -83,6 +84,7 @@ class TransStatus(metaclass=mputils.V2SMapMeta, strip=3):
 # ErrorResponse/NoticeResponse中的field type
 class FieldType(metaclass=mputils.V2SMapMeta, strip=3):
     FT_Severity = b'S'
+    FT_Severity2 = b'V'      # same to b'S', but never localized
     FT_Code = b'C'
     FT_Message = b'M'
     FT_Detail = b'D'
@@ -161,9 +163,10 @@ def BE(cls):
     return cls
 
 # FE msg
+@mputils.SeqAccess(attname='params', f=lambda x:(None if x.sz < 0 else x.data))
 class Bind(Msg):
     _formats = '>x >x >h -0>h >24X >h -0>h'
-    _fields = 'portal pstmt fc_cnt fc_list params res_fc_cnt res_fc_list'
+    _fields = 'portal stmt fc_cnt fc_list params res_fc_cnt res_fc_list'
 @mputils.Check(attname='obj_type', attvals=ObjType.v2smap)
 class Close(Msg):
     _formats = '>s >x'
@@ -180,9 +183,10 @@ class Execute(Msg):
     _fields = 'portal max_num'
 class Flush(Msg):
     pass
+@mputils.SeqAccess(attname='args', f=lambda x:(None if x.sz < 0 else x.data))
 class FunctionCall(Msg):
     _formats = '>i >h -0>h >24X >h'
-    _fields = 'foid fc_cnt fc_list arguments res_fc'
+    _fields = 'foid fc_cnt fc_list args res_fc'
 class Parse(Msg):
     _formats = '>x >x >h -0>i'
     _fields = 'portal query param_cnt oid_list'
@@ -267,35 +271,35 @@ class CopyOutResponse(CopyResponse):
     pass
 class CopyBothResponse(CopyResponse):
     pass
+@mputils.SeqAccess(attname='col_vals', f=lambda x:(None if x.sz < 0 else x.data))
 class DataRow(Msg):
     _formats = '>24X'
     _fields = 'col_vals'
 class EmptyQueryResponse(Msg):
     pass
-# err_list是字节串列表，字节串中第一个字节是fieldtype, 剩下的是fieldval
-@mputils.SeqAccess(attname='err_list', restype='Field', resfields='t v', f=lambda x:(x[:1],x[1:]))
-class ErrorResponse(Msg):
+# field_list是字节串列表，字节串中第一个字节是fieldtype, 剩下的是fieldval
+@mputils.SeqAccess(attname='field_list', restype='Field', resfields='t v', f=lambda x:(x[:1],x[1:]))
+class ErrorNoticeResponse(Msg):
     _formats = '>X'
-    _fields = 'err_list'
+    _fields = 'field_list'
+class ErrorResponse(ErrorNoticeResponse):
+    pass
+class NoticeResponse(ErrorNoticeResponse):
+    pass
 class FunctionCallResponse(Msg):
     _formats = '>4x'
     _fields = 'res_val'
 class NoData(Msg):
     pass
-# notice_list是字节串列表，字节串中第一个字节是fieldtype, 剩下的是fieldval
-@mputils.SeqAccess(attname='notice_list', restype='Field', resfields='t v', f=lambda x:(x[:1],x[1:]))
-class NoticeResponse(Msg):
-    _formats = '>X'
-    _fields = 'notice_list'
 class NotificationResponse(Msg):
     _formats = '>i >x >x'
     _fields = 'pid channel payload'
 class ParameterDescription(Msg):
     _formats = '>h -0>i'
-    _fields = 'param_cnt oid_list'
+    _fields = 'count oid_list'
 class ParameterStatus(Msg):
     _formats = '>x >x'
-    _fields = 'param_name param_val'
+    _fields = 'name val'
 class ParseComplete(Msg):
     pass
 class PortalSuspended(Msg):
@@ -310,12 +314,23 @@ class RowDescription(Msg):
     _formats = '>h -0>xihihih'
     _fields = 'field_cnt field_list'
 
+# 
 # FE->BE的第一个消息
+# 
 PG_PROTO_VERSION2_NUM = 131072
 PG_PROTO_VERSION3_NUM = 196608
 PG_CANCELREQUEST_CODE = 80877102
 PG_SSLREQUEST_CODE    = 80877103
 
+# 
+# V3 StartupMessage的详情参见postmaster.c中的ProcessStartupPacket函数。
+# 可以包含下面这些：
+#   database
+#   user
+#   options       命令行选项
+#   replication   有效值true/false/1/0/database，database表示连接到database选项指定的数据库，一般用于逻辑复制。
+#   <guc option>  其他guc选项。比如: client_encoding/application_name
+# 
 class StartupMessage(Msg):
     _formats = '>i >X'
     _fields = 'code params'
@@ -351,9 +366,25 @@ class SSLRequest(Msg):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.code = PG_SSLREQUEST_CODE
+# 用于处理nnX(非00X/X)，负值串和None相互转换。
+def Xval2List(v):
+    return [None if x.sz < 0 else x.data for x in v]
+def List2Xval(vlist):
+    xlist = (xval(b'', sz=-1) if v is None else v for v in vlist)
+    return Xval(xlist)
+
 #============================================================================================
 # 和协议解析不直接相关的
 # 
+# 检查startup消息是否已完整，如果data太长则抛出异常，data包含开头表示长度的4个字节。
+def startup_msg_is_complete(data):
+    data_len = len(data)
+    if data_len <= 4:
+        return False
+    msg_len = struct.unpack('>i', data[:4])[0]
+    if data_len > msg_len:
+        raise RuntimeError('startup msg is invalid. msg_len:%s data_len:%s' % (msg_len, data_len))
+    return data_len == msg_len
 # 分析FE的第一个消息，返回相应的消息类的对象或者抛出异常。data不包括开头表示大小的4个字节。
 def parse_startup_msg(data):
     code = struct.unpack('>i', data[:4])[0]
