@@ -310,14 +310,13 @@ class struct_attr_descriptor(object):
     # 检查instance是否提供了相关的检查函数，如果有就调用它。
     def _apply_instance_check(self, instance, val):
         m = getattr(instance, '_check_'+self.name, None)
-        if not m:
-            return
-        m(val)
+        if m:
+            m(val)
 # meta class for struct_base
 # _formats和_fields必须同时指定，或者都不指定，如果都不指定，那么继承基类。
 class struct_meta(type):
     flag_list = structview.flag_list
-    format_list = structview.format_list + tuple('sxX')
+    format_list = structview.format_list + tuple('sxXa')
     def __repr__(self):
         return "<class '%s.%s' _formats='%s' _fields='%s'>" % (self.__module__, self.__name__, self._formats_original, self._fields_original)
     def __new__(cls, name, bases, ns):
@@ -349,6 +348,10 @@ class struct_meta(type):
             _formats = _formats.split()
         _formats_res = []
         for idx, fmt in enumerate(_formats):
+            # check 'a' format
+            if 'a' in fmt:
+                if len(fmt) != 2 or (idx + 1) != len(_formats):
+                    raise ValueError("wrong fmt '%s'. format 'a' should be last and '<flag>a'." % fmt)
             _formats_res.append(cls._parse_format(fmt, idx))
         ns['_formats'] = tuple(_formats_res)
         
@@ -439,6 +442,7 @@ class struct_meta(type):
 #                    00表示多个字节串以\x00结尾，单个字节串也以\x00结尾，也就是最后会有2个\x00，不支持空串；
 #                    c1>0则表示开头c1个字节表示字节串的数目，c2=0表示字节串以\x00结尾，c2>0表示字节串的前面c2个字节表示字节串的大小。
 #                    除了00，其他格式其实可以用x来代替，比如'>11X'和'>b -0>1x'可以达到同样的效果。
+#     a    : 表示包含剩下的所有数据，只能放在_formats的最后。
 # struct_meta会把_formats转换成fmt_spec的列表，fmt_spec包含5部分：
 #     n, flag, fmt_list : fmt_list是单个fmt的序列
 #     fmt_str : 不包含数字前缀的格式字符组成的串。对于非s/x/X格式字符，会根据前缀数字扩展。比如3i -> iii
@@ -451,6 +455,8 @@ class struct_meta(type):
 #   '2>ii' : 返回列表的列表，列表中包含两个长度为2的整数列表，比如[[1,2],[3,4]]
 # 
 # _fields : _formats中对应项的属性名。不能包含buf以及类已有的属性。
+# 
+# 传给__init__的buf的最后部分必须是个完整的结构,否则会越界访问。如果_formats的最后是'a'，那么buf必须只包含一个结构。
 # 
 class struct_base(metaclass=struct_meta):
     _check_assign = True # 如果为True或者不定义，那么在描述符里将检查属性值
@@ -528,6 +534,9 @@ class struct_base(metaclass=struct_meta):
         for fmt_spec, field in zip(self._formats, self._fields):
             res += self._write(fmt_spec, field)
         return res
+    def field_assigned(self, field):
+        fval = getattr(self, field)
+        return not isinstance(fval, struct_attr_descriptor)
     def _write(self, fmt_spec, field):
         n, flag, fmt_list, fmt_str, fmt_info = fmt_spec
         fval = getattr(self, field)
@@ -587,12 +596,16 @@ class struct_base(metaclass=struct_meta):
         c1, c2 = int(fmt[0]), int(fmt[1])
         v, sidx = Xval.frombuf(c1, c2, flag, buf, sidx)
         return [v], sidx
+    def _read_a(self, flag, fmt, buf, sidx):
+        v = buf[sidx:]
+        return [v], len(buf)
     _read_map = dict(zip(structview.format_list, itertools.repeat(_read_std)))
     _read_map['s'] = _read_s
     _read_map['x'] = _read_x
     _read_map['X'] = _read_X
-    del _read_std, _read_x, _read_X
-    # _write_xxx函数返回结果字节串和剩余的值列表
+    _read_map['a'] = _read_a
+    del _read_s, _read_std, _read_x, _read_X, _read_a
+    # _write_xxx函数返回结果字节串和剩余的值列表。根据fmt从val取需要的数据项个数，val是个序列。
     # 对于s格式，strut.pack的时候，如果给定的字节串太长则会截断，如果太短则会用\x00填补。
     # 而struct.unpack的时候，必须给定相同长度的字节串。
     def _write_s(self, flag, fmt, val):
@@ -619,11 +632,15 @@ class struct_base(metaclass=struct_meta):
         # val[0]必须是个iterable，Xval支持iterable协议
         res = Xval(val[0], c1, c2, flag).tobuf()
         return res, val[1:]
+    def _write_a(self, flag, fmt, val):
+        res = bytes(val[0])
+        return res, val[1:]
     _write_map = dict(zip(structview.format_list, itertools.repeat(_write_std)))
     _write_map['s'] = _write_s
     _write_map['x'] = _write_x
     _write_map['X'] = _write_X
-    del _write_s, _write_std, _write_x, _write_X
+    _write_map['a'] = _write_a
+    del _write_s, _write_std, _write_x, _write_X, _write_a
 # utility func to define struct_base derived class
 def def_struct(name, formats, fields):
     return struct_meta(name, (struct_base,), {'_formats':formats, '_fields':fields})

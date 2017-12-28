@@ -6,6 +6,8 @@
 # FE的第一个消息不包含type部分。
 # 传给Msg派生类的buf不包含开头的5个字节(或者4个字节)。
 # 
+# 现在对于不能识别的消息类型直接抛出异常，这样做可能不是很合适，因为pg新版本可能增加新的消息类型。
+# 
 import sys, os
 import struct
 import hashlib
@@ -35,8 +37,9 @@ class FeMsgType(metaclass=mputils.V2SMapMeta, skip=(b'',), strip=3):
     MT_Execute = b'E'              # Execute
     MT_Flush = b'H'                # Flush
     MT_FunctionCall = b'F'         # FunctionCall
-    MT_Parse = b'P'                # Parse (大写的P)
-    MT_PasswordMessage = b'p'      # PasswordMessage (小写的p)
+    MT_Parse = b'P'                # Parse (大写P)
+    # TODO: 'p'类型的消息类似于Authentication，表示多个消息类型，不过只能从上下文中判断。
+    MT_PasswordMessage = b'p'      # PasswordMessage (小写p) SASLInitialResponse SASLResponse GSSResponse。对Authentication的响应消息
     MT_Query = b'Q'                # Query
     MT_Sync = b'S'                 # Sync
     MT_Terminate = b'X'            # Terminate
@@ -58,7 +61,7 @@ class BeMsgType(metaclass=mputils.V2SMapMeta, skip=(b'',), strip=3):
     MT_ErrorNoticeResponse = b''   # placeholder for ErrorResponse/NoticeResponse base class
     MT_ErrorResponse = b'E'        # ErrorResponse
     MT_NoticeResponse = b'N'       # NoticeResponse
-    MT_FunctionCallResponse = b'V' # FunctionCallResponse
+    MT_FunctionCallResponse = b'V' # FunctionCallResponse (大写V)
     MT_NoData = b'n'               # NoData
     MT_NotificationResponse = b'A' # NotificationResponse (async message)
     MT_ParameterDescription = b't' # ParameterDescription
@@ -210,32 +213,22 @@ class Terminate(Msg):
     pass
 
 # BE msg
-# Authentication特殊，不从Msg派生。
-@BE
-class Authentication():
-    msg_type = MsgType.MT_Authentication
-    # buf和关键字参数互斥
-    def __init__(self, buf=None, *, authtype=None, data=b''):
-        if buf:
-            self.authtype = struct.unpack('>i', buf[:4])[0]
-            self.data = buf[4:]
-        else:
-            self.authtype = authtype
-            self.data = data
-        self._check()
-    def _check(self):
-        if self.authtype not in AuthType.v2smap:
-            raise ValueError('unknown authtype %s' % self.authtype)
-        if self.authtype not in AuthType._HasData and self.data:
-            raise ValueError('authtype(%s) should not has data(%s)' % (AuthType.v2smap[self.authtype], self.data))
-        if self.authtype in AuthType._HasData and not self.data:
-            raise ValueError('authtype(%s) should has data' % (AuthType.v2smap[self.authtype],))
+# 某些authtype即使是没有data值的，也要把b''赋值给data。
+@mputils.Check(attname='authtype', attvals=AuthType.v2smap)
+class Authentication(Msg):
+    _formats = '>i >a'
+    _fields = 'authtype data'
+    # 检查val是否是有效的data，在给data赋值前必须先给authtype赋值。
+    def _check_data(self, val):
+        if not self.field_assigned('authtype'):
+            raise ValueError('authtype should be assigned before data')
+        if self.authtype not in AuthType._HasData and val:
+            raise ValueError('authtype(%s) should has empty data(%s)' % (AuthType.v2smap[self.authtype], val))
+        if self.authtype in AuthType._HasData and not val:
+            raise ValueError('authtype(%s) should has data which is not empty' % (AuthType.v2smap[self.authtype],))
         # 检查具体auth类型的data的有效性
-        if self.authtype == AuthType.AT_MD5Password and len(self.data) != 4:
-            raise ValueError('the data size for authtype(MD5Password) should be 4:%s' % self.data)
-    def tobytes(self):
-        d = struct.pack('>i', self.authtype) + self.data
-        return self.msg_type + struct.pack('>i', len(d)+4) + d
+        if self.authtype == AuthType.AT_MD5Password and len(val) != 4:
+            raise ValueError('the data size for authtype(MD5Password) should be 4:%s' % val)
     def __repr__(self):
         return '<%s authtype=%s data=%s>' % (type(self).__name__, AuthType.v2smap[self.authtype], self.data)
 class BackendKeyData(Msg):
@@ -248,17 +241,9 @@ class CloseComplete(Msg):
 class CommandComplete(Msg):
     _formats = '>x'
     _fields = 'tag'
-# CopyData特殊，单独实现，不从Msg派生。
-@FE
-@BE
-class CopyData():
-    msg_type = MsgType.MT_CopyData
-    def __init__(self, buf):
-        self.data = buf
-    def tobytes(self):
-        return self.msg_type + struct.pack('>i', len(self.data)+4) + self.data
-    def __repr__(self):
-        return '<%s data=%s>' % (type(self).__name__, self.data)
+class CopyData(Msg):
+    _formats = '>a'
+    _fields = 'data'
 class CopyDone(Msg):
     pass
 # just base class for Copy In/Out/Both Response

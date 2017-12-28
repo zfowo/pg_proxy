@@ -15,6 +15,7 @@ class connbase():
         self.s.settimeout(0)
         self.recv_buf = b''
         self.send_buf = b''
+        self.readsz = -1 # _read函数每次最多读取多少字节，<=0表示不限。
     def fileno(self):
         return self.s.fileno()
     def close(self):
@@ -29,6 +30,8 @@ class connbase():
                 raise RuntimeError('the peer(%s) closed connection' % (s.getpeername(),))
             self.recv_buf += data
             if len(data) < 4096:
+                break
+            if self.readsz > 0 and len(self.recv_buf) >= self.readsz:
                 break
     def _write(self):
         if self.send_buf:
@@ -91,6 +94,7 @@ class pgconn(beconn):
     def write_msg(self, msg):
         super().write_msg(msg)
         self.processer = get_processer_for_msg(msg)
+    # read_msgs2/write_msgs2现在是循环读写，可能忙等待导致cpu占用，可以用poller来检查是否可读写。
     # 一直读直到有消息为止
     def read_msgs2(self):
         msg_list = self.read_msgs()
