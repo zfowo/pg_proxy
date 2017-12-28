@@ -542,6 +542,7 @@ class struct_base(metaclass=struct_meta):
         fval = getattr(self, field)
         if isinstance(fval, struct_attr_descriptor):
             raise ValueError('attribute(%s) is not assigned' % field)
+        leftval = []
         if n == 0: # fval可以是单值或者序列。
             res, leftval = self._write_one(flag, fmt_list, fval)
         else: # fval必须是序列，fval中的元素可以是单值或者序列。

@@ -7,6 +7,7 @@
 # 传给Msg派生类的buf不包含开头的5个字节(或者4个字节)。
 # 
 # 现在对于不能识别的消息类型直接抛出异常，这样做可能不是很合适，因为pg新版本可能增加新的消息类型。
+# TODO: 有些消息类型的所有对象其实都是相同的，所以可以预先创建这些对象及其bytes。类似于NoneType类型只有None这一个对象。
 # 
 import sys, os
 import struct
@@ -28,21 +29,22 @@ class FeMsgType(metaclass=mputils.V2SMapMeta, skip=(b'',), strip=3):
     MT_SSLRequest = b''            #
 
     MT_Msg = b''                   # 
+    MT_Query = b'Q'                # Query
+    MT_Parse = b'P'                # Parse (大写P)
     MT_Bind = b'B'                 # Bind
+    MT_Execute = b'E'              # Execute
+    MT_DescribeClose = b''         # placeholder for Describe/Close base class
+    MT_Describe = b'D'             # Describe
     MT_Close = b'C'                # Close
+    MT_Sync = b'S'                 # Sync
+    MT_Flush = b'H'                # Flush
     MT_CopyData = b'd'             # CopyData (和be共用)
     MT_CopyDone = b'c'             # CopyDone (和be共用)
     MT_CopyFail = b'f'             # CopyFail
-    MT_Describe = b'D'             # Describe
-    MT_Execute = b'E'              # Execute
-    MT_Flush = b'H'                # Flush
     MT_FunctionCall = b'F'         # FunctionCall
-    MT_Parse = b'P'                # Parse (大写P)
-    # TODO: 'p'类型的消息类似于Authentication，表示多个消息类型，不过只能从上下文中判断。
-    MT_PasswordMessage = b'p'      # PasswordMessage (小写p) SASLInitialResponse SASLResponse GSSResponse。对Authentication的响应消息
-    MT_Query = b'Q'                # Query
-    MT_Sync = b'S'                 # Sync
     MT_Terminate = b'X'            # Terminate
+    # 'p'类型的消息是对Authentication的响应。类似于Authentication，包括多个具体类型，不过只能从上下文中判断。
+    MT_AuthResponse = b'p'         # (小写p)具体类型包括: PasswordMessage,SASLInitialResponse,SASLResponse,GSSResponse。
 class BeMsgType(metaclass=mputils.V2SMapMeta, skip=(b'',), strip=3):
     # BE msg type
     MT_Authentication = b'R'       # AuthenticationXXX
@@ -124,7 +126,7 @@ class MsgMeta(struct_meta):
     fe_msg_map = mputils.NoRepeatAssignMap()
     be_msg_map = mputils.NoRepeatAssignMap()
     def __init__(self, name, bases, ns):
-        if self.msg_type:
+        if self.msg_type: # 跳过msg_type=b''
             mt_symbol = 'MT_' + name
             if hasattr(FeMsgType, mt_symbol):
                 type(self).fe_msg_map[self.msg_type] = self
@@ -144,7 +146,7 @@ class MsgMeta(struct_meta):
         else:
             if msg_type not in cls.be_msg_map:
                 raise ValueError('unknown be msg type:[%s]' % msg_type)
-# 消息基类。有些不能用struct_base实现的消息类不从Msg派生，包括Authentication/CopyData。
+# 消息基类。
 class Msg(struct_base, metaclass=MsgMeta):
     def tobytes(self):
         data = super().tobytes()
@@ -165,54 +167,114 @@ def BE(cls):
     MsgMeta.be_msg_map[cls.msg_type] = cls
     return cls
 
+# 
 # FE msg
+# 
+# simple query
+class Query(Msg):
+    _formats = '>x'
+    _fields = 'query'
+# extended query。
+# 一般顺序为: Parse->Bind->Describe->Execute->Close->Sync。
+# 如果想立刻收到消息的结果的话则需要后面发送Flush(Sync后面不需要Flush)，如果有错误则服务器端会立刻发回ErrorResponse(不需要Flush)。
+# 如果有错则服务器端会忽略后面的所有消息直到Sync，所以每个消息后面可以先检查是否收到ErrorResponse，如果没收到再发送后续的消息。
+# Sync会关闭事务(提交或回滚)，然后返回ReadyForQuery。每个Sync都会有一个ReadyForQuery对应。
+# 
+# param_cnt/param_oids指定参数的数据类型的oid，如果oid=0则系统会自己推导出类型。
+# 这里指定的参数个数可以小于查询语句中实际的参数个数，没有指定的参数由系统自己推导出类型。
+class Parse(Msg):
+    _formats = '>x >x >h -0>i'
+    _fields = 'stmt query param_cnt param_oids'
+    # query/stmt必须是格式为client_encoding的字节串。其他地方也一样。
+    # query是sql语句，其中参数用$n表示；stmt是prepared statement名字。
+    @classmethod
+    def make(cls, query, stmt=b'', param_oids=()):
+        return cls(stmt=stmt, query=query, param_cnt=len(param_oids), param_oids=param_oids)
 @mputils.SeqAccess(attname='params', f=lambda x:(None if x.sz < 0 else x.data))
 class Bind(Msg):
     _formats = '>x >x >h -0>h >24X >h -0>h'
     _fields = 'portal stmt fc_cnt fc_list params res_fc_cnt res_fc_list'
-@mputils.Check(attname='obj_type', attvals=ObjType.v2smap)
-class Close(Msg):
-    _formats = '>s >x'
-    _fields = 'obj_type obj_name'
-class CopyFail(Msg):
-    _formats = '>x'
-    _fields = 'err_msg'
-@mputils.Check(attname='obj_type', attvals=ObjType.v2smap)
-class Describe(Msg):
-    _formats = '>s >x'
-    _fields = 'obj_type obj_name'
+    # fc_list指定params中参数值的格式代码(fc)，0是文本格式1是二进制格式。如果为空则表示都是文本格式，
+    # 如果只有一个fc则指定所有参数的格式为fc，否则fc_list的大小和params的大小一样，指定每个参数的fc。
+    # res_fc_list指定返回结果中各列的格式代码，意义和fc_list一样。
+    @classmethod
+    def make(cls, params, portal=b'', stmt=b'', fc_list=(), res_fc_list=()):
+        params = List2Xval(params)
+        return cls(portal=portal, stmt=stmt, fc_cnt=len(fc_list), fc_list=fc_list, 
+                   params=params, res_fc_cnt=len(res_fc_list), res_fc_list=res_fc_list)
 class Execute(Msg):
     _formats = '>x >i'
     _fields = 'portal max_num'
+    @classmethod
+    def make(cls, portal=b'', max_num=0):
+        return cls(portal=portal, max_num=max_num)
+@mputils.Check(attname='obj_type', attvals=ObjType.v2smap)
+class DescribeClose(Msg):
+    _formats = '>s >x'
+    _fields = 'obj_type obj_name'
+    # 注意:不能通过DescribeClose调用下面这2个方法，应该通过Describe和Close调用。
+    @classmethod
+    def stmt(cls, name=b''):
+        return cls(obj_type=ObjType.OBJ_PreparedStmt, obj_name=name)
+    @classmethod
+    def portal(cls, name=b''):
+        return cls(obj_type=ObjType.OBJ_Portal, obj_name=name)
+class Describe(DescribeClose):
+    pass
+class Close(DescribeClose):
+    pass
+class Sync(Msg):
+    pass
 class Flush(Msg):
     pass
+# CopyData/CopyDone和BE共用，在下面定义。
+class CopyFail(Msg):
+    _formats = '>x'
+    _fields = 'err_msg'
 @mputils.SeqAccess(attname='args', f=lambda x:(None if x.sz < 0 else x.data))
 class FunctionCall(Msg):
     _formats = '>i >h -0>h >24X >h'
     _fields = 'foid fc_cnt fc_list args res_fc'
-class Parse(Msg):
-    _formats = '>x >x >h -0>i'
-    _fields = 'portal query param_cnt oid_list'
-class PasswordMessage(Msg):
+    # fc_list的意思和Bind.make一样。
+    @classmethod
+    def make(cls, foid, args, fc_list=(), res_fc=0):
+        args = List2Xval(args)
+        return cls(foid=foid, fc_cnt=len(fc_list), fc_list=fc_list, args=args, res_fc=res_fc)
+class Terminate(Msg):
+    pass
+# 'p'消息类型是对Authentication的回应，包括多个具体的类型，需要根据上下文判断需要那个具体类型。
+# AuthResponse包含data，这data由具体的类型解析；反过来具体类型的tobytes结果要赋值给AuthResponse的data。
+# 比如：
+#     r = SASLInitialResponse(name=b'xxxx', response=xval(b'yyyy'))
+#     ar = AuthResponse(data=bytes(r))
+#     r2 = SASLInitialResponse(ar.data)   不能用ar.tobytes()或者bytes(ar)
+class AuthResponse(Msg):
+    _formats = '>a'
+    _fields = 'data'
+class PasswordMessage(struct_base):
     _formats = '>x'
     _fields = 'password'
     # 参数必须是字节串
     @classmethod
-    def md5pw(cls, password, username=None, md5salt = None):
+    def make(cls, password, username=None, md5salt = None):
         if md5salt:
             if not username:
                 raise SystemError('BUG: should provide username for md5 authentication')
             password = b'md5' + md5(md5(password + username) + md5salt)
         return cls(password=password)
-class Query(Msg):
-    _formats = '>x'
-    _fields = 'query'
-class Sync(Msg):
-    pass
-class Terminate(Msg):
-    pass
+class SASLInitialResponse(struct_base):
+    _formats = '>x >4x'
+    _fields = 'name response'
+class SASLResponse(struct_base):
+    _formats = '>a'
+    _fields = 'msgdata'
+class GSSResponse(struct_base):
+    _formats = '>a'
+    _fields = 'msgdata'
 
+# 
 # BE msg
+# 
 # 某些authtype即使是没有data值的，也要把b''赋值给data。
 @mputils.Check(attname='authtype', attvals=AuthType.v2smap)
 class Authentication(Msg):
@@ -250,6 +312,9 @@ class CopyDone(Msg):
 class CopyResponse(Msg):
     _formats = '>b >h -0>h'
     _fields = 'overall_fmt col_cnt col_fc_list'
+    @classmethod
+    def make(cls, overall_fmt, col_fc_list):
+        return cls(overall_fmt=overall_fmt, col_cnt=len(col_fc_list), col_fc_list=col_fc_list)
 class CopyInResponse(CopyResponse):
     pass
 class CopyOutResponse(CopyResponse):
@@ -267,6 +332,14 @@ class EmptyQueryResponse(Msg):
 class ErrorNoticeResponse(Msg):
     _formats = '>X'
     _fields = 'field_list'
+    def get(self, fields):
+        res = []
+        if not (set(fields) <= FieldType.v2smap.keys()):
+            raise ValueError('fields(%s) have unknown field type' % (fields,))
+        for t, v in self:
+            if t not in fields:
+                continue
+            res.append((FieldType.v2smap[t], v))
 class ErrorResponse(ErrorNoticeResponse):
     pass
 class NoticeResponse(ErrorNoticeResponse):
@@ -274,6 +347,8 @@ class NoticeResponse(ErrorNoticeResponse):
 class FunctionCallResponse(Msg):
     _formats = '>4x'
     _fields = 'res_val'
+    def value(self):
+        return (None if self.res_val.sz < 0 else bytes(self.res_val))
 class NoData(Msg):
     pass
 class NotificationResponse(Msg):

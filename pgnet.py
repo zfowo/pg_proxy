@@ -27,7 +27,7 @@ class connbase():
             if data is None:
                 break
             elif not data:
-                raise RuntimeError('the peer(%s) closed connection' % (s.getpeername(),))
+                raise RuntimeError('the peer(%s) closed connection' % (self.s.getpeername(),))
             self.recv_buf += data
             if len(data) < 4096:
                 break
@@ -92,19 +92,29 @@ class pgconn(beconn):
         m = p.StartupMessage.make(**kwargs)
         self.write_msg(m)
     def write_msg(self, msg):
-        super().write_msg(msg)
+        ret = super().write_msg(msg)
         self.processer = get_processer_for_msg(msg)
-    # read_msgs2/write_msgs2现在是循环读写，可能忙等待导致cpu占用，可以用poller来检查是否可读写。
+        return ret
+    # read_msgs_until_done/write_msgs_until_done 现在是循环读写，可能忙等待导致cpu占用，可以用poller来检查是否可读写。
     # 一直读直到有消息为止
-    def read_msgs2(self):
-        msg_list = self.read_msgs()
+    def read_msgs_until_done(self):
+        msg_list = None
         while not msg_list:
             msg_list = self.read_msgs()
         return msg_list
     # 一直写直到写完为止
-    def write_msgs2(self):
+    def write_msgs_until_done(self):
         while self.write_msgs():
             pass
+    def flush(self):
+        return self.write_msgs((p.Flush(),))
+    def sync(self):
+        return self.write_msgs((p.Sync(),))
+# 表示ErrorResponse消息的异常，其他错误抛出的是RuntimeError异常。
+class pgerror(Exception):
+    def __init__(self, errmsg):
+        super().__init__(errmsg)
+        self.errmsg = errmsg
 # 
 # processer for response msg after sending message
 # 
@@ -117,7 +127,7 @@ def Reset(func):
     @functools.wraps(func)
     def wrapper(cls, cnn, *args, **kwargs):
         try:
-            cnn.write_msgs2()
+            cnn.write_msgs_until_done()
             return func(cls, cnn, *args, **kwargs)
         finally:
             cls.reset()
@@ -139,7 +149,7 @@ class StartupMessageProcesser(MsgProcesser):
     @classmethod
     @Reset
     def process(cls, cnn):
-        msg_list = cnn.read_msgs2()
+        msg_list = cnn.read_msgs_until_done()
         m1 = msg_list[0]
         if m1.msg_type == p.MsgType.MT_Authentication:
             if m1.authtype == p.AuthType.AT_Ok:
@@ -152,7 +162,7 @@ class StartupMessageProcesser(MsgProcesser):
             else:
                 raise RuntimeError('unsupported authentication type', m1)
         elif m1.msg_type == p.MsgType.MT_ErrorResponse:
-            raise RuntimeError(m1)
+            raise pgerror(m1)
         else:
             raise RuntimeError(cls.UnknownMsgErr, m1)
     @classmethod
@@ -167,12 +177,12 @@ class StartupMessageProcesser(MsgProcesser):
                 got_ready = True
                 break
             elif m.msg_type == p.MsgType.MT_ErrorResponse:
-                raise RuntimeError(m)
+                raise pgerror(m)
             else:
                 raise RuntimeError(cls.UnknownMsgErr, m)
         if got_ready:
             return
-        msg_list = cnn.read_msgs2()
+        msg_list = cnn.read_msgs_until_done()
         cls._process_msg_list(msg_list, cnn)
 class PasswordMessageProcesser(StartupMessageProcesser):
     pass
@@ -187,7 +197,7 @@ class QueryProcesser(MsgProcesser):
     @classmethod
     @Reset
     def process(cls, cnn):
-        msg_list = cnn.read_msgs2()
+        msg_list = cnn.read_msgs_until_done()
         cls._process_msg_list(msg_list, cnn)
         if cls.ex:
             raise cls.ex
@@ -198,9 +208,9 @@ class QueryProcesser(MsgProcesser):
         got_ready = False
         for m in msg_list:
             if m.msg_type == p.MsgType.MT_EmptyQueryResponse:
-                cls.ex = RuntimeError(m)
+                cls.ex = RuntimeError('empty query', m)
             elif m.msg_type == p.MsgType.MT_ErrorResponse:
-                cls.ex = RuntimeError(m)
+                cls.ex = pgerror(m)
             elif m.msg_type == p.MsgType.MT_RowDescription:
                 cls.rowdesc = list(m)
                 cls.rows = []
@@ -212,10 +222,10 @@ class QueryProcesser(MsgProcesser):
                 got_ready = True
                 break
             else:
-                raise RuntimeError(UnknownMsgErr, m)
+                raise RuntimeError(cls.UnknownMsgErr, m)
         if got_ready:
             return
-        msg_list = cnn.read_msgs2()
+        msg_list = cnn.read_msgs_until_done()
         cls._process_msg_list(msg_list, cnn)
 # main
 if __name__ == '__main__':
