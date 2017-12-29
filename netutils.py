@@ -14,37 +14,49 @@ else:
     NONBLOCK_SEND_RECV_OK = (errno.EAGAIN, errno.EWOULDBLOCK, errno.WSAEWOULDBLOCK)
     NONBLOCK_CONNECT_EX_OK = (errno.WSAEWOULDBLOCK, 0)
 
+# 当poll到POLLERR的时候调用该函数获得错误代码/错误信息。
+# 在异步建立连接(connect_ex)的时候，除了需要检测POLLIN/POLLOUT还需要检测POLLERR。
+# 而在连接建立完成后可以不检测POLLERR，因为在读写的时候会出错。
+def get_socket_error(s):
+    errcode = s.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
+    if hasattr(socket, 'errorTab'):
+        errmsg = socket.errorTab[errcode]
+    else:
+        errmsg = os.strerror(errcode)
+    return (errcode, errmsg)
+
 class poller_base(object):
     def __init__(self):
         self.fd2objs = {}
-    def _register(self, fobj, eventmask):
+    def register(self, fobj, eventmask):
         fd = fobj
         if type(fobj) != int:
             fd = fobj.fileno()
         
-        obj = self.fd2objs.get(fd, None)
-        if obj and obj[0] != fobj:
-            logging.warning('register with same fd(%d) but with two different obj(%s %s)', fd, obj, fobj)
+        objs = self.fd2objs.get(fd, None)
+        if objs and objs[0] is not fobj:
+            logging.warning('register with same fd(%d) but with two different obj(%s %s)', fd, objs, fobj)
         
-        exist = fd in self.fd2objs
+        exist = objs is not None
         self.fd2objs[fd] = (fobj, eventmask)
         return (fd, exist)
-    def _modify(self, fobj, eventmask):
+    def modify(self, fobj, eventmask):
         fd = fobj
         if type(fobj) != int:
             fd = fobj.fileno()
         if fd not in self.fd2objs:
-            ex = IOError()
+            ex = OSError()
             ex.errno = errno.ENOENT
             raise ex
         self.fd2objs[fd] = (fobj, eventmask)
         return (fd, )
-    def _unregister(self, fobj):
+    def unregister(self, fobj):
         fd = fobj
         if type(fobj) != int:
             fd = fobj.fileno()
         self.fd2objs.pop(fd)
         return (fd, )
+    # 派生类需要定义_poll
     def _poll(self, *args, **kwargs):
         raise SystemError('BUG: the derived class(%s) should implement _poll' % (type(self), ))
     def poll(self, timeout = None, *args, **kwargs):
@@ -56,6 +68,11 @@ class poller_base(object):
                     continue
                 raise
             return ret
+    def clear(self, fobj_list=None):
+        if fobj_list is None:
+            fobj_list = list(self.fd2objs.keys())
+        for fobj in fobj_list:
+            self.unregister(fobj)
     def close(self):
         pass
 # 
@@ -67,18 +84,10 @@ class spoller(poller_base):
     POLLERR = 0x04
     def __init__(self):
         super().__init__()
-    def register(self, fobj, eventmask):
-        super()._register(fobj, eventmask)
-    def modify(self, fobj, eventmask):
-        super()._modify(fobj, eventmask)
-    def unregister(self, fobj):
-        super()._unregister(fobj)
     def _poll(self, timeout = None):
         if timeout != None and timeout < 0: # 负值表示block，这和poll/epoll相同。
             timeout = None
-        r_list = []
-        w_list = []
-        e_list = []
+        r_list, w_list, e_list = [], [], []
         mask2list = [(self.POLLIN, r_list), (self.POLLOUT, w_list), (self.POLLERR, e_list)]
         for k in self.fd2objs:
             m = self.fd2objs[k][1]
@@ -112,13 +121,13 @@ if os.name == 'posix':
             super().__init__()
             self.p = select.poll()
         def register(self, fobj, eventmask):
-            ret = super()._register(fobj, eventmask)
+            ret = super().register(fobj, eventmask)
             self.p.register(ret[0], eventmask)
         def modify(self, fobj, eventmask):
-            ret = super()._modify(fobj, eventmask)
+            ret = super().modify(fobj, eventmask)
             self.p.modify(ret[0], eventmask)
         def unregister(self, fobj):
-            ret = super()._unregister(fobj)
+            ret = super().unregister(fobj)
             self.p.unregister(ret[0])
         def _poll(self, timeout = None):
             res = self.p.poll(timeout)
@@ -137,15 +146,15 @@ if os.name == 'posix':
             super().__init__()
             self.p = select.epoll()
         def register(self, fobj, eventmask):
-            ret = super()._register(fobj, eventmask)
+            ret = super().register(fobj, eventmask)
             if ret[1]:
                 self.p.unregister(ret[0])
             self.p.register(ret[0], eventmask)
         def modify(self, fobj, eventmask):
-            ret = super()._modify(fobj, eventmask)
+            ret = super().modify(fobj, eventmask)
             self.p.modify(ret[0], eventmask)
         def unregister(self, fobj):
-            ret = super()._unregister(fobj)
+            ret = super().unregister(fobj)
             self.p.unregister(ret[0])
         def _poll(self, timeout = None, maxevents = -1):
             if timeout == None:

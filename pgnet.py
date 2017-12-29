@@ -4,6 +4,7 @@
 # 
 # 
 import sys, os, socket, time
+import traceback
 import functools
 import netutils
 import pgprotocol3 as p
@@ -229,15 +230,29 @@ class QueryProcesser(MsgProcesser):
         cls._process_msg_list(msg_list, cnn)
 # main
 if __name__ == '__main__':
+    if len(sys.argv) > 3:
+        print('usage: %s [be_addr [listen_addr]]' % sys.argv[0])
+        sys.exit(1)
+    be_addr = ('10.10.77.150', 5432)
+    listen_addr = ('0.0.0.0', 9999)
+    if len(sys.argv) >= 2:
+        host, port = sys.argv[1].split(':')
+        be_addr = (host, int(port))
+    if len(sys.argv) >= 3:
+        host, port = sys.argv[2].split(':')
+        listen_addr = (host, int(port))
+    print(be_addr, listen_addr)
+        
     listen_s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    listen_s.bind(('10.10.77.100', 9999))
+    listen_s.bind(listen_addr)
     listen_s.listen()
     poll = netutils.spoller()
     while True:
         s, peer = listen_s.accept()
         print('accept connection from %s' % (peer,))
+        poll.clear()
         try:
-            with feconn(s) as fe_c, beconn(('10.10.77.150', 5432)) as be_c:
+            with feconn(s) as fe_c, beconn(be_addr) as be_c:
                 while True:
                     m = fe_c.read_startup_msg()
                     if m:
@@ -258,3 +273,4 @@ if __name__ == '__main__':
                         poll.register(fe_c, poll.POLLIN)
         except Exception as ex:
             print('%s: %s' % (ex.__class__.__name__, ex))
+            #traceback.print_tb(sys.exc_info()[2])
