@@ -62,7 +62,7 @@ class BeMsgType(metaclass=mputils.V2SMapMeta, skip=(b'',), strip=3):
     MT_EmptyQueryResponse = b'I'   # EmptyQueryResponse
     MT_ErrorNoticeResponse = b''   # placeholder for ErrorResponse/NoticeResponse base class
     MT_ErrorResponse = b'E'        # ErrorResponse
-    MT_NoticeResponse = b'N'       # NoticeResponse
+    MT_NoticeResponse = b'N'       # NoticeResponse (async message)
     MT_FunctionCallResponse = b'V' # FunctionCallResponse (大写V)
     MT_NoData = b'n'               # NoData
     MT_NotificationResponse = b'A' # NotificationResponse (async message)
@@ -72,6 +72,9 @@ class BeMsgType(metaclass=mputils.V2SMapMeta, skip=(b'',), strip=3):
     MT_PortalSuspended = b's'      # PortalSuspended
     MT_ReadyForQuery = b'Z'        # ReadyForQuery
     MT_RowDescription = b'T'       # RowDescription
+    @classmethod
+    def is_async_msg(cls, msgtype):
+        return msgtype in (cls.MT_NoticeResponse, cls.MT_NotificationResponse, cls.MT_ParameterDescription)
 class MsgType(FeMsgType, BeMsgType):
     pass
 
@@ -106,6 +109,10 @@ class FieldType(metaclass=mputils.V2SMapMeta, strip=3):
     FT_File = b'F'
     FT_Line = b'L'
     FT_Routine = b'R'
+    # 把fieldtype字节串转成列表
+    @classmethod
+    def ftstr2list(cls, ftstr):
+        return [ftstr[i:i+1] for i in range(len(ftstr))]
 
 # auth type。Authentication消息类型
 class AuthType(metaclass=mputils.V2SMapMeta, strip=3):
@@ -246,7 +253,7 @@ class Terminate(Msg):
 # AuthResponse包含data，这data由具体的类型解析；反过来具体类型的tobytes结果要赋值给AuthResponse的data。
 # 比如：
 #     r = SASLInitialResponse(name=b'xxxx', response=xval(b'yyyy'))
-#     ar = AuthResponse(data=bytes(r))
+#     ar = AuthResponse(data=bytes(r))  or  ar = AuthResponse(r)
 #     r2 = SASLInitialResponse(ar.data)   不能用ar.tobytes()或者bytes(ar)
 class AuthResponse(Msg):
     _formats = '>a'
@@ -293,6 +300,13 @@ class Authentication(Msg):
             raise ValueError('the data size for authtype(MD5Password) should be 4:%s' % val)
     def __repr__(self):
         return '<%s authtype=%s data=%s>' % (type(self).__name__, AuthType.v2smap[self.authtype], self.data)
+    # 根据本消息的类型创建相应的AuthResponse消息
+    def make_ar(self, **kwargs):
+        if self.authtype in (AuthType.AT_CleartextPassword, AuthType.AT_MD5Password):
+            return AuthResponse(PasswordMessage.make(md5salt=self.data, **kwargs))
+        else:
+            raise ValueError('do not support authentication:%s' % AuthType.v2smap[self.authtype])
+        
 class BackendKeyData(Msg):
     _formats = '>i >i'
     _fields = 'pid skey'
@@ -334,12 +348,15 @@ class ErrorNoticeResponse(Msg):
     _fields = 'field_list'
     def get(self, fields):
         res = []
+        if type(fields) == bytes:
+            fields = FieldType.ftstr2list(fields)
         if not (set(fields) <= FieldType.v2smap.keys()):
             raise ValueError('fields(%s) have unknown field type' % (fields,))
         for t, v in self:
             if t not in fields:
                 continue
             res.append((FieldType.v2smap[t], v))
+        return res
 class ErrorResponse(ErrorNoticeResponse):
     pass
 class NoticeResponse(ErrorNoticeResponse):

@@ -21,6 +21,7 @@ class connbase():
         return self.s.fileno()
     def close(self):
         self.s.close()
+        self.status = 'disconnected'
     # 读取数据直到没有数据可读
     def _read(self):
         while True:
@@ -38,8 +39,8 @@ class connbase():
         if self.send_buf:
             sz = self.s.send(self.send_buf)
             self.send_buf = self.send_buf[sz:]
-    # 返回解析后的消息列表
-    def read_msgs(self, *, fe):
+    # 返回解析后的消息列表。max_msg指定最多返回多少个消息。
+    def read_msgs(self, max_msg=0, *, fe):
         self._read()
         if not self.recv_buf:
             return []
@@ -60,6 +61,9 @@ class connbase():
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.close()
 class feconn(connbase):
+    def __init__(self, s):
+        self.status = 'connected'
+        super().__init__(s)
     # 读取第一个消息，如果还没有收到则返回None。
     def read_startup_msg(self):
         self._read()
@@ -68,40 +72,62 @@ class feconn(connbase):
             m = p.parse_startup_msg(self.recv_buf[4:])
             self.recv_buf = b''
         return m
-    def read_msgs(self):
-        return super().read_msgs(fe=True)
+    def read_msgs(self, max_msg=0):
+        return super().read_msgs(max_msg, fe=True)
     def write_msgs(self, msg_list=()):
         return super().write_msgs(msg_list, fe=True)
     def write_msg(self, msg):
         return self.write_msgs((msg,))
 class beconn(connbase):
-    def __init__(self, addr):
+    def __init__(self, addr, async_conn=False):
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.connect(addr)
+        self.status = 'connecting'
+        # connect_ex也可能抛出异常，之后需要先检测POLLOUT|POLLERR，
+        # POLLERR表示连接失败，此时可通过netutils.get_socket_error获得连接失败的原因。
+        # POLLOUT表示连接成功可以发送数据。
+        if async_conn:
+            s.settimeout(0)
+            s.connect_ex(addr)
+        else:
+            s.connect(addr)
+            self.status = 'connected'
         super().__init__(s)
-    def read_msgs(self):
-        return super().read_msgs(fe=False)
+    def read_msgs(self, max_msg=0):
+        return super().read_msgs(max_msg, fe=False)
     def write_msgs(self, msg_list=()):
         return super().write_msgs(msg_list, fe=False)
     def write_msg(self, msg):
         return self.write_msgs((msg,))
+# 
 class pgconn(beconn):
     def __init__(self, **kwargs):
+        self.async_msgs = { 
+            p.MsgType.MT_NoticeResponse :       [], 
+            p.MsgType.MT_NotificationResponse : [], 
+            p.MsgType.MT_ParameterDescription : [], 
+        }
         host = kwargs.pop('host', '127.0.0.1')
         port = kwargs.pop('port', 5432)
         super().__init__((host, port))
         m = p.StartupMessage.make(**kwargs)
         self.write_msg(m)
+        # 发送startup消息后如果不立即读取可能会导致ConnectionResetError异常。
+        # 貌似socket(TCP)在接收到RST后，recv会抛出ConnectionResetError异常，即使还有数据可读。
+        self.s.settimeout(None)
+        self._read()
+        self.s.settimeout(0)
     def write_msg(self, msg):
+        if self.processer:
+            raise RuntimeError('self.processer(%s) is not None. you should call self.processer.process before write_msg' % self.processer)
         ret = super().write_msg(msg)
-        self.processer = get_processer_for_msg(msg)
-        return ret
-    # read_msgs_until_done/write_msgs_until_done 现在是循环读写，可能忙等待导致cpu占用，可以用poller来检查是否可读写。
+        self.processer = get_processer_for_msg(msg)(self)
+        return self.processer
+    # read_msgs_until_avail/write_msgs_until_done 现在是循环读写，可能忙等待导致cpu占用，可以用poller来检查是否可读写。
     # 一直读直到有消息为止
-    def read_msgs_until_done(self):
+    def read_msgs_until_avail(self, max_msg=0):
         msg_list = None
         while not msg_list:
-            msg_list = self.read_msgs()
+            msg_list = self.read_msgs(max_msg)
         return msg_list
     # 一直写直到写完为止
     def write_msgs_until_done(self):
@@ -111,6 +137,10 @@ class pgconn(beconn):
         return self.write_msgs((p.Flush(),))
     def sync(self):
         return self.write_msgs((p.Sync(),))
+    def got_async_msg(self, m):
+        self.async_msgs[m.msg_type].append(m)
+        if m.msg_type == p.MsgType.MT_ParameterStatus:
+            self.params[bytes(m.name).decode('ascii')] = bytes(m.val).decode('ascii')
 # 表示ErrorResponse消息的异常，其他错误抛出的是RuntimeError异常。
 class pgerror(Exception):
     def __init__(self, errmsg):
@@ -123,40 +153,37 @@ def get_processer_for_msg(msg):
     msgname = type(msg).__name__
     pname = msgname + 'Processer'
     return globals()[pname]
-# decorator for process method
-def Reset(func):
-    @functools.wraps(func)
-    def wrapper(cls, cnn, *args, **kwargs):
-        try:
-            cnn.write_msgs_until_done()
-            return func(cls, cnn, *args, **kwargs)
-        finally:
-            cls.reset()
-    return wrapper
 class MsgProcesser():
-    @classmethod
-    def delattrs(cls, attrs):
-        for attr in attrs:
-            if hasattr(cls, attr):
-                delattr(cls, attr)
+    def __init__(self, cnn, prev_processer=None):
+        self.cnn = cnn
+        self.prev_processer = prev_processer
+    def process(self, *args, **kwargs):
+        self.cnn.write_msgs_until_done()
+        try:
+            res = self._process(*args, **kwargs)
+            return res
+        except Exception as ex:
+            ex.processer = self
+            raise
+        finally:
+            if self.cnn.processer is self:
+                self.cnn.processer = self.prev_processer
 class StartupMessageProcesser(MsgProcesser):
     UnknownMsgErr = 'unknown response msg for startup message'
-    params = {}
-    @classmethod
-    def reset(cls):
-        cls.params = {}
-        super().delattrs(['be_keydata'])
+    def __init__(self, cnn):
+        super().__init__(cnn)
+        self.params = {}
+        self.be_keydata = None
     # 返回authtype是Ok/CleartextPasword/MD5Password的Authentication，或者抛出异常。
-    @classmethod
-    @Reset
-    def process(cls, cnn):
-        msg_list = cnn.read_msgs_until_done()
+    # 调用后应该检查cnn.async_msgs[MsgType.MT_NoticeResponse]是否为空。
+    def _process(self):
+        msg_list = self.cnn.read_msgs_until_avail()
         m1 = msg_list[0]
         if m1.msg_type == p.MsgType.MT_Authentication:
             if m1.authtype == p.AuthType.AT_Ok:
-                cls._process_msg_list(msg_list[1:], cnn)
-                cnn.params = cls.params
-                cnn.be_keydata = cls.be_keydata
+                self._process_msg_list(msg_list[1:])
+                self.cnn.params = self.params
+                self.cnn.be_keydata = self.be_keydata
                 return m1
             elif m1.authtype == p.AuthType.AT_CleartextPassword or m1.authtype == p.AuthType.AT_MD5Password:
                 return m1
@@ -166,68 +193,139 @@ class StartupMessageProcesser(MsgProcesser):
             raise pgerror(m1)
         else:
             raise RuntimeError(cls.UnknownMsgErr, m1)
-    @classmethod
-    def _process_msg_list(cls, msg_list, cnn):
+    def _process_msg_list(self, msg_list):
         got_ready = False
         for m in msg_list:
             if m.msg_type == p.MsgType.MT_ParameterStatus:
-                cls.params[bytes(m.name).decode('ascii')] = bytes(m.val).decode('ascii')
+                self.params[bytes(m.name).decode('ascii')] = bytes(m.val).decode('ascii')
             elif m.msg_type == p.MsgType.MT_BackendKeyData:
-                cls.be_keydata = (m.pid, m.skey)
+                self.be_keydata = (m.pid, m.skey)
             elif m.msg_type == p.MsgType.MT_ReadyForQuery:
                 got_ready = True
                 break
+            elif m.msg_type == p.MsgType.MT_NoticeResponse:
+                self.cnn.got_async_msg(m)
             elif m.msg_type == p.MsgType.MT_ErrorResponse:
                 raise pgerror(m)
             else:
-                raise RuntimeError(cls.UnknownMsgErr, m)
+                raise RuntimeError(self.UnknownMsgErr, m)
         if got_ready:
             return
-        msg_list = cnn.read_msgs_until_done()
-        cls._process_msg_list(msg_list, cnn)
-class PasswordMessageProcesser(StartupMessageProcesser):
+        msg_list = self.cnn.read_msgs_until_avail()
+        self._process_msg_list(msg_list)
+class AuthResponseProcesser(StartupMessageProcesser):
+    UnknownMsgErr = 'unknown response msg for AuthResponse message'
     pass
 class QueryProcesser(MsgProcesser):
     UnknownMsgErr = 'unknown response msg for Query message'
-    ex = None
-    @classmethod
-    def reset(cls):
-        cls.ex = None
-        super().delattrs(['cmdstatus', 'rowdesc', 'rows'])
-    # 
-    @classmethod
-    @Reset
-    def process(cls, cnn):
-        msg_list = cnn.read_msgs_until_done()
-        cls._process_msg_list(msg_list, cnn)
-        if cls.ex:
-            raise cls.ex
-        res = (cls.cmdstatus, cls.rowdesc, cls.rows)
+    def __init__(self, cnn):
+        super().__init__(cnn)
+        self.msgs_from_copy = []
+        self.ex = None
+        self.cmdstatus = None
+        self.rowdesc = None
+        self.rows = None
+    # 返回cmdstatus, rowdesc, rows。或者抛出异常。
+    def _process(self):
+        if self.msgs_from_copy:
+            msg_list = self.msgs_from_copy
+            self.msgs_from_copy = []
+        else:
+            msg_list = self.cnn.read_msgs_until_avail()
+        ret = self._process_msg_list(msg_list)
+        if isinstance(ret, p.CopyResponse):
+            return ret
+        if self.ex:
+            ex = self.ex
+            self.ex = None # 避免循环引用
+            raise ex
+        res = (self.cmdstatus, self.rowdesc, self.rows)
         return res
-    @classmethod
-    def _process_msg_list(cls, msg_list, cnn):
+    def _process_msg_list(self, msg_list):
         got_ready = False
-        for m in msg_list:
+        for idx, m in enumerate(msg_list):
             if m.msg_type == p.MsgType.MT_EmptyQueryResponse:
-                cls.ex = RuntimeError('empty query', m)
+                self.ex = RuntimeError('empty query', m)
             elif m.msg_type == p.MsgType.MT_ErrorResponse:
-                cls.ex = pgerror(m)
+                self.ex = pgerror(m)
             elif m.msg_type == p.MsgType.MT_RowDescription:
-                cls.rowdesc = list(m)
-                cls.rows = []
+                self.rowdesc = list(m)
+                self.rows = []
             elif m.msg_type == p.MsgType.MT_DataRow:
-                cls.rows.append(list(m))
+                self.rows.append(list(m))
             elif m.msg_type == p.MsgType.MT_CommandComplete:
-                cls.cmdstatus = bytes(m.tag).decode('ascii').split()
+                self.cmdstatus = bytes(m.tag).decode('ascii').split()
             elif m.msg_type == p.MsgType.MT_ReadyForQuery:
                 got_ready = True
                 break
+            elif m.msg_type in self.cnn.async_msgs: # async msg
+                self.cnn.got_async_msg(m)
+            elif m.msg_type == p.MsgType.MT_CopyInResponse:
+                self.cnn.processer = CopyInResponseProcesser(self.cnn, msg_list[idx:])
+                return m
+            elif m.msg_type == p.MsgType.MT_CopyOutResponse:
+                self.cnn.processer = CopyOutResponseProcesser(self.cnn, msg_list[idx:])
+                return m
             else:
-                raise RuntimeError(cls.UnknownMsgErr, m)
+                # 这里不直接抛出异常，需要处理到ReadyForQuery之后才能把它抛出。
+                self.ex = RuntimeError(self.UnknownMsgErr, m)
         if got_ready:
             return
-        msg_list = cnn.read_msgs_until_done()
-        cls._process_msg_list(msg_list, cnn)
+        msg_list = self.cnn.read_msgs_until_avail()
+        return self._process_msg_list(msg_list)
+class CopyInResponseProcesser(MsgProcesser):
+    # cir_msg is CopyInResponse msg
+    def __init__(self, cnn, msg_list):
+        super().__init__(cnn, cnn.processer)
+        self.cir_msg = msg_list[0]
+        self.msg_list = msg_list[1:]
+    # 如果CopyIn成功则返回True，否则返回False。
+    def _process(self, data_list):
+        for data in data_list:
+            m = p.CopyData(data=data)
+            self.cnn.write_msgs((m,))
+            if self.msg_list:
+                msg_list = self.msg_list
+                self.msg_list = None
+            else:
+                msg_list = self.cnn.read_msgs()
+            for m in msg_list:
+                if m.msg_type in self.cnn.async_msgs:
+                    self.cnn.got_async_msg(m)
+                elif m.msg_type in (p.MsgType.MT_ErrorResponse, p.MsgType.MT_CommandComplete):
+                    self.prev_processer.msgs_from_copy.append(m)
+                else: # 异常消息，目前返回让QueryProcesser处理。
+                    self.prev_processer.msgs_from_copy.append(m)
+            if self.prev_processer.msgs_from_copy:
+                return False
+        self.cnn.write_msgs((p.CopyDone(),))
+        return True
+class CopyOutResponseProcesser(MsgProcesser):
+    # cor_msg is CopyOutResponse msg
+    def __init__(self, cnn, msg_list):
+        super().__init__(cnn, cnn.processer)
+        self.cor_msg = msg_list[0]
+        self.msg_list = msg_list[1:]
+    # 返回(是否正常结束, 已经接收的数据)
+    def _process(self):
+        res = []
+        while True:
+            if self.msg_list:
+                msg_list = self.msg_list
+                self.msg_list = None
+            else:
+                msg_list = self.cnn.read_msgs_until_avail()
+            for idx, m in enumerate(msg_list):
+                if m.msg_type == p.MsgType.MT_CopyData:
+                    res.append(m.data)
+                elif m.msg_type == p.MsgType.MT_CopyDone:
+                    self.prev_processer.msgs_from_copy.extend(msg_list[idx+1:])
+                    return (True, res)
+                elif m.msg_type in self.cnn.async_msgs:
+                    self.cnn.got_async_msg(m)
+                else:
+                    self.prev_processer.msgs_from_copy.extend(msg_list[idx:])
+                    return (False, res)
 # main
 if __name__ == '__main__':
     if len(sys.argv) > 3:
@@ -262,7 +360,7 @@ if __name__ == '__main__':
                 poll.register(fe_c, poll.POLLIN)
                 poll.register(be_c, poll.POLLIN)
                 while True:
-                    poll.poll(timeout=0.1)
+                    poll.poll()
                     if be_c.write_msgs(fe_c.read_msgs()):
                         poll.register(be_c, poll.POLLIN|poll.POLLOUT)
                     else:

@@ -483,7 +483,7 @@ class struct_base(metaclass=struct_meta):
         #if buf is None and not kwargs:
         #    raise ValueError('buf or kwargs should be given')
         if buf:
-            self._init_from_buf(buf)
+            self._init_from_buf(bytes(buf))
         else:
             self._init_from_kwargs(kwargs)
     def _init_from_buf(self, buf):

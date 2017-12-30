@@ -176,6 +176,7 @@ else:
 # 所以需要检查返回值是否为None。
 # 
 # 如果s是阻塞的，则不会返回None。
+# 如果对端异常close的话(没有发送FIN)，myrecv可能不会返回空串，而是抛出ConnectionResetError异常。
 # 
 def myrecv(s, bufsize=4096):
     try:
