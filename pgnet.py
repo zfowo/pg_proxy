@@ -6,6 +6,7 @@
 import sys, os, socket, time
 import traceback
 import functools
+import getpass
 import netutils
 import pgprotocol3 as p
 
@@ -106,19 +107,32 @@ class pgconn(beconn):
             p.MsgType.MT_NotificationResponse : [], 
             p.MsgType.MT_ParameterDescription : [], 
         }
+        self.processer = None
         host = kwargs.pop('host', '127.0.0.1')
         port = kwargs.pop('port', 5432)
         super().__init__((host, port))
+        if 'database' not in kwargs:
+            kwargs['database'] = 'postgres'
+        if 'user' not in kwargs:
+            kwargs['user'] = getpass.getuser()
+        password = kwargs.pop('password', '')
         m = p.StartupMessage.make(**kwargs)
         self.write_msg(m)
-        # 发送startup消息后如果不立即读取可能会导致ConnectionResetError异常。
-        # 貌似socket(TCP)在接收到RST后，recv会抛出ConnectionResetError异常，即使还有数据可读。
-        self.s.settimeout(None)
-        self._read()
-        self.s.settimeout(0)
+        self._process_auth(password.encode('utf8'), kwargs['user'].encode('utf8'))
+    def _process_auth(self, password, user):
+        m = self.processer.process()
+        if m.authtype == p.AuthType.AT_Ok:
+            return
+        elif m.authtype == p.AuthType.AT_CleartextPassword:
+            self.write_msg(m.make_ar(password=password))
+        elif m.authtype == p.AuthType.AT_MD5Password:
+            self.write_msg(m.make_ar(password=password, user=user))
+        else:
+            raise RuntimeError('unsupported authentication type:%s' % m)
+        self._process_auth(password, user)
     def write_msg(self, msg):
         if self.processer:
-            raise RuntimeError('self.processer(%s) is not None. you should call self.processer.process before write_msg' % self.processer)
+            raise RuntimeError('you should not call write_msg while processer(%s) is not None' % self.processer)
         ret = super().write_msg(msg)
         self.processer = get_processer_for_msg(msg)(self)
         return self.processer
@@ -141,6 +155,19 @@ class pgconn(beconn):
         self.async_msgs[m.msg_type].append(m)
         if m.msg_type == p.MsgType.MT_ParameterStatus:
             self.params[bytes(m.name).decode('ascii')] = bytes(m.val).decode('ascii')
+    # str <-> bytes
+    def encode(self, data):
+        if type(data) is str:
+            data = data.encode(self.params['client_encoding'])
+        return data
+    def decode(self, data):
+        if type(data) is not str:
+            data = bytes(data).decode(self.params['client_encoding'])
+        return data
+    # 执行查询，如果返回值是CopyResponse则需要调用process继续进行copy操作。
+    def query(self, sql):
+        sql = self.encode(sql)
+        return self.write_msg(p.Query(query=sql)).process()
 # 表示ErrorResponse消息的异常，其他错误抛出的是RuntimeError异常。
 class pgerror(Exception):
     def __init__(self, errmsg):
@@ -160,14 +187,13 @@ class MsgProcesser():
     def process(self, *args, **kwargs):
         self.cnn.write_msgs_until_done()
         try:
-            res = self._process(*args, **kwargs)
-            return res
-        except Exception as ex:
-            ex.processer = self
-            raise
+            return self._process(*args, **kwargs)
         finally:
-            if self.cnn.processer is self:
-                self.cnn.processer = self.prev_processer
+            self.reset_processer()
+    # 把cnn的processer重置为prev_processer
+    def reset_processer(self):
+        if self.cnn.processer is self:
+            self.cnn.processer = self.prev_processer
 class StartupMessageProcesser(MsgProcesser):
     UnknownMsgErr = 'unknown response msg for startup message'
     def __init__(self, cnn):
@@ -215,17 +241,16 @@ class StartupMessageProcesser(MsgProcesser):
         self._process_msg_list(msg_list)
 class AuthResponseProcesser(StartupMessageProcesser):
     UnknownMsgErr = 'unknown response msg for AuthResponse message'
-    pass
 class QueryProcesser(MsgProcesser):
     UnknownMsgErr = 'unknown response msg for Query message'
     def __init__(self, cnn):
         super().__init__(cnn)
         self.msgs_from_copy = []
         self.ex = None
-        self.cmdstatus = None
+        self.cmdtag = None
         self.rowdesc = None
         self.rows = None
-    # 返回cmdstatus, rowdesc, rows。或者抛出异常。
+    # 返回(cmdtag, rowdesc, rows)，或者CopyResponse消息，或者抛出异常。
     def _process(self):
         if self.msgs_from_copy:
             msg_list = self.msgs_from_copy
@@ -236,11 +261,8 @@ class QueryProcesser(MsgProcesser):
         if isinstance(ret, p.CopyResponse):
             return ret
         if self.ex:
-            ex = self.ex
-            self.ex = None # 避免循环引用
-            raise ex
-        res = (self.cmdstatus, self.rowdesc, self.rows)
-        return res
+            raise self.ex
+        return (self.cmdtag, self.rowdesc, self.rows)
     def _process_msg_list(self, msg_list):
         got_ready = False
         for idx, m in enumerate(msg_list):
@@ -249,12 +271,12 @@ class QueryProcesser(MsgProcesser):
             elif m.msg_type == p.MsgType.MT_ErrorResponse:
                 self.ex = pgerror(m)
             elif m.msg_type == p.MsgType.MT_RowDescription:
-                self.rowdesc = list(m)
+                self.rowdesc = list(c._replace(name=self.cnn.decode(c.name)) for c in m)
                 self.rows = []
             elif m.msg_type == p.MsgType.MT_DataRow:
-                self.rows.append(list(m))
+                self.rows.append(list(c if c is None else self.cnn.decode(c) for c in m))
             elif m.msg_type == p.MsgType.MT_CommandComplete:
-                self.cmdstatus = bytes(m.tag).decode('ascii').split()
+                self.cmdtag = self.cnn.decode(m.tag)
             elif m.msg_type == p.MsgType.MT_ReadyForQuery:
                 got_ready = True
                 break
@@ -273,65 +295,62 @@ class QueryProcesser(MsgProcesser):
             return
         msg_list = self.cnn.read_msgs_until_avail()
         return self._process_msg_list(msg_list)
-class CopyInResponseProcesser(MsgProcesser):
-    # cir_msg is CopyInResponse msg
+class CopyResponseProcesser(MsgProcesser):
+    # msg_list[0] is CopyInResponse or CopyOutResponse msg
     def __init__(self, cnn, msg_list):
         super().__init__(cnn, cnn.processer)
-        self.cir_msg = msg_list[0]
+        self.cr_msg = msg_list[0]
         self.msg_list = msg_list[1:]
+    def _get_msg_list(self):
+        if self.msg_list:
+            msg_list = self.msg_list
+            self.msg_list = None
+        else:
+            msg_list = self.cnn.read_msgs()
+        return msg_list
+class CopyInResponseProcesser(CopyResponseProcesser):
     # 如果CopyIn成功则返回True，否则返回False。
     def _process(self, data_list):
         for data in data_list:
+            data = self.cnn.encode(data)
             m = p.CopyData(data=data)
             self.cnn.write_msgs((m,))
-            if self.msg_list:
-                msg_list = self.msg_list
-                self.msg_list = None
-            else:
-                msg_list = self.cnn.read_msgs()
+            msg_list = self._get_msg_list()
             for m in msg_list:
                 if m.msg_type in self.cnn.async_msgs:
                     self.cnn.got_async_msg(m)
-                elif m.msg_type in (p.MsgType.MT_ErrorResponse, p.MsgType.MT_CommandComplete):
-                    self.prev_processer.msgs_from_copy.append(m)
-                else: # 异常消息，目前返回让QueryProcesser处理。
+                else: # 异常消息(包括ErrorResponse)则退出CopyIn模式。
                     self.prev_processer.msgs_from_copy.append(m)
             if self.prev_processer.msgs_from_copy:
                 return False
         self.cnn.write_msgs((p.CopyDone(),))
         return True
-class CopyOutResponseProcesser(MsgProcesser):
-    # cor_msg is CopyOutResponse msg
-    def __init__(self, cnn, msg_list):
-        super().__init__(cnn, cnn.processer)
-        self.cor_msg = msg_list[0]
-        self.msg_list = msg_list[1:]
-    # 返回(是否正常结束, 已经接收的数据)
+class CopyOutResponseProcesser(CopyResponseProcesser):
+    # 服务器端可能在返回部分结果后再发送ErrorResponse，所以必须查看QueryProcesser的结果看是否有错误。
     def _process(self):
-        res = []
+        return list(self.process_iter())
+    # 一条一条返回，不是返回整个结果集。调用该函数处理完数据后需要再调用reset_processer。
+    def process_iter(self):
+        self.cnn.write_msgs_until_done()
         while True:
-            if self.msg_list:
-                msg_list = self.msg_list
-                self.msg_list = None
-            else:
-                msg_list = self.cnn.read_msgs_until_avail()
+            msg_list = self._get_msg_list()
             for idx, m in enumerate(msg_list):
                 if m.msg_type == p.MsgType.MT_CopyData:
-                    res.append(m.data)
+                    yield self.cnn.decode(m.data)
                 elif m.msg_type == p.MsgType.MT_CopyDone:
                     self.prev_processer.msgs_from_copy.extend(msg_list[idx+1:])
-                    return (True, res)
+                    return
                 elif m.msg_type in self.cnn.async_msgs:
                     self.cnn.got_async_msg(m)
-                else:
+                else: # 异常消息(包括ErrorResponse)则退出CopyOut模式。
                     self.prev_processer.msgs_from_copy.extend(msg_list[idx:])
-                    return (False, res)
+                    return
 # main
 if __name__ == '__main__':
     if len(sys.argv) > 3:
         print('usage: %s [be_addr [listen_addr]]' % sys.argv[0])
         sys.exit(1)
-    be_addr = ('10.10.77.150', 5432)
+    be_addr = ('127.0.0.1', 5432)
     listen_addr = ('0.0.0.0', 9999)
     if len(sys.argv) >= 2:
         host, port = sys.argv[1].split(':')

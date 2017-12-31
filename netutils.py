@@ -176,7 +176,11 @@ else:
 # 所以需要检查返回值是否为None。
 # 
 # 如果s是阻塞的，则不会返回None。
-# 如果对端异常close的话(没有发送FIN)，myrecv可能不会返回空串，而是抛出ConnectionResetError异常。
+# 
+# 有些情况下即使有数据可接收也会抛出ConnectionResetError异常。比如: 
+#     client发送了100个字节，而服务器端只接收了50个字节，然后发给client数据后就close了。
+#     如果服务器端没有正常close socket，而是进程异常退出，比如通过os._exit(1)。
+#     linux下面没有这个问题，因为close就能把socket正常关闭，而windows下面必须用closesocket来关闭。
 # 
 def myrecv(s, bufsize=4096):
     try:
