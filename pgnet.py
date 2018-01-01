@@ -99,7 +99,7 @@ class beconn(connbase):
         return super().write_msgs(msg_list, fe=False)
     def write_msg(self, msg):
         return self.write_msgs((msg,))
-# 
+# 有效的关键字参数包括: host, port, database, user, password, 以及其他GUC参数，比如client_encoding, application_name。
 class pgconn(beconn):
     def __init__(self, **kwargs):
         self.async_msgs = { 
@@ -173,6 +173,18 @@ class pgerror(Exception):
     def __init__(self, errmsg):
         super().__init__(errmsg)
         self.errmsg = errmsg
+# transaction context manager
+class pgtrans():
+    def __init__(self, cnn):
+        self.cnn = cnn
+        sele.cnn.query('begin')
+    def __enter__(self):
+        return self
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if exc_val is None:
+            self.cnn.query('commit')
+        else:
+            self.cnn.query('abort')
 # 如果rowdesc!=None，则表明是有返回结果集的查询(比如select)，否则就是没有结果集的(比如insert/delete)。
 class QueryResult():
     class rowtype():

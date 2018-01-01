@@ -89,6 +89,8 @@ def Check(cls=None, *, attname, attvals, fnfmt='_check_%s'):
 # 有时需要定义一些常量值，而又希望从常量值获得对应的符号名，这就需要定义个从常量值到符号名的映射表。
 # 本元类的作用就是创建这个映射表。
 class V2SMapMeta(type):
+    def __init__(self, name, bases, ns, **kwargs):
+        super().__init__(name, bases, ns)
     # v2s_attname指定要创建的属性的名字；skip指定那些常量值不保存；strip指定从符号名开头去掉几个字符。
     def __new__(cls, name, bases, ns, v2s_attname='v2smap', skip=(), strip=0):
         if v2s_attname in ns:

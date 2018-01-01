@@ -7,12 +7,15 @@ import sys, os, errno, struct
 import socket, select
 import logging
 
-if os.name == 'posix':
+if 'PyPy' in sys.version:
+    NONBLOCK_SEND_RECV_OK = (errno.EAGAIN, 10035)
+    NONBLOCK_CONNECT_EX_OK = (10036, 0)
+elif os.name == 'posix':
     NONBLOCK_SEND_RECV_OK = (errno.EAGAIN, errno.EWOULDBLOCK)
     NONBLOCK_CONNECT_EX_OK = (errno.EINPROGRESS, 0)
 else:
     NONBLOCK_SEND_RECV_OK = (errno.EAGAIN, errno.EWOULDBLOCK, errno.WSAEWOULDBLOCK)
-    NONBLOCK_CONNECT_EX_OK = (errno.WSAEWOULDBLOCK, 0)
+    NONBLOCK_CONNECT_EX_OK = (errno.WSAEINPROGRESS, 0)
 
 # 当poll到POLLERR的时候调用该函数获得错误代码/错误信息。
 # 在异步建立连接(connect_ex)的时候，除了需要检测POLLIN/POLLOUT还需要检测POLLERR。
@@ -74,7 +77,7 @@ class poller_base(object):
         for fobj in fobj_list:
             self.unregister(fobj)
     def close(self):
-        pass
+        self.clear()
 # 
 # 基于select.select
 # 
@@ -165,8 +168,8 @@ if os.name == 'posix':
                 res_list.append((self.fd2objs[fd][0], event))
             return res_list
         def close(self):
-            self.p.close()
             super().close()
+            self.p.close()
 else:
     poller = spoller
     epoller = spoller
