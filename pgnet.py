@@ -45,7 +45,7 @@ class connbase():
         self._read()
         if not self.recv_buf:
             return []
-        idx, msg_list = p.parse_pg_msg(self.recv_buf, fe=fe)
+        idx, msg_list = p.parse_pg_msg(self.recv_buf, max_msg, fe=fe)
         if msg_list:
             self.recv_buf = self.recv_buf[idx:]
         return msg_list
@@ -173,6 +173,68 @@ class pgerror(Exception):
     def __init__(self, errmsg):
         super().__init__(errmsg)
         self.errmsg = errmsg
+# 如果rowdesc!=None，则表明是有返回结果集的查询(比如select)，否则就是没有结果集的(比如insert/delete)。
+class QueryResult():
+    class rowtype():
+        # r : row data
+        # qres : QueryResult which contains the row data
+        def __init__(self, r, qres):
+            self.r = r
+            self.qres = qres
+        def __iter__(self):
+            yield from self.r
+        def __len__(self):
+            return len(self.r)
+        def __getitem__(self, idx):
+            if type(idx) is str:
+                idx = self.qres.field_map[idx]
+            return self.r[idx]
+        def __getattr__(self, name):
+            if name not in self.qres.field_map:
+                raise AttributeError('no attribute %s' % name)
+            return self[name]
+        def __repr__(self):
+            ret = '('
+            for field in self.qres.rowdesc:
+                ret += '%s=%s, ' % (field.name, self[field.name])
+            ret = ret[:-2] + ')'
+            return ret
+    
+    def __init__(self, cmdtag, rowdesc, rows):
+        self.cmdtag = cmdtag
+        self.rowdesc = rowdesc
+        self.rows = rows
+        self._parse_cmdtag()
+        self._make_field_map()
+    def _parse_cmdtag(self):
+        s1, s2 = self.cmdtag.split(maxsplit=1)
+        if s1 in ('UPDATE', 'DELETE', 'SELECT', 'MOVE', 'FETCH', 'COPY'):
+            self.cmdtag = (s1, int(s2))
+        elif s1 in ('INSERT',):
+            oid, rownum = s2.split(maxsplit=1)
+            self.cmdtag = (s1, int(rownum), int(oid))
+        else:
+            self.cmdtag = (self.cmdtag, )
+    def _make_field_map(self):
+        if self.rowdesc is None:
+            return
+        self.field_map = {field.name : idx for idx, field in enumerate(self.rowdesc)}
+    def __iter__(self):
+        for r in self.rows:
+            yield type(self).rowtype(r, self)
+    def __len__(self):
+        return len(self.rows)
+    def __getitem__(self, idx):
+        return type(self).rowtype(self.rows[idx], self)
+    def rowcount(self):
+        if self.rowdesc is None:
+            if len(self.cmdtag) >= 2:
+                return self.cmdtag[1]
+            else:
+                return -1
+        return len(self)
+    def field_info(self, fname):
+        return self.rowdesc[self.field_map[fname]]
 # 
 # processer for response msg after sending message
 # 
@@ -262,7 +324,7 @@ class QueryProcesser(MsgProcesser):
             return ret
         if self.ex:
             raise self.ex
-        return (self.cmdtag, self.rowdesc, self.rows)
+        return QueryResult(self.cmdtag, self.rowdesc, self.rows)
     def _process_msg_list(self, msg_list):
         got_ready = False
         for idx, m in enumerate(msg_list):
