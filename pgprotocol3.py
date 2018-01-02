@@ -15,6 +15,7 @@ import hashlib
 import collections
 import mputils
 from structview import *
+import scram
 
 # 输入输出都是bytes类型
 def md5(bs):
@@ -304,9 +305,30 @@ class Authentication(Msg):
     def make_ar(self, **kwargs):
         if self.authtype in (AuthType.AT_CleartextPassword, AuthType.AT_MD5Password):
             return AuthResponse(PasswordMessage.make(md5salt=self.data, **kwargs))
+        elif self.authtype == AuthType.AT_SASL:
+            sasl = SASL(self.data)
+            mechs = list(sasl)
+            if 'SCRAM-SHA-256' not in mechs:
+                raise RuntimeError('only support SCRAM-SHA-256. server support %s' % mechs)
+            return AuthResponse(kwargs['sasl_init_resp_msg'])
+        elif self.authtype == AuthType.AT_SASLContinue:
+            return AuthResponse(kwargs['sasl_resp_msg'])
         else:
             raise ValueError('do not support authentication:%s' % AuthType.v2smap[self.authtype])
-        
+# mech_name_list是服务器端支持的authentication mechanisms
+# 目前支持SCRAM-SHA-256和SCRAM-SHA-256-PLUS(if SSL enabled)
+# 要想支持scram，在设置用户密码的时候必须把password_encryption设为'scram-sha-256'
+# SASL: Simple Authentication and Security Layer
+@mputils.SeqAccess(attname='mech_name_list', f=lambda x:bytes(x).decode('ascii'))
+class SASL(struct_base):
+    _formats = '>X'
+    _fields = 'mech_name_list'
+    @classmethod
+    def make(cls, *names):
+        names = (name.encode('ascii') if type(name)==str else name for name in names)
+        mech_name_list = Xval(names)
+        return cls(mech_name_list=mech_name_list)
+
 class BackendKeyData(Msg):
     _formats = '>i >i'
     _fields = 'pid skey'
@@ -357,6 +379,15 @@ class ErrorNoticeResponse(Msg):
                 continue
             res.append((FieldType.v2smap[t], v))
         return res
+    # fields是(t,v)列表
+    @classmethod
+    def make(cls, *fields):
+        field_list = []
+        for t, v in fields:
+            if t not in FieldType.v2smap:
+                raise ValueError('unknown field type:%s' % t)
+            field_list.append(t + v)
+        return cls(field_list=Xval(field_list))
 class ErrorResponse(ErrorNoticeResponse):
     pass
 class NoticeResponse(ErrorNoticeResponse):

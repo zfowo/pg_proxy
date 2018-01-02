@@ -9,6 +9,7 @@ import functools
 import getpass
 import netutils
 import pgprotocol3 as p
+import scram
 
 # 连接是非阻塞的，除了connect的时候。
 class connbase():
@@ -100,6 +101,7 @@ class beconn(connbase):
     def write_msg(self, msg):
         return self.write_msgs((msg,))
 # 有效的关键字参数包括: host, port, database, user, password, 以及其他GUC参数，比如client_encoding, application_name。
+class AuthContext: pass
 class pgconn(beconn):
     def __init__(self, **kwargs):
         self.async_msgs = { 
@@ -108,6 +110,7 @@ class pgconn(beconn):
             p.MsgType.MT_ParameterDescription : [], 
         }
         self.processer = None
+        self.auth_ctx = AuthContext()
         host = kwargs.pop('host', '127.0.0.1')
         port = kwargs.pop('port', 5432)
         super().__init__((host, port))
@@ -118,18 +121,43 @@ class pgconn(beconn):
         password = kwargs.pop('password', '')
         m = p.StartupMessage.make(**kwargs)
         self.write_msg(m)
-        self._process_auth(password.encode('utf8'), kwargs['user'].encode('utf8'))
-    def _process_auth(self, password, user):
+        self.auth_ctx.password = password
+        self.auth_ctx.user = kwargs['user']
+        self._process_auth()
+    def _process_auth(self):
         m = self.processer.process()
         if m.authtype == p.AuthType.AT_Ok:
+            #self.auth_ctx = None
             return
         elif m.authtype == p.AuthType.AT_CleartextPassword:
-            self.write_msg(m.make_ar(password=password))
+            self.write_msg(m.make_ar(password=self.auth_ctx.password.encode('utf')))
         elif m.authtype == p.AuthType.AT_MD5Password:
-            self.write_msg(m.make_ar(password=password, user=user))
+            self.write_msg(m.make_ar(password=self.auth_ctx.password.encode('utf8'), user=self.auth_ctx.user.encode('utf8')))
+        elif m.authtype == p.AuthType.AT_SASL:
+            self.auth_ctx.sasl_init_resp_msg = scram.make_SASLInitialResponse()
+            auth_resp_msg = m.make_ar(sasl_init_resp_msg=self.auth_ctx.sasl_init_resp_msg)
+            self.write_msg(auth_resp_msg)
+        elif m.authtype == p.AuthType.AT_SASLContinue:
+            scram.parse_SASLContinue(m)
+            password = self.auth_ctx.password.encode('utf8')
+            self.auth_ctx.salted_password = scram.scram_salted_password(password, m.salt, m.iter_num)
+            self.auth_ctx.sasl_continue_msg = m
+            
+            self.auth_ctx.sasl_resp_msg = scram.make_SASLResponse(self.auth_ctx.salted_password, 
+                                                                  self.auth_ctx.sasl_init_resp_msg, 
+                                                                  self.auth_ctx.sasl_continue_msg)
+            auth_resp_msg = m.make_ar(sasl_resp_msg=self.auth_ctx.sasl_resp_msg)
+            self.write_msg(auth_resp_msg)
+        elif m.authtype == p.AuthType.AT_SASLFinal:
+            scram.parse_SASLFinal(m)
+            proof = scram.calc_SASLFinal(self.auth_ctx.salted_password, self.auth_ctx.sasl_init_resp_msg, 
+                                         self.auth_ctx.sasl_continue_msg, self.auth_ctx.sasl_resp_msg)
+            if proof != m.proof:
+                raise RuntimeError('wrong server proof')
+            self.processer = AuthResponseProcesser(self, self.auth_ctx.msg_list)
         else:
             raise RuntimeError('unsupported authentication type:%s' % m)
-        self._process_auth(password, user)
+        self._process_auth()
     def write_msg(self, msg):
         if self.processer:
             raise RuntimeError('you should not call write_msg while processer(%s) is not None' % self.processer)
@@ -272,12 +300,17 @@ class StartupMessageProcesser(MsgProcesser):
     UnknownMsgErr = 'unknown response msg for startup message'
     def __init__(self, cnn):
         super().__init__(cnn)
+        self.msg_list = ()
         self.params = {}
         self.be_keydata = None
     # 返回authtype是Ok/CleartextPasword/MD5Password的Authentication，或者抛出异常。
     # 调用后应该检查cnn.async_msgs[MsgType.MT_NoticeResponse]是否为空。
     def _process(self):
-        msg_list = self.cnn.read_msgs_until_avail()
+        if not self.msg_list:
+            msg_list = self.cnn.read_msgs_until_avail()
+        else:
+            msg_list = self.msg_list
+            self.msg_list = ()
         m1 = msg_list[0]
         if m1.msg_type == p.MsgType.MT_Authentication:
             if m1.authtype == p.AuthType.AT_Ok:
@@ -287,12 +320,20 @@ class StartupMessageProcesser(MsgProcesser):
                 return m1
             elif m1.authtype == p.AuthType.AT_CleartextPassword or m1.authtype == p.AuthType.AT_MD5Password:
                 return m1
+            elif m1.authtype == p.AuthType.AT_SASL:
+                return m1
+            elif m1.authtype == p.AuthType.AT_SASLContinue:
+                return m1
+            elif m1.authtype == p.AuthType.AT_SASLFinal:
+                self.cnn.auth_ctx.msg_list = msg_list[1:]
+                return m1
             else:
                 raise RuntimeError('unsupported authentication type', m1)
         elif m1.msg_type == p.MsgType.MT_ErrorResponse:
             raise pgerror(m1)
         else:
             raise RuntimeError(cls.UnknownMsgErr, m1)
+    # 处理authtype=Ok后面的消息，也可能有ErrorResponse，比如认证成功后检查发现数据库不存在。
     def _process_msg_list(self, msg_list):
         got_ready = False
         for m in msg_list:
@@ -315,6 +356,9 @@ class StartupMessageProcesser(MsgProcesser):
         self._process_msg_list(msg_list)
 class AuthResponseProcesser(StartupMessageProcesser):
     UnknownMsgErr = 'unknown response msg for AuthResponse message'
+    def __init__(self, cnn, msg_list = ()):
+        super().__init__(cnn)
+        self.msg_list = msg_list
 class QueryProcesser(MsgProcesser):
     UnknownMsgErr = 'unknown response msg for Query message'
     def __init__(self, cnn):
