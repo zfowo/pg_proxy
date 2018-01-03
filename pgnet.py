@@ -31,7 +31,7 @@ class connbase():
             if data is None:
                 break
             elif not data:
-                raise RuntimeError('the peer(%s) closed connection' % (self.s.getpeername(),))
+                raise pgfatal(None, 'the peer(%s) closed connection' % (self.s.getpeername(),))
             self.recv_buf += data
             if len(data) < 4096:
                 break
@@ -101,6 +101,11 @@ class beconn(connbase):
     def write_msg(self, msg):
         return self.write_msgs((msg,))
 # 有效的关键字参数包括: host, port, database, user, password, 以及其他GUC参数，比如client_encoding, application_name。
+# 关于password需要特别注意的是: 
+#   在用create role/alter role设置用户密码的时候，服务器端处理的密码是数据库编码格式的。而在建立连接的时候无法知道
+#   数据库的编码，因此客户端需要确保密码的格式是数据库编码的，如果密码没有特殊字符(比如中文)那就没问题，但是如果有
+#   中文等特殊字符，并且数据库编码不是utf8，就需要把密码的bytes传给password参数，bytes的格式需要是数据库编码。
+#   因此尽量密码中不要包括非latin特殊字符。
 class AuthContext: pass
 class pgconn(beconn):
     def __init__(self, **kwargs):
@@ -121,8 +126,8 @@ class pgconn(beconn):
         password = kwargs.pop('password', '')
         m = p.StartupMessage.make(**kwargs)
         self.write_msg(m)
-        self.auth_ctx.password = password
-        self.auth_ctx.user = kwargs['user']
+        self.auth_ctx.password = password.encode('utf8') if type(password) is str else password
+        self.auth_ctx.user = kwargs['user'].encode('utf8')
         self._process_auth()
     def _process_auth(self):
         m = self.processer.process()
@@ -130,16 +135,16 @@ class pgconn(beconn):
             #self.auth_ctx = None
             return
         elif m.authtype == p.AuthType.AT_CleartextPassword:
-            self.write_msg(m.make_ar(password=self.auth_ctx.password.encode('utf')))
+            self.write_msg(m.make_ar(password=self.auth_ctx.password))
         elif m.authtype == p.AuthType.AT_MD5Password:
-            self.write_msg(m.make_ar(password=self.auth_ctx.password.encode('utf8'), user=self.auth_ctx.user.encode('utf8')))
+            self.write_msg(m.make_ar(password=self.auth_ctx.password, user=self.auth_ctx.user))
         elif m.authtype == p.AuthType.AT_SASL:
             self.auth_ctx.sasl_init_resp_msg = scram.make_SASLInitialResponse()
             auth_resp_msg = m.make_ar(sasl_init_resp_msg=self.auth_ctx.sasl_init_resp_msg)
             self.write_msg(auth_resp_msg)
         elif m.authtype == p.AuthType.AT_SASLContinue:
             scram.parse_SASLContinue(m)
-            password = self.auth_ctx.password.encode('utf8')
+            password = scram.mysaslprep(self.auth_ctx.password)
             self.auth_ctx.salted_password = scram.scram_salted_password(password, m.salt, m.iter_num)
             self.auth_ctx.sasl_continue_msg = m
             
@@ -153,10 +158,10 @@ class pgconn(beconn):
             proof = scram.calc_SASLFinal(self.auth_ctx.salted_password, self.auth_ctx.sasl_init_resp_msg, 
                                          self.auth_ctx.sasl_continue_msg, self.auth_ctx.sasl_resp_msg)
             if proof != m.proof:
-                raise RuntimeError('wrong server proof')
-            self.processer = AuthResponseProcesser(self, self.auth_ctx.msg_list)
+                raise pgfatal(None, 'wrong server proof')
+            self.processer = AuthResponseProcesser(self)
         else:
-            raise RuntimeError('unsupported authentication type:%s' % m)
+            raise pgfatal(m, 'unsupported authentication type')
         self._process_auth()
     def write_msg(self, msg):
         if self.processer:
@@ -196,11 +201,55 @@ class pgconn(beconn):
     def query(self, sql):
         sql = self.encode(sql)
         return self.write_msg(p.Query(query=sql)).process()
-# 表示ErrorResponse消息的异常，其他错误抛出的是RuntimeError异常。
-class pgerror(Exception):
-    def __init__(self, errmsg):
-        super().__init__(errmsg)
+    def copyin(self, sql, data_list):
+        m = self.query(sql)
+        if isinstance(m, p.CopyInResponse):
+            self.processer.process(data_list)
+            return self.processer.process()
+        elif isinstance(m, p.CopyOutResponse):
+            for r in self.processer.process_iter():
+                pass
+            self.processer.reset_processer()
+            try:
+                self.processer.process()
+            except Exception:
+                pass
+            raise pgerror(None, 'sql(%s) is not copy in statement' % sql)
+        else:
+            raise pgerror(None, 'sql(%s) is not copy in statement' % sql)
+    def copyout(self, sql, outf=None):
+        res = []
+        m = self.query(sql)
+        if isinstance(m, p.CopyOutResponse):
+            for r in self.processer.process_iter():
+                if outf:
+                    outf(r)
+                else:
+                    res.append(r)
+            self.processer.reset_processer()
+            return self.processer.process(), res
+        elif isinstance(m, p.CopyInResponse):
+            self.processer.process((), abort=True)
+            try:
+                self.processer.process()
+            except Exception:
+                pass
+            raise pgerror(None, 'sql(%s) is not copy out statement' % sql)
+        else:
+            raise pgerror(None, 'sql(%s) is not copy out statement' % sql)
+# errmsg是ErrorResponse或其他不认识的消息, pgerror表示连接还可以继续使用；而pgfatal表示发生的错误导致连接不可用。
+# 其他和postgresql无关的错误则抛出RuntimeError。
+class pgexception(Exception):
+    def __init__(self, errmsg, errstr=None):
         self.errmsg = errmsg
+        self.errstr = errstr
+    def __repr__(self):
+        return "errstr:%s errmsg:%s" % (self.errstr, self.errmsg)
+    __str__ = __repr__
+class pgerror(pgexception):
+    pass
+class pgfatal(pgexception):
+    pass
 # transaction context manager
 class pgtrans():
     def __init__(self, cnn):
@@ -259,6 +308,8 @@ class QueryResult():
         if self.rowdesc is None:
             return
         self.field_map = {field.name : idx for idx, field in enumerate(self.rowdesc)}
+    def __repr__(self):
+        return "<%s %s %s>" % (self.cmdtag, self.rowdesc, self.rowcount())
     def __iter__(self):
         for r in self.rows:
             yield type(self).rowtype(r, self)
@@ -300,39 +351,28 @@ class StartupMessageProcesser(MsgProcesser):
     UnknownMsgErr = 'unknown response msg for startup message'
     def __init__(self, cnn):
         super().__init__(cnn)
-        self.msg_list = ()
         self.params = {}
         self.be_keydata = None
     # 返回authtype是Ok/CleartextPasword/MD5Password的Authentication，或者抛出异常。
     # 调用后应该检查cnn.async_msgs[MsgType.MT_NoticeResponse]是否为空。
     def _process(self):
-        if not self.msg_list:
-            msg_list = self.cnn.read_msgs_until_avail()
-        else:
-            msg_list = self.msg_list
-            self.msg_list = ()
-        m1 = msg_list[0]
+        m1 = self.cnn.read_msgs_until_avail(max_msg=1)[0]
         if m1.msg_type == p.MsgType.MT_Authentication:
             if m1.authtype == p.AuthType.AT_Ok:
-                self._process_msg_list(msg_list[1:])
+                self._process_msg_list(self.cnn.read_msgs_until_avail())
                 self.cnn.params = self.params
                 self.cnn.be_keydata = self.be_keydata
                 return m1
-            elif m1.authtype == p.AuthType.AT_CleartextPassword or m1.authtype == p.AuthType.AT_MD5Password:
+            elif m1.authtype in (p.AuthType.AT_CleartextPassword, p.AuthType.AT_MD5Password):
                 return m1
-            elif m1.authtype == p.AuthType.AT_SASL:
-                return m1
-            elif m1.authtype == p.AuthType.AT_SASLContinue:
-                return m1
-            elif m1.authtype == p.AuthType.AT_SASLFinal:
-                self.cnn.auth_ctx.msg_list = msg_list[1:]
+            elif m1.authtype in (p.AuthType.AT_SASL, p.AuthType.AT_SASLContinue, p.AuthType.AT_SASLFinal):
                 return m1
             else:
-                raise RuntimeError('unsupported authentication type', m1)
+                raise pgfatal(m1, 'unsupported authentication type')
         elif m1.msg_type == p.MsgType.MT_ErrorResponse:
-            raise pgerror(m1)
+            raise pgfatal(m1, 'auth fail')
         else:
-            raise RuntimeError(cls.UnknownMsgErr, m1)
+            raise pgfatal(m1, cls.UnknownMsgErr)
     # 处理authtype=Ok后面的消息，也可能有ErrorResponse，比如认证成功后检查发现数据库不存在。
     def _process_msg_list(self, msg_list):
         got_ready = False
@@ -347,18 +387,15 @@ class StartupMessageProcesser(MsgProcesser):
             elif m.msg_type == p.MsgType.MT_NoticeResponse:
                 self.cnn.got_async_msg(m)
             elif m.msg_type == p.MsgType.MT_ErrorResponse:
-                raise pgerror(m)
+                raise pgfatal(m)
             else:
-                raise RuntimeError(self.UnknownMsgErr, m)
+                raise pgfatal(m, self.UnknownMsgErr)
         if got_ready:
             return
         msg_list = self.cnn.read_msgs_until_avail()
         self._process_msg_list(msg_list)
 class AuthResponseProcesser(StartupMessageProcesser):
     UnknownMsgErr = 'unknown response msg for AuthResponse message'
-    def __init__(self, cnn, msg_list = ()):
-        super().__init__(cnn)
-        self.msg_list = msg_list
 class QueryProcesser(MsgProcesser):
     UnknownMsgErr = 'unknown response msg for Query message'
     def __init__(self, cnn):
@@ -369,6 +406,8 @@ class QueryProcesser(MsgProcesser):
         self.rowdesc = None
         self.rows = None
     # 返回(cmdtag, rowdesc, rows)，或者CopyResponse消息，或者抛出异常。
+    # 如果返回CopyResponse消息，那么需要继续调用cnn.processer.process来处理copy。
+    # 最后再调用cnn.processer.process来获得copy命令的处理结果。
     def _process(self):
         if self.msgs_from_copy:
             msg_list = self.msgs_from_copy
@@ -385,7 +424,7 @@ class QueryProcesser(MsgProcesser):
         got_ready = False
         for idx, m in enumerate(msg_list):
             if m.msg_type == p.MsgType.MT_EmptyQueryResponse:
-                self.ex = RuntimeError('empty query', m)
+                self.ex = pgerror(m)
             elif m.msg_type == p.MsgType.MT_ErrorResponse:
                 self.ex = pgerror(m)
             elif m.msg_type == p.MsgType.MT_RowDescription:
@@ -408,7 +447,7 @@ class QueryProcesser(MsgProcesser):
                 return m
             else:
                 # 这里不直接抛出异常，需要处理到ReadyForQuery之后才能把它抛出。
-                self.ex = RuntimeError(self.UnknownMsgErr, m)
+                self.ex = pgerror(m, self.UnknownMsgErr)
         if got_ready:
             return
         msg_list = self.cnn.read_msgs_until_avail()
@@ -428,7 +467,10 @@ class CopyResponseProcesser(MsgProcesser):
         return msg_list
 class CopyInResponseProcesser(CopyResponseProcesser):
     # 如果CopyIn成功则返回True，否则返回False。
-    def _process(self, data_list):
+    def _process(self, data_list, abort=False):
+        if abort:
+            self.cnn.write_msgs((p.CopyDone(),))
+            return True
         for data in data_list:
             data = self.cnn.encode(data)
             m = p.CopyData(data=data)

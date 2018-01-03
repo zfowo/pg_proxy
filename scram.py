@@ -5,8 +5,24 @@ import sys, os, struct
 import contextlib
 import random
 import hmac, hashlib, base64
-from passlib.utils import saslprep
 import pgprotocol3 as p
+
+try:
+    from passlib.utils import saslprep
+except ImportError:
+    saslprep = lambda x:x
+# pwd如果是bytes，则认为是utf8格式，这和postgresql中pg_saslprep函数的逻辑是一样的。
+def mysaslprep(pwd):
+    try:
+        if type(pwd) is not str:
+            pwd = pwd.decode('utf8')
+        pwd = saslprep(pwd)
+    except (UnicodeDecodeError, ValueError):
+        pass
+    if type(pwd) is str:
+        return pwd.encode('utf8')
+    else:
+        return pwd
 
 @contextlib.contextmanager
 def print_duration(prefix=''):
@@ -29,10 +45,8 @@ SCRAM_NONCE_LEN = 18
 # nonce不是base64格式
 def make_SASLInitialResponse(nonce=None):
     name = b'SCRAM-SHA-256'
-    if nonce is None:
-        client_nonce = base64.b64encode(gen_random_bytes(SCRAM_NONCE_LEN))
-    else:
-        client_nonce = base64.b64encode(nonce)
+    nonce = gen_random_bytes(SCRAM_NONCE_LEN) if nonce is None else nonce
+    client_nonce = base64.b64encode(nonce)
     response_bare = b'n=,r=' + client_nonce
     response = b'n,,' + response_bare
     x = p.SASLInitialResponse(name=name, response=response)
@@ -69,7 +83,7 @@ def calc_SASLFinal(salted_pwd, sasl_init_resp_msg, sasl_continue_msg, sasl_resp_
     serverkey = scram_serverkey(salted_pwd)
     proof = hmac_sha256(serverkey, sasl_init_resp_msg.response_bare, b',', sasl_continue_msg.data, b',', sasl_resp_msg.data_without_proof)
     return proof
-
+# pwd/salt都是bytes
 def make_scram_verifier(pwd, salt, iter_num):
     salted_pwd = scram_salted_password(pwd, salt, iter_num)
     storedkey = sha256(scram_clientkey(salted_pwd))
@@ -87,14 +101,6 @@ def scram_clientkey(salted_pwd):
     return hmac_sha256(salted_pwd, b'Client Key')
 def scram_serverkey(salted_pwd):
     return hmac_sha256(salted_pwd, b'Server Key')
-# pwd是str不是bytes，如果saslprep成功那么就用处理过后的密码，否则用原来的密码。
-# 最后需要把密码encode成utf8格式。
-def mysaslprep(pwd):
-    try:
-        pwd = saslprep(pwd)
-    except ValueError:
-        pass
-    return pwd
 def gen_random_bytes(sz):
     res = b''
     while True:
@@ -118,14 +124,4 @@ def xor_bytes(b1, b2):
 
 # main
 if __name__ == '__main__':
-    import pgprotocol3 as p
-    sasl_init_resp_msg = make_SASLInitialResponse(b'\x14x\xbf\x05\x0ea\xa8\xa4>3T7\xbc\xb1\x0em\xb1g')
-    sasl_continue_msg = p.Authentication(authtype=p.AuthType.AT_SASLContinue, 
-                             data=b'r=FHi/BQ5hqKQ+M1Q3vLEObbFn7FE4adfMyzYwTclg+MD6SOV5,s=c8XIx8dXRQ3xQkM+CGDhEg==,i=4096')
-    parse_SASLContinue(sasl_continue_msg)
-    salted_pwd = scram_salted_password(b'123456', sasl_continue_msg.salt, 4096)
-    sasl_resp_msg=make_SASLResponse(salted_pwd, sasl_init_resp_msg, sasl_continue_msg)
-    sasl_final_msg = p.Authentication(authtype=p.AuthType.AT_SASLFinal, data=b'v=XqOtAQYMX4m9goNPhoDyRbQ3XCo1lHVod0pgbv0Arc0=')
-    parse_SASLFinal(sasl_final_msg)
-    print(sasl_final_msg.proof)
-    print(calc_SASLFinal(salted_pwd, sasl_init_resp_msg, sasl_continue_msg, sasl_resp_msg))
+    pass

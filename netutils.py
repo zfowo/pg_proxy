@@ -5,6 +5,7 @@
 # 
 import sys, os, errno, struct
 import socket, select
+import collections
 import logging
 
 if 'PyPy' in sys.version:
@@ -90,27 +91,22 @@ class spoller(poller_base):
     def _poll(self, timeout = None):
         if timeout != None and timeout < 0: # 负值表示block，这和poll/epoll相同。
             timeout = None
+        
         r_list, w_list, e_list = [], [], []
-        mask2list = [(self.POLLIN, r_list), (self.POLLOUT, w_list), (self.POLLERR, e_list)]
-        for k in self.fd2objs:
-            m = self.fd2objs[k][1]
-            for i in mask2list:
-                if m & i[0]:
-                    i[1].append(k)
+        for fd, (_, m) in self.fd2objs.items():
+            r_list.append(fd) if m & self.POLLIN else None
+            w_list.append(fd) if m & self.POLLOUT else None
+            e_list.append(fd) if m & self.POLLERR else None
         #logging.debug('select: %s %s %s %s', r_list, w_list, e_list, timeout)
         x = select.select(r_list, w_list, e_list, timeout)
         
-        res = {}
+        res = collections.defaultdict(int)
         masks = [self.POLLIN, self.POLLOUT, self.POLLERR]
-        for idx in range(3):
-            for fd in x[idx]:
-                obj = self.fd2objs[fd][0]
-                mask = res.get(obj, 0)
-                res[obj] = mask | masks[idx]
-        res_list = []
-        for obj in res:
-            res_list.append((obj, res[obj]))
-        return res_list
+        for idx, fdlist in enumerate(x):
+            for fd in fdlist:
+                fobj = self.fd2objs[fd][0]
+                res[fobj] |= masks[idx]
+        return list(res.items())
 
 if os.name == 'posix':
     # 
