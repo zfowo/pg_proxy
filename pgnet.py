@@ -12,6 +12,7 @@ import pgprotocol3 as p
 import scram
 
 # 连接是非阻塞的，除了connect的时候。
+@netutils.pollize
 class connbase():
     def __init__(self, s):
         self.s = s
@@ -24,6 +25,8 @@ class connbase():
     def close(self):
         self.s.close()
         self.status = 'disconnected'
+    def __getattr__(self, name):
+        return getattr(self.s, name)
     # 读取数据直到没有数据可读
     def _read(self):
         while True:
@@ -31,7 +34,7 @@ class connbase():
             if data is None:
                 break
             elif not data:
-                raise pgfatal(None, 'the peer(%s) closed connection' % (self.s.getpeername(),))
+                raise pgfatal(None, 'the peer(%s) closed connection' % (self.s.getpeername(), ))
             self.recv_buf += data
             if len(data) < 4096:
                 break
@@ -58,6 +61,17 @@ class connbase():
             self.send_buf += msg.tobytes()
         self._write()
         return len(self.send_buf)
+    # 一直读直到有消息为止
+    def read_msgs_until_avail(self, max_msg=0):
+        msg_list = self.read_msgs(max_msg)
+        while not msg_list:
+            self.pollin()
+            msg_list = self.read_msgs(max_msg)
+        return msg_list
+    # 一直写直到写完为止
+    def write_msgs_until_done(self):
+        while self.write_msgs():
+            self.pollout()
     def __enter__(self):
         return self
     def __exit__(self, exc_type, exc_val, exc_tb):
@@ -169,17 +183,6 @@ class pgconn(beconn):
         ret = super().write_msg(msg)
         self.processer = get_processer_for_msg(msg)(self)
         return self.processer
-    # read_msgs_until_avail/write_msgs_until_done 现在是循环读写，可能忙等待导致cpu占用，可以用poller来检查是否可读写。
-    # 一直读直到有消息为止
-    def read_msgs_until_avail(self, max_msg=0):
-        msg_list = None
-        while not msg_list:
-            msg_list = self.read_msgs(max_msg)
-        return msg_list
-    # 一直写直到写完为止
-    def write_msgs_until_done(self):
-        while self.write_msgs():
-            pass
     def flush(self):
         return self.write_msgs((p.Flush(),))
     def sync(self):
@@ -521,6 +524,7 @@ if __name__ == '__main__':
     print(be_addr, listen_addr)
         
     listen_s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listen_s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     listen_s.bind(listen_addr)
     listen_s.listen()
     poll = netutils.spoller()

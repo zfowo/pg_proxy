@@ -453,6 +453,8 @@ class StartupMessage(Msg):
             f = lambda x: (bytes(x[0]).decode('ascii'), bytes(x[1]))
             self._params_dict = dict(map(f, zip(it, it)))
         return self._params_dict
+    def __getitem__(self, key):
+        return self.get_params()[key]
     @classmethod
     def make(cls, **kwargs):
         params = []

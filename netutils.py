@@ -18,8 +18,40 @@ else:
     NONBLOCK_SEND_RECV_OK = (errno.EAGAIN, errno.EWOULDBLOCK, errno.WSAEWOULDBLOCK)
     NONBLOCK_CONNECT_EX_OK = (errno.WSAEINPROGRESS, 0)
 
+# 检查单个fobj
+POLLIN = 0x01
+POLLOUT = 0x02
+POLLERR = 0x04
+POLLINOUT = POLLIN|POLLOUT
+POLLINERR = POLLIN|POLLERR
+POLLOUTERR = POLLOUT|POLLERR
+POLLINOUTERR = POLLIN|POLLOUT|POLLERR
+def poll(fobj, event, timeout=None):
+    if timeout != None and timeout < 0: # 负值表示block，这和poll/epoll相同。
+        timeout = None
+    if type(fobj) is not int:
+        fd = fobj.fileno()
+    r_list, w_list, e_list = [], [], []
+    r_list.append(fd) if event & POLLIN else None
+    w_list.append(fd) if event & POLLOUT else None
+    e_list.append(fd) if event & POLLERR else None
+    r_list, w_list, e_list = select.select(r_list, w_list, e_list, timeout)
+    return bool(r_list), bool(w_list), bool(e_list)
+def pollin(fobj, timeout=None):
+    return poll(fobj, POLLIN, timeout)[0]
+def pollout(fobj, timeout=None):
+    return poll(fobj, POLLOUT, timeout)[1]
+# 往类cls增加pollin/pollout/pollerr函数。
+def pollize(cls):
+    def mypoll(self, event, timeout=None): return poll(self, event, timeout)
+    def mypollin(self, timeout=None): return pollin(self, timeout)
+    def mypollout(self, timeout=None): return pollout(self, timeout)
+    setattr(cls, 'poll', mypoll)
+    setattr(cls, 'pollin', mypollin)
+    setattr(cls, 'pollout', mypollout)
+    return cls
 # 当poll到POLLERR的时候调用该函数获得错误代码/错误信息。
-# 在异步建立连接(connect_ex)的时候，除了需要检测POLLIN/POLLOUT还需要检测POLLERR。
+# 在异步建立连接(connect_ex)的时候，一般需要检测POLLOUT|POLLERR，有POLLERR表示连接失败，POLLOUT表示连接成功。
 # 而在连接建立完成后可以不检测POLLERR，因为在读写的时候会出错。
 def get_socket_error(s):
     errcode = s.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
@@ -86,6 +118,10 @@ class spoller(poller_base):
     POLLIN =  0x01
     POLLOUT = 0x02
     POLLERR = 0x04
+    POLLINOUT = POLLIN|POLLOUT
+    POLLINERR = POLLIN|POLLERR
+    POLLOUTERR = POLLOUT|POLLERR
+    POLLINOUTERR = POLLIN|POLLOUT|POLLERR
     def __init__(self):
         super().__init__()
     def _poll(self, timeout = None):
@@ -116,6 +152,10 @@ if os.name == 'posix':
         POLLIN  = select.POLLIN
         POLLOUT = select.POLLOUT
         POLLERR = select.POLLERR
+        POLLINOUT = POLLIN|POLLOUT
+        POLLINERR = POLLIN|POLLERR
+        POLLOUTERR = POLLOUT|POLLERR
+        POLLINOUTERR = POLLIN|POLLOUT|POLLERR
         def __init__(self):
             super().__init__()
             self.p = select.poll()
@@ -141,6 +181,10 @@ if os.name == 'posix':
         POLLIN  = select.EPOLLIN
         POLLOUT = select.EPOLLOUT
         POLLERR = select.EPOLLERR
+        POLLINOUT = POLLIN|POLLOUT
+        POLLINERR = POLLIN|POLLERR
+        POLLOUTERR = POLLOUT|POLLERR
+        POLLINOUTERR = POLLIN|POLLOUT|POLLERR
         def __init__(self):
             super().__init__()
             self.p = select.epoll()

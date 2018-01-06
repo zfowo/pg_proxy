@@ -31,7 +31,7 @@ def print_duration(prefix=''):
     et = time.time()
     print('{}{:.7f}seconds'.format(prefix, et-st))
 
-# scram相关代码在fe-auth-scram.c里面
+# scram相关代码在fe-auth-scram.c/auth-scram.c/auth.c里面
 # pg_shadow中保存的格式为: (代码在函数 pg_be_scram_build_verifier 里面)
 #     SCRAM-SHA-256$4096:salt$StoredKey:ServerKey。4096是hash次数，salt/StoredKey/ServerKey都是base64格式。
 # 
@@ -42,7 +42,7 @@ def print_duration(prefix=''):
 # BE: SASLFinal 包含data:'v=<server_proof>'
 SCRAM_SALT_LEN = 16
 SCRAM_NONCE_LEN = 18
-# nonce不是base64格式
+# nonce参数不是base64格式
 def make_SASLInitialResponse(nonce=None):
     name = b'SCRAM-SHA-256'
     nonce = gen_random_bytes(SCRAM_NONCE_LEN) if nonce is None else nonce
@@ -53,25 +53,36 @@ def make_SASLInitialResponse(nonce=None):
     x.response_bare = response_bare
     x.client_nonce = client_nonce
     return x
+def parse_SASLInitialResponse(msg):
+    response = bytes(msg.response)
+    _, nonce = response.split(b'r=', maxsplit=1)
+    msg.client_nonce = nonce
+    msg.response_bare = b'n=,r=%s' % msg.client_nonce
+# client_nonce和salt都是base64格式，iter_num可以是int或者bytes
+def make_SASLContinue(client_nonce, salt, iter_num):
+    if type(iter_num) is int:
+        iter_num = b'%d' % iter_num
+    server_nonce = base64.b64encode(gen_random_bytes(SCRAM_NONCE_LEN))
+    data = b'r=%s%s,s=%s,i=%s' % (client_nonce, server_nonce, salt, iter_num)
+    msg = p.Authentication(authtype=p.AuthType.AT_SASLContinue, data=data)
+    msg.server_nonce = server_nonce
+    return msg
 # msg是authtype=AT_SASLContinue的Authentication
 # 其中r是client_nonce+server_nonce; s是salt; i是hash次数
 def parse_SASLContinue(msg):
     items = msg.data.split(b',')
     for k, v in (item.split(b'=', maxsplit=1) for item in items):
         if k == b'r':
-            msg.nonce = base64.b64decode(v)
+            msg.nonce = v
         elif k == b's':
             msg.salt = base64.b64decode(v)
         elif k == b'i':
             msg.iter_num = int(v.decode('ascii'))
         else:
             raise ValueError('unknown info in SASLContinue(%s, %s)' % (k, v))
-# msg是authtype=AT_SASLFinal的Authentication
-def parse_SASLFinal(msg):
-    msg.proof = base64.b64decode(msg.data[2:])
 # sasl_continue_msg是authtype=AT_SASLContinue的Authentication
 def make_SASLResponse(salted_pwd, sasl_init_resp_msg, sasl_continue_msg):
-    sasl_resp_data_without_proof = b'c=biws,r=' + base64.b64encode(sasl_continue_msg.nonce)
+    sasl_resp_data_without_proof = b'c=biws,r=' + sasl_continue_msg.nonce
     clientkey = scram_clientkey(salted_pwd)
     storedkey = sha256(clientkey)
     proof = hmac_sha256(storedkey, sasl_init_resp_msg.response_bare, b',', sasl_continue_msg.data, b',', sasl_resp_data_without_proof)
@@ -79,10 +90,41 @@ def make_SASLResponse(salted_pwd, sasl_init_resp_msg, sasl_continue_msg):
     x = p.SASLResponse(sasl_resp_data_without_proof + b',p=' + base64.b64encode(proof))
     x.data_without_proof = sasl_resp_data_without_proof
     return x
+def parse_SASLResponse(msg):
+    items = msg.msgdata.split(b',')
+    for k, v in (item.split(b'=', maxsplit=1) for item in items):
+        if k == b'c':
+            pass
+        elif k == b'r':
+            msg.nonce = v
+        elif k == b'p':
+            msg.proof = base64.b64decode(v)
+        else:
+            raise ValueError('unknown info in SASLResponse(%s, %s)' % (k, v))
+    idx = msg.msgdata.rfind(b',p=')
+    msg.data_without_proof = msg.msgdata[:idx]
+# serverkey是保存在pg_shadow中的ServerKey，serverkey不是base64格式。
+def make_SASLFinal(serverkey, sasl_init_resp_msg, sasl_continue_msg, sasl_resp_msg):
+    server_sig = hmac_sha256(serverkey, sasl_init_resp_msg.response_bare, b',', sasl_continue_msg.data, b',', sasl_resp_msg.data_without_proof)
+    server_sig = base64.b64encode(server_sig)
+    return p.Authentication(authtype=p.AuthType.AT_SASLFinal, data = b'v='+server_sig)
+# msg是authtype=AT_SASLFinal的Authentication
+def parse_SASLFinal(msg):
+    # msg.data : b'v=<proof>'
+    msg.proof = base64.b64decode(msg.data[2:])
+# 客户端验证server
 def calc_SASLFinal(salted_pwd, sasl_init_resp_msg, sasl_continue_msg, sasl_resp_msg):
     serverkey = scram_serverkey(salted_pwd)
     proof = hmac_sha256(serverkey, sasl_init_resp_msg.response_bare, b',', sasl_continue_msg.data, b',', sasl_resp_msg.data_without_proof)
     return proof
+# 服务器端验证client
+# storedkey是保存在pg_shadow中的StoredKey，storedkey不是base64格式。
+def verify_SASLResponse(storedkey, sasl_init_resp_msg, sasl_continue_msg, sasl_resp_msg):
+    client_sig = hmac_sha256(storedkey, sasl_init_resp_msg.response_bare, b',', sasl_continue_msg.data, b',', sasl_resp_msg.data_without_proof)
+    clientkey = xor_bytes(client_sig, sasl_resp_msg.proof)
+    client_storedkey = sha256(clientkey)
+    return client_storedkey == storedkey
+# 
 # pwd/salt都是bytes
 def make_scram_verifier(pwd, salt, iter_num):
     salted_pwd = scram_salted_password(pwd, salt, iter_num)
