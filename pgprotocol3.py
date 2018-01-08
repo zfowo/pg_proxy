@@ -361,6 +361,10 @@ class CopyBothResponse(CopyResponse):
 class DataRow(Msg):
     _formats = '>24X'
     _fields = 'col_vals'
+    # 参数必须是字节串或者None
+    @classmethod
+    def make(cls, *vals):
+        return cls(col_vals=List2Xval(vals))
 class EmptyQueryResponse(Msg):
     pass
 # field_list是字节串列表，字节串中第一个字节是fieldtype, 剩下的是fieldval
@@ -388,6 +392,17 @@ class ErrorNoticeResponse(Msg):
                 raise ValueError('unknown field type:%s' % t)
             field_list.append(t + v)
         return cls(field_list=Xval(field_list))
+    @classmethod
+    def make_error(cls, message, detail=None, hint=None):
+        fields = []
+        fields.append((FieldType.FT_Severity, b'ERROR'))
+        fields.append((FieldType.FT_Severity2, b'ERROR'))
+        fields.append((FieldType.FT_Message, message))
+        if detail:
+            fields.append((FieldType.FT_Detail, detail))
+        if hint:
+            fields.append((FieldType.FT_Hint, hint))
+        return cls.make(*fields)
 class ErrorResponse(ErrorNoticeResponse):
     pass
 class NoticeResponse(ErrorNoticeResponse):
@@ -421,11 +436,32 @@ class PortalSuspended(Msg):
 class ReadyForQuery(Msg):
     _formats = '>s'
     _fields = 'trans_status'
+ReadyForQuery.Idle = ReadyForQuery(trans_status=TransStatus.TS_Idle)
 # field_list包含(name, tableoid, attnum, typoid, typlen, typmod, fmtcode)
 @mputils.SeqAccess(attname='field_list', restype='Field', resfields='name tableoid attnum typoid typlen typmod fmtcode')
 class RowDescription(Msg):
     _formats = '>h -0>xihihih'
     _fields = 'field_cnt field_list'
+    # 参数可以是序列也可以是字典
+    @classmethod
+    def make(cls, *fields):
+        flist = []
+        for idx, field in enumerate(fields):
+            if isinstance(field, collections.Sequence):
+                flist.append(cls.Field(*field))
+            else:
+                flist.append(cls.make_field(idx, **field))
+        return cls(field_cnt=len(flist), field_list=flist)
+    @classmethod
+    def make_field(cls, idx, **kwargs):
+        kwargs.setdefault('name', b'col%d' % (idx+1))
+        kwargs.setdefault('tableoid', 99999)
+        kwargs.setdefault('attnum', idx+1)
+        kwargs.setdefault('typoid', 25)
+        kwargs.setdefault('typlen', -1)
+        kwargs.setdefault('typmod', -1)
+        kwargs.setdefault('fmtcode', 0)
+        return cls.Field(**kwargs)
 
 # 
 # FE->BE的第一个消息

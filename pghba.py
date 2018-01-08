@@ -150,7 +150,7 @@ class pgauth():
     def fileno(self):
         return self.cnn.fileno()
     # 在调用之前需要poll.unregister本auth。返回True表示auth成功。
-    def handle_event(self, poll):
+    def handle_event(self, poll, event):
         ret = self.go()
         if ret == AUTH_OK:
             if self.cnn.write_msgs(self.auth_ok_msgs):
