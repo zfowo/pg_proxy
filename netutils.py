@@ -108,7 +108,13 @@ class poller_base(object):
         if fobj_list is None:
             fobj_list = list(self.fd2objs.keys())
         for fobj in fobj_list:
-            self.unregister(fobj)
+            if self._has_fobj(fobj):
+                self.unregister(fobj)
+    def _has_fobj(self, fobj):
+        fd = fobj
+        if type(fobj) != int:
+            fd = fobj.fileno()
+        return fd in self.fd2objs
     def close(self):
         self.clear()
 # 
@@ -246,6 +252,16 @@ def recv_size(s, sz):
         ret += tmp
         sz -= len(tmp)
     return ret
+class listener():
+    def __init__(self, addr, *, async=False, family=socket.AF_INET):
+        self.s = socket.socket(family, socket.SOCK_STREAM)
+        self.s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.s.bind(addr)
+        self.s.listen()
+        if async:
+            self.s.settimeout(0)
+    def __getattr__(self, name):
+        return getattr(self.s, name)
 # 
 # 通过unix domain socket进行通信，可以传递具体的消息以及文件描述符。
 # 消息格式：一字节的消息类型 + 四个字节的消息长度(包括本四个字节) + 消息数据。

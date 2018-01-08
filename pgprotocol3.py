@@ -408,6 +408,11 @@ class ParameterDescription(Msg):
 class ParameterStatus(Msg):
     _formats = '>x >x'
     _fields = 'name val'
+    @classmethod
+    def make(cls, name, val):
+        name = name.encode('ascii') if type(name) is str else name
+        val = val.encode('ascii') if type(val) is str else val
+        return cls(name=name, val=val)
 class ParseComplete(Msg):
     pass
 class PortalSuspended(Msg):
@@ -445,7 +450,9 @@ class StartupMessage(Msg):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.code = PG_PROTO_VERSION3_NUM
+        # cached value
         self._params_dict = None
+        self._hv = None
     def get_params(self):
         # 把params转成dict，dict的key转成str，value是字节串
         if not self._params_dict:
@@ -455,6 +462,15 @@ class StartupMessage(Msg):
         return self._params_dict
     def __getitem__(self, key):
         return self.get_params()[key]
+    def __eq__(self, other):
+        return self.get_params() == other.get_params()
+    def __hash__(self):
+        if self._hv is not None:
+            return self._hv
+        self._hv = 0
+        for k, v in self.get_params().items():
+            self._hv += hash(k) + hash(v)
+        return self._hv
     @classmethod
     def make(cls, **kwargs):
         params = []
@@ -523,9 +539,10 @@ def has_msg(data, idx, *, fe=True):
 # 从data中提取多个消息包，返回下一个idx和消息对象列表。该函数不能用于parse从FE发给BE的第一个消息。
 #   data : 原始数据。
 #   max_msg : 最多提取多少个消息包。如果为0表示提取所有。
+#   stop : 指定提取停止的条件。可以指定消息类型，包含多个消息类型(多个MsgType的+或者序列)；也可以是函数，函数返回True表示停止提取。
 #   fe : 是否是来自FE的消息。
 # 
-def parse_pg_msg(data, max_msg = 0, *, fe=True):
+def parse_pg_msg(data, max_msg=0, stop=None, *, fe=True):
     msg_list = []
     idx, cnt = 0, 0
     msg_map = MsgMeta.fe_msg_map if fe else MsgMeta.be_msg_map
@@ -537,7 +554,13 @@ def parse_pg_msg(data, max_msg = 0, *, fe=True):
         msg_data = data[idx+5:idx+msg_len]
         idx += msg_len
         
-        msg_list.append(msg_map[msg_type](msg_data))
+        msg = msg_map[msg_type](msg_data)
+        msg_list.append(msg)
+        if stop:
+            if callable(stop):
+                if stop(msg): break
+            else:
+                if msg_type in stop: break
         cnt += 1
         if max_msg > 0 and cnt >= max_msg:
             break

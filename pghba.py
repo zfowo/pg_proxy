@@ -147,6 +147,26 @@ class pgauth():
         if not m:
             return 'pollin'
         return m[0]
+    def fileno(self):
+        return self.cnn.fileno()
+    # 在调用之前需要poll.unregister本auth。返回True表示auth成功。
+    def handle_event(self, poll):
+        ret = self.go()
+        if ret == AUTH_OK:
+            if self.cnn.write_msgs(self.auth_ok_msgs):
+                poll.register(self.cnn, poll.POLLOUT)
+            else:
+                poll.register(self.cnn, poll.POLLIN)
+            return True
+        elif ret == AUTH_FAIL:
+            self.cnn.write_msgs(self.auth_fail_msgs)
+            self.cnn.close()
+        elif ret == 'pollin':
+            poll.register(self, poll.POLLIN)
+        elif ret == 'pollout':
+            poll.register(self, poll.POLLOUT)
+        else:
+            raise RuntimeError('unknown return value(%s) from auth.go' % ret)
 class pgdenyauth(pgauth):
     def go(self):
         return AUTH_FAIL
@@ -256,8 +276,19 @@ class pgscramauth(pgauth):
             self.result = AUTH_OK
             return self.result
         return self.result
-# database/user参数必须都是str不是bytes
-def get_auth(hba, shadows, cnn, database, user):
+# 
+default_auth_fail_msgs = [p.ErrorResponse.make((b'S', b'FATAL'), (b'V', b'FATAL'), (b'M', b'authentication fail')), ]
+def get_auth(hba, shadows, cnn, startup_msg, auth_ok_msgs, auth_fail_msgs=None):
+    if not auth_fail_msgs:
+        auth_fail_msgs = default_auth_fail_msgs
+    auth = _get_auth(hba, shadows, cnn, startup_msg)
+    auth.startup_msg = startup_msg
+    auth.auth_ok_msgs = auth_ok_msgs
+    auth.auth_fail_msgs = auth_fail_msgs
+    return auth
+def _get_auth(hba, shadows, cnn, startup_msg):
+    database = startup_msg['database'].decode('ascii')
+    user = startup_msg['user'].decode('ascii')
     addr = cnn.getpeername()
     if type(addr) is tuple:
         hba_res = hba.check_host(database, user, addr[0])
@@ -325,7 +356,7 @@ if __name__ == '__main__':
                 m = fe.read_startup_msg()
                 while not m:
                     m = fe.read_startup_msg()
-                auth = get_auth(hba, shadows, fe, m['database'].decode('ascii'), m['user'].decode('ascii'))
+                auth = get_auth(hba, shadows, fe, m, auth_ok_msgs, auth_fail_msgs)
                 while auth.go() not in (AUTH_OK, AUTH_FAIL):
                     pass
                 if auth.go() == AUTH_FAIL:

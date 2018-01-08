@@ -30,7 +30,10 @@ class connbase():
     # 读取数据直到没有数据可读
     def _read(self):
         while True:
-            data = netutils.myrecv(self.s, 4096)
+            try:
+                data = netutils.myrecv(self.s, 4096)
+            except ConnectionError as ex:
+                raise pgfatal(None, '%s' % ex)
             if data is None:
                 break
             elif not data:
@@ -45,11 +48,11 @@ class connbase():
             sz = self.s.send(self.send_buf)
             self.send_buf = self.send_buf[sz:]
     # 返回解析后的消息列表。max_msg指定最多返回多少个消息。
-    def read_msgs(self, max_msg=0, *, fe):
+    def read_msgs(self, max_msg=0, stop=None, *, fe):
         self._read()
         if not self.recv_buf:
             return []
-        idx, msg_list = p.parse_pg_msg(self.recv_buf, max_msg, fe=fe)
+        idx, msg_list = p.parse_pg_msg(self.recv_buf, max_msg, stop, fe=fe)
         if msg_list:
             self.recv_buf = self.recv_buf[idx:]
         return msg_list
@@ -62,14 +65,15 @@ class connbase():
         self._write()
         return len(self.send_buf)
     # 一直读直到有消息为止
-    def read_msgs_until_avail(self, max_msg=0):
-        msg_list = self.read_msgs(max_msg)
+    def read_msgs_until_avail(self, max_msg=0, stop=None):
+        msg_list = self.read_msgs(max_msg, stop)
         while not msg_list:
             self.pollin()
-            msg_list = self.read_msgs(max_msg)
+            msg_list = self.read_msgs(max_msg, stop)
         return msg_list
     # 一直写直到写完为止
-    def write_msgs_until_done(self):
+    def write_msgs_until_done(self, msg_list=()):
+        self.write_msgs(msg_list)
         while self.write_msgs():
             self.pollout()
     def __enter__(self):
@@ -80,20 +84,28 @@ class feconn(connbase):
     def __init__(self, s):
         self.status = 'connected'
         super().__init__(s)
+        self.startup_msg = None
     # 读取第一个消息，如果还没有收到则返回None。
     def read_startup_msg(self):
+        if self.startup_msg:
+            return self.startup_msg
         self._read()
-        m = None
         if p.startup_msg_is_complete(self.recv_buf):
-            m = p.parse_startup_msg(self.recv_buf[4:])
+            self.startup_msg = p.parse_startup_msg(self.recv_buf[4:])
             self.recv_buf = b''
-        return m
-    def read_msgs(self, max_msg=0):
-        return super().read_msgs(max_msg, fe=True)
+        return self.startup_msg
+    def read_msgs(self, max_msg=0, stop=None):
+        return super().read_msgs(max_msg, stop, fe=True)
     def write_msgs(self, msg_list=()):
         return super().write_msgs(msg_list, fe=True)
     def write_msg(self, msg):
         return self.write_msgs((msg,))
+# 用于读取statup message
+class feconn4startup():
+    def __init__(self, cnn):
+        self.cnn = cnn
+    def __getattr__(self, name):
+        return getattr(self.cnn, name)
 class beconn(connbase):
     def __init__(self, addr, async_conn=False):
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -108,8 +120,8 @@ class beconn(connbase):
             s.connect(addr)
             self.status = 'connected'
         super().__init__(s)
-    def read_msgs(self, max_msg=0):
-        return super().read_msgs(max_msg, fe=False)
+    def read_msgs(self, max_msg=0, stop=None):
+        return super().read_msgs(max_msg, stop, fe=False)
     def write_msgs(self, msg_list=()):
         return super().write_msgs(msg_list, fe=False)
     def write_msg(self, msg):
@@ -138,8 +150,8 @@ class pgconn(beconn):
         if 'user' not in kwargs:
             kwargs['user'] = getpass.getuser()
         password = kwargs.pop('password', '')
-        m = p.StartupMessage.make(**kwargs)
-        self.write_msg(m)
+        self.startup_msg = p.StartupMessage.make(**kwargs)
+        self.write_msg(self.startup_msg)
         self.auth_ctx.password = password.encode('utf8') if type(password) is str else password
         self.auth_ctx.user = kwargs['user'].encode('utf8')
         self._process_auth()
@@ -240,6 +252,15 @@ class pgconn(beconn):
             raise pgerror(None, 'sql(%s) is not copy out statement' % sql)
         else:
             raise pgerror(None, 'sql(%s) is not copy out statement' % sql)
+    # 获得auth成功后从服务器端返回给客户端的消息。从AuthenticationOk开始直到ReadyForQuery。
+    def make_auth_ok_msgs(self):
+        msg_list = []
+        msg_list.append(p.Authentication(authtype=p.AuthType.AT_Ok, data=b''))
+        for k, v in self.params.items():
+            msg_list.append(p.ParameterStatus.make(k, v))
+        msg_list.append(p.BackendKeyData(pid=self.be_keydata[0], skey=self.be_keydata[1]))
+        msg_list.append(p.ReadyForQuery(trans_status=p.TransStatus.TS_Idle))
+        return msg_list
 # errmsg是ErrorResponse或其他不认识的消息, pgerror表示连接还可以继续使用；而pgfatal表示发生的错误导致连接不可用。
 # 其他和postgresql无关的错误则抛出RuntimeError。
 class pgexception(Exception):
@@ -554,4 +575,4 @@ if __name__ == '__main__':
                         poll.register(fe_c, poll.POLLIN)
         except Exception as ex:
             print('%s: %s' % (ex.__class__.__name__, ex))
-            #traceback.print_tb(sys.exc_info()[2])
+            traceback.print_tb(sys.exc_info()[2])
