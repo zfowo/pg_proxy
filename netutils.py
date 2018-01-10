@@ -18,7 +18,7 @@ else:
     NONBLOCK_SEND_RECV_OK = (errno.EAGAIN, errno.EWOULDBLOCK, errno.WSAEWOULDBLOCK)
     NONBLOCK_CONNECT_EX_OK = (errno.WSAEINPROGRESS, 0)
 
-# 检查单个fobj
+# 检查1个/2个fobj
 POLLIN = 0x01
 POLLOUT = 0x02
 POLLERR = 0x04
@@ -29,8 +29,7 @@ POLLINOUTERR = POLLIN|POLLOUT|POLLERR
 def poll(fobj, event, timeout=None):
     if timeout != None and timeout < 0: # 负值表示block，这和poll/epoll相同。
         timeout = None
-    if type(fobj) is not int:
-        fd = fobj.fileno()
+    fd = fobj.fileno() if type(fobj) is not int else fobj
     r_list, w_list, e_list = [], [], []
     r_list.append(fd) if event & POLLIN else None
     w_list.append(fd) if event & POLLOUT else None
@@ -50,6 +49,24 @@ def pollize(cls):
     setattr(cls, 'pollin', mypollin)
     setattr(cls, 'pollout', mypollout)
     return cls
+def poll2(fobj1, event1, fobj2, event2, timeout=None):
+    if timeout != None and timeout < 0:
+        timeout = None
+    fd1 = fobj1.fileno() if type(fobj1) is not int else fobj1
+    fd2 = fobj2.fileno() if type(fobj2) is not int else fobj2
+    r_list, w_list, e_list = [], [], []
+    for fd, event in ((fd1, event1), (fd2, event2)):
+        r_list.append(fd) if event & POLLIN else None
+        w_list.append(fd) if event & POLLOUT else None
+        e_list.append(fd) if event & POLLERR else None
+    r_list, w_list, e_list = select.select(r_list, w_list, e_list, timeout)
+    return tuple((fd in r_list, fd in w_list, fd in e_list) for fd in (fd1, fd2))
+def poll2in(fobj1, fobj2, timeout=None):
+    x = poll2(fobj1, POLLIN, fobj2, POLLIN, timeout)
+    return x[0][0], x[1][0]
+def poll2out(fobj1, fobj2, timeout=None):
+    x = poll2(fobj1, POLLOUT, fobj2, POLLOUT, timeout)
+    return x[0][1], x[1][1]
 # 当poll到POLLERR的时候调用该函数获得错误代码/错误信息。
 # 在异步建立连接(connect_ex)的时候，一般需要检测POLLOUT|POLLERR，有POLLERR表示连接失败，POLLOUT表示连接成功。
 # 而在连接建立完成后可以不检测POLLERR，因为在读写的时候会出错。

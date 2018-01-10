@@ -259,7 +259,7 @@ class pgconn(beconn):
         for k, v in self.params.items():
             msg_list.append(p.ParameterStatus.make(k, v))
         msg_list.append(p.BackendKeyData(pid=self.be_keydata[0], skey=self.be_keydata[1]))
-        msg_list.append(p.ReadyForQuery(trans_status=p.TransStatus.TS_Idle))
+        msg_list.append(p.ReadyForQuery.Idle)
         return msg_list
 # errmsg是ErrorResponse或其他不认识的消息, pgerror表示连接还可以继续使用；而pgfatal表示发生的错误导致连接不可用。
 # 其他和postgresql无关的错误则抛出RuntimeError。
@@ -575,4 +575,4 @@ if __name__ == '__main__':
                         poll.register(fe_c, poll.POLLIN)
         except Exception as ex:
             print('%s: %s' % (ex.__class__.__name__, ex))
-            traceback.print_tb(sys.exc_info()[2])
+            #traceback.print_tb(sys.exc_info()[2])

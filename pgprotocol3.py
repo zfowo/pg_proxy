@@ -183,7 +183,7 @@ class Query(Msg):
     _formats = '>x'
     _fields = 'query'
 # extended query。
-# 一般顺序为: Parse->Describe->Bind->Describe->Execute->Close->Sync。
+# 一般顺序为: Parse->Bind->Describe->Execute->Close->Sync。
 # 如果想立刻收到消息的结果的话则需要后面发送Flush(Sync后面不需要Flush)，如果有错误则服务器端会立刻发回ErrorResponse(不需要Flush)。
 # 如果有错则服务器端会忽略后面的所有消息直到Sync，所以每个消息后面可以先检查是否收到ErrorResponse，如果没收到再发送后续的消息。
 # Sync会关闭事务(提交或回滚)，然后返回ReadyForQuery。每个Sync都会有一个ReadyForQuery对应。

@@ -12,6 +12,9 @@ import pghba
 import netutils
 import pseudodb
 
+class fepgfatal(Exception):
+    def __init__(self, fatal_ex):
+        self.fatal_ex = fatal_ex
 class pgworker():
     nextid = 0
     @classmethod
@@ -24,7 +27,6 @@ class pgworker():
         self.auth_ok_msgs = []
         self.startup_msg = None
         self.num_processed_msg = 0
-        self.num_skipped_msg = 0
     def _process_auth(self, be_addr, fecnn, main_queue):
         self.startup_msg = fecnn.startup_msg
         self.becnn = pgnet.beconn(be_addr)
@@ -54,31 +56,88 @@ class pgworker():
             return
         # process Query msg from queue
         while True:
+            self.fe_fatal = None
             try:
-                self._process_one()
+                fecnn, msg = self.msg_queue.get()
+                self._process_one(fecnn, msg)
             except pgnet.pgfatal as ex:
+                fecnn.close()
                 print('<thread %d> BE%s: %s' % (self.id, self.becnn.getpeername(), ex))
                 break
+            else:
+                main_queue.put(('done', fecnn))
         main_queue.put(('exit', self))
-    def _process_one(self):
-        fecnn, msg = self.msg_queue.get()
-        if msg.msg_type != p.MsgType.MT_Query:
-            self.num_skipped_msg += 1
-            print('<trhead %d> skip non Query msg from %s: %s' % (self.id, fecnn.getpeername(), msg))
-            return
-        self.becnn.write_msgs_until_done((msg,))
+    def _process_one(self, fecnn, msg):
+        if msg.msg_type == p.MsgType.MT_Terminate:
+            print('<trhead %d> recved Terminate from %s' % (self.id, fecnn.getpeername()))
+        elif msg.msg_type == p.MsgType.MT_Query:
+            self._process_query(fecnn, msg)
+        elif msg.msg_type == p.MsgType.MT_Parse:
+            self._process_parse(fecnn, msg)
+        else:
+            self._process_unsupported(fecnn,  msg)
+        self.num_processed_msg += 1
+    def _process_query(self, fecnn, femsg):
+        self.becnn.write_msgs_until_done((femsg,))
+        m = self.becnn.read_msgs_until_avail(max_msg=1)[0]
+        if m.msg_type == p.MsgType.MT_CopyInResponse:
+            self._process_copyin(fecnn, m)
+        elif m.msg_type == p.MsgType.MT_CopyOutResponse:
+            self._process_copyout(fecnn, m)
+        elif m.msg_type == p.MsgType.MT_CopyBothResponse:
+            raise pgnet.pgfatal(None, 'do not support CopyBothResponse')
+        else:
+            self._process_query2(fecnn, m)
+    def _process_query2(self, fecnn, bemsg):
+        msg_list = (bemsg,)
         while True:
-            msg_list = self.becnn.read_msgs_until_avail()
-            try:
-                fecnn.write_msgs_until_done(msg_list)
-            except pgnet.pgfatal as ex:
-                print('<thread %d> FE%s: %s' % (self.id, fecnn.getpeername(), ex))
-                self._skip_be_msgs(msg_list)
-                return
+            self._write_msgs_to_fe(fecnn, msg_list)
             if msg_list[-1].msg_type == p.MsgType.MT_ReadyForQuery:
                 break
-        self.num_processed_msg += 1
-    def _skip_be_msgs(self, msg_list):
+            msg_list = self.becnn.read_msgs_until_avail()
+    def _process_copyin(self, fecnn, bemsg):
+        self._write_msgs_to_fe(fecnn, (bemsg,))
+        while True:
+            netutils.poll2in(fecnn, self.becnn)
+            try:
+                msg_list = fecnn.read_msgs()
+            except pgnet.pgfatal as ex:
+                err_msg = str(ex).encode('utf8')
+                self.becnn.write_msgs_until_done((p.CopyFail(err_msg=err_msg),))
+                self._skip_be_msgs()
+                break
+            self.becnn.write_msgs_until_done(msg_list)
+            msg_list = self.becnn.read_msgs()
+            self._write_msgs_to_fe(fecnn, msg_list)
+            if msg_list and msg_list[-1].msg_type == p.MsgType.MT_ReadyForQuery:
+                break
+    def _process_copyout(self, fecnn, bemsg):
+        self._write_msgs_to_fe(fecnn, (bemsg,))
+        while True:
+            msg_list = self.becnn.read_msgs_until_avail()
+            self._write_msgs_to_fe(fecnn, msg_list)
+            if msg_list[-1].msg_type == p.MsgType.MT_ReadyForQuery:
+                break
+    def _process_parse(self, fecnn, femsg):
+        pass
+    def _process_unsupported(self, fecnn, femsg):
+        errmsg = p.ErrorResponse.make_error(b'unsupported msg type:%s' % femsg.msg_type)
+        try:
+            fecnn.write_msgs_until_done((errmsg, p.ReadyForQuery.Idle))
+        except pgnet.pgfatal as ex:
+            pass # 不需要处理，主线程在下次read的时候会报错
+    def _write_msgs_to_fe(self, fecnn, msg_list):
+        if self.fe_fatal:
+            return False
+        try:
+            fecnn.write_msgs_until_done(msg_list)
+        except pgnet.pgfatal as ex:
+            self.fe_fatal = ex
+            return False
+        return True
+    def _skip_be_msgs(self, msg_list=()):
+        if not msg_list:
+            msg_list = self.becnn.read_msgs_until_avail()
         while True:
             if msg_list[-1].msg_type == p.MsgType.MT_ReadyForQuery:
                 return
@@ -121,7 +180,6 @@ class pgworkerpool():
         worker_list = self.workers_map[cnn.startup_msg]
         nextidx = self.nextidx_map[cnn.startup_msg] % len(worker_list)
         if not worker_list: # 没有可用的worker则断开连接
-            poll.unregister(cnn)
             cnn.close()
         else:
             worker_list[nextidx].put(cnn, msg)
@@ -186,16 +244,14 @@ class pooldb(pseudodb.pseudodb):
         msg_list = []
         msg_list.append(p.RowDescription.make(
                                       {'name':b'id'}, {'name':b'host'}, {'name':b'port'}, 
-                                      {'name':b'database'}, {'name':b'user'}, 
-                                      {'name':b'processed'}, {'name':b'skipped'}))
+                                      {'name':b'database'}, {'name':b'user'}, {'name':b'processed'}))
         for m, w in self.wpool:
             id = b'%d' % w.id
             processed = b'%d' % w.num_processed_msg
-            skipped = b'%d' % w.num_skipped_msg
             host, port = w.becnn.getpeername()
             host = host.encode('utf8')
             port = b'%d' % port
-            msg_list.append(p.DataRow.make(id, host, port, m['database'], m['user'], processed, skipped))
+            msg_list.append(p.DataRow.make(id, host, port, m['database'], m['user'], processed))
         cnt = len(msg_list) - 1
         msg_list.append(p.CommandComplete(tag=b'SELECT %d' % cnt))
         msg_list.append(p.ReadyForQuery.Idle)
@@ -229,7 +285,7 @@ if __name__ == '__main__':
     poll = netutils.spoller()
     poll.register(listen, poll.POLLIN)
     while True:
-        x = poll.poll(0.1)
+        x = poll.poll(0.001)
         for fobj, event in x:
             try:
                 if fobj is listen:
@@ -265,6 +321,7 @@ if __name__ == '__main__':
                     m = fobj.read_msgs(max_msg=1)
                     if not m:
                         continue
+                    poll.unregister(fobj) # 主线程停止检测，把控制权交给worker
                     wpool.dispatch_fe_msg(poll, fobj, m[0])
                 elif isinstance(fobj, pseudodb.pseudodb):
                     fobj.handle_event(poll, event)
@@ -289,5 +346,7 @@ if __name__ == '__main__':
             elif x[0] == 'exit': # ('exit', worker)
                 wpool.remove(x[1])
                 wpool.dispatch_worker_remain_msg(poll, x[1])
+            elif x[0] == 'done': # ('done', fecnn)
+                poll.register(x[1], poll.POLLIN)
             else:
                 raise RuntimeError('unknow x from main_queue:%s' % (x,))
