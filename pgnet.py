@@ -155,6 +155,7 @@ class pgconn(beconn):
         self.auth_ctx.password = password.encode('utf8') if type(password) is str else password
         self.auth_ctx.user = kwargs['user'].encode('utf8')
         self._process_auth()
+        # auth ok后会生成self.params和self.be_keydata
     def _process_auth(self):
         m = self.processer.process()
         if m.authtype == p.AuthType.AT_Ok:
