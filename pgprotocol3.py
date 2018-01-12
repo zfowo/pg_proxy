@@ -13,6 +13,7 @@ import sys, os
 import struct
 import hashlib
 import collections
+import copy
 import mputils
 from structview import *
 import scram
@@ -507,6 +508,15 @@ class StartupMessage(Msg):
         for k, v in self.get_params().items():
             self._hv += hash(k) + hash(v)
         return self._hv
+    def match(self, other, skip=('host','port','password')):
+        def xf(x):
+            x = copy.copy(x)
+            for k in skip:
+                x.pop(k, None)
+            return self.make(**x)
+        m1 = xf(self.get_params())
+        m2 = xf(other)
+        return m1 == m2
     @classmethod
     def make(cls, **kwargs):
         params = []

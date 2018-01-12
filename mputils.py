@@ -104,4 +104,19 @@ class V2SMapMeta(type):
                 v2smap[v] = s
         ns[v2s_attname] = v2smap
         return super().__new__(cls, name, bases, ns)
-
+# 为类cls的每个实例对象生成一个id
+# 如果派生类没有generateid，那么派生类第一个对象的id从基类中的最后一个id开始
+def generateid(cls):
+    cls._nextid = 0
+    old_new = cls.__dict__.get('__new__')
+    @staticmethod
+    def mynew(cls2, *args, **kwargs):
+        if old_new:
+            obj = old_new(cls2, *args, **kwargs)
+        else:
+            obj = super(cls, cls2).__new__(cls2)
+        cls2._nextid += 1
+        obj.id = cls2._nextid
+        return obj
+    cls.__new__ = mynew
+    return cls

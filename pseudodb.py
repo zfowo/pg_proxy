@@ -46,7 +46,7 @@ class pseudodb():
             return
         m = msg_list[0]
         if m.msg_type not in (p.MsgType.MT_Query, p.MsgType.MT_Terminate):
-            if self.write_msgs(self.unsupported_msgs):
+            if self._write_error('only support Query/Terminate msg'):
                 poll.register(self, poll.POLLOUT)
             return
         # Query/Terminate msg
@@ -55,14 +55,38 @@ class pseudodb():
             poll.unregister(self)
             self.close()
             return
-        query = bytes(m.query).decode('utf8')
-        if self.process_query(query):
-            poll.register(self, poll.POLLOUT)
+        try:
+            query = bytes(m.query).decode('utf8')
+            if self.process_query(query):
+                poll.register(self, poll.POLLOUT)
+        except pgnet.pgfatal as ex:
+            raise
+        except Exception as ex:
+            if self._write_error('%s' % ex):
+                poll.register(self, poll.POLLOUT)
     # 派生类需要实现process_query，往前端写消息，返回write_msgs的返回值。
     # 如果成功则发送: RowDescription + DataRow + CommandComplete + ReadyForQuery
     # 如果失败则发送: ErrorResponse + ReadyForQuery
     def process_query(self, query):
         raise RuntimeError('derived class should implement process_query')
+    # 写错误信息
+    def _write_error(self, err):
+        err = err.encode('utf8') if type(err) is str else err
+        return self.write_msgs((p.ErrorResponse.make_error(err), p.ReadyForQuery.Idle))
+    def _write_result(self, col_names, rows):
+        msg_list = []
+        x = []
+        for cn in col_names:
+            cn = cn.encode('utf8') if type(cn) is str else cn
+            x.append({'name':cn})
+        msg_list.append(p.RowDescription.make(*x))
+        for r in rows:
+            y = (str(c).encode('utf8') if type(c) is not bytes else c for c in r)
+            msg_list.append(p.DataRow.make(*y))
+        cnt = len(msg_list) - 1
+        msg_list.append(p.CommandComplete(tag=b'SELECT %d'%cnt))
+        msg_list.append(p.ReadyForQuery.Idle)
+        return self.write_msgs(msg_list)
 # for test
 class testdb(pseudodb):
     def process_query(self, query):

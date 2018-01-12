@@ -5,6 +5,7 @@
 # 
 import sys, os
 import datetime, socket
+import collections
 from netutils import uds_ep
 
 # 连接到主进程的uds，然后发送b's'消息。
@@ -21,13 +22,15 @@ def read_conf_file(conf_file, conf_name):
     data = f.read()
     f.close()
     this_path = os.path.dirname(conf_file)
+    this_path = os.path.abspath(this_path)
     local_dict = {'this_path' : this_path}
     exec(data, None, local_dict)
     return local_dict.pop(conf_name)
-
-def read_conf(this_path):
+# 如果没有指定配置文件那么就在thist_path目录找缺省的配置文件。
+def read_conf(this_path=''):
     if len(sys.argv) == 1:
-        conf_file = os.path.join(this_path, 'pg_proxy.conf.py')
+        fn = os.path.basename(sys.argv[0])[:-3] + '.conf.py'
+        conf_file = os.path.join(this_path, fn)
     elif len(sys.argv) == 2:
         conf_file = sys.argv[1]
     else:
@@ -65,6 +68,23 @@ def get_now_time():
     d = datetime.datetime.now()
     return '%.4d-%.2d-%.2d %.2d:%.2d:%.2d' % (d.year, d.month, d.day, d.hour, d.minute, d.second)
 
+def parse_args(args, sep, **kwargs):
+    res = collections.defaultdict(list)
+    for kv in args:
+        kv = kv.strip()
+        k, v = kv.split(sep, maxsplit=1)
+        k, v = k.strip(), v.strip()
+        x = mysplit(v, kwargs.get(k))
+        if type(x) is str:
+            res[k].append(x)
+        else:
+            res[k] += x
+    return res
+def mysplit(s, seps):
+    if not seps:
+        return s
+    res = s.split(seps[0])
+    return [mysplit(x, seps[1:]) for x in res]
 # main
 if __name__ == '__main__':
     pass
