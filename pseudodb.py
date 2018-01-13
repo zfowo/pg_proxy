@@ -10,20 +10,20 @@ import pgprotocol3 as p
 import netutils
 
 default_auth_ok_msgs = [
-    p.Authentication(authtype=p.AuthType.AT_Ok, data=b''), 
-    p.ParameterStatus(name=b'application_name', val=b'pseudo'), 
-    p.ParameterStatus(name=b'client_encoding', val=b'UTF8'), 
-    p.ParameterStatus(name=b'DateStyle', val=b'ISO, MDY'), 
-    p.ParameterStatus(name=b'integer_datetimes', val=b'on'), 
-    p.ParameterStatus(name=b'IntervalStyle', val=b'postgres'), 
-    p.ParameterStatus(name=b'is_superuser', val=b'on'), 
-    p.ParameterStatus(name=b'server_encoding', val=b'UTF8'), 
-    p.ParameterStatus(name=b'server_version', val=b'11devel'), 
-    p.ParameterStatus(name=b'session_authorization', val=b'pseudo'), 
-    p.ParameterStatus(name=b'standard_conforming_strings', val=b'on'), 
-    p.ParameterStatus(name=b'TimeZone', val=b'Asia/Hong_Kong'), 
+    p.Authentication.Ok, 
+    p.ParameterStatus.make('application_name', 'pseudo'), 
+    p.ParameterStatus.make('client_encoding', 'UTF8'), 
+    p.ParameterStatus.make('DateStyle', 'ISO, MDY'), 
+    p.ParameterStatus.make('integer_datetimes', 'on'), 
+    p.ParameterStatus.make('IntervalStyle', 'postgres'), 
+    p.ParameterStatus.make('is_superuser', 'on'), 
+    p.ParameterStatus.make('server_encoding', 'UTF8'), 
+    p.ParameterStatus.make('server_version', '11devel'), 
+    p.ParameterStatus.make('session_authorization', 'pseudo'), 
+    p.ParameterStatus.make('standard_conforming_strings', 'on'), 
+    p.ParameterStatus.make('TimeZone', 'Asia/Hong_Kong'), 
     p.BackendKeyData(pid=1234, skey=1234), 
-    p.ReadyForQuery(trans_status=b'I'), 
+    p.ReadyForQuery.Idle, 
 ]
 # 本类不处理auth过程，由pgauth处理，用户名/密码用的是数据库中的，不单独设置。
 class pseudodb():

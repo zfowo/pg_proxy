@@ -33,11 +33,11 @@ class connbase():
             try:
                 data = netutils.myrecv(self.s, 4096)
             except ConnectionError as ex:
-                raise pgfatal(None, '%s' % ex)
+                raise pgfatal(None, '%s' % ex, self)
             if data is None:
                 break
             elif not data:
-                raise pgfatal(None, 'the peer(%s) closed connection' % (self.s.getpeername(), ))
+                raise pgfatal(None, 'the peer(%s) closed connection' % (self.s.getpeername(),), self)
             self.recv_buf += data
             if len(data) < 4096:
                 break
@@ -45,7 +45,10 @@ class connbase():
                 break
     def _write(self):
         if self.send_buf:
-            sz = self.s.send(self.send_buf)
+            try:
+                sz = self.s.send(self.send_buf)
+            except ConnectionError as ex:
+                raise pgfatal(None, '%s' % ex, self)
             self.send_buf = self.send_buf[sz:]
     # 返回解析后的消息列表。max_msg指定最多返回多少个消息。
     def read_msgs(self, max_msg=0, stop=None, *, fe):
@@ -60,7 +63,7 @@ class connbase():
     def write_msgs(self, msg_list=(), *, fe):
         prefix_str = 'BE' if fe else 'FE'
         for msg in msg_list:
-            print('%s: %s' % (prefix_str, msg))
+            #print('%s: %s' % (prefix_str, msg))
             self.send_buf += msg.tobytes()
         self._write()
         return len(self.send_buf)
@@ -113,12 +116,16 @@ class beconn(connbase):
         # connect_ex也可能抛出异常，之后需要先检测POLLOUT|POLLERR，
         # POLLERR表示连接失败，此时可通过netutils.get_socket_error获得连接失败的原因。
         # POLLOUT表示连接成功可以发送数据。
-        if async_conn:
-            s.settimeout(0)
-            s.connect_ex(addr)
-        else:
-            s.connect(addr)
-            self.status = 'connected'
+        # connect可能抛出的异常:socket.gaierror, TimeoutError, ConnectionError
+        try:
+            if async_conn:
+                s.settimeout(0)
+                s.connect_ex(addr)
+            else:
+                s.connect(addr)
+                self.status = 'connected'
+        except OSError as ex:
+            raise pgfatal(None, 'connect fail for %s: %s' % (addr, ex))
         super().__init__(s)
     def read_msgs(self, max_msg=0, stop=None):
         return super().read_msgs(max_msg, stop, fe=False)
@@ -263,11 +270,13 @@ class pgconn(beconn):
         msg_list.append(p.ReadyForQuery.Idle)
         return msg_list
 # errmsg是ErrorResponse或其他不认识的消息, pgerror表示连接还可以继续使用；而pgfatal表示发生的错误导致连接不可用。
+# pgfatal如果是由于socket读写失败导致的，则cnn设置为相应的连接对象。
 # 其他和postgresql无关的错误则抛出RuntimeError。
 class pgexception(Exception):
-    def __init__(self, errmsg, errstr=None):
+    def __init__(self, errmsg, errstr=None, cnn=None):
         self.errmsg = errmsg
         self.errstr = errstr
+        self.cnn = cnn
     def __repr__(self):
         return "errstr:%s errmsg:%s" % (self.errstr, self.errmsg)
     __str__ = __repr__

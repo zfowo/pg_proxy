@@ -5,8 +5,9 @@
 -- 
 -- 当主库down掉后，需要执行下面这些：
 --   1. 把数据最新的一个从库提升为主库。
---   2. 在新的主库上创建其他从库用到的物理复制slot。
---   3. 修改其他从库的recovery.conf，把primary_conninfo中的host/port指向新的主库，然后重启pg。
+--   2. 调用z_change_recovery_conf修改其他从库的recovery.conf，把primary_conninfo中的host/port指向新的主库。
+--   3. 用z_change_recovery_conf的返回值在新的主库上创建其他从库用到的物理复制slot。
+--   4. 调用z_restart_pg重启其他从库。
 -- 
 
 -- 

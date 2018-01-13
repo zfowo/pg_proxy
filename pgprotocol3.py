@@ -316,6 +316,7 @@ class Authentication(Msg):
             return AuthResponse(kwargs['sasl_resp_msg'])
         else:
             raise ValueError('do not support authentication:%s' % AuthType.v2smap[self.authtype])
+Authentication.Ok = Authentication(authtype=AuthType.AT_Ok, data=b'')
 # mech_name_list是服务器端支持的authentication mechanisms
 # postgresql 10支持SCRAM-SHA-256和SCRAM-SHA-256-PLUS(if SSL enabled)
 # 要想支持scram，在设置用户密码的时候必须把password_encryption设为'scram-sha-256'
@@ -438,6 +439,8 @@ class ReadyForQuery(Msg):
     _formats = '>s'
     _fields = 'trans_status'
 ReadyForQuery.Idle = ReadyForQuery(trans_status=TransStatus.TS_Idle)
+ReadyForQuery.InBlock = ReadyForQuery(trans_status=TransStatus.TS_InBlock)
+ReadyForQuery.Fail = ReadyForQuery(trans_status=TransStatus.TS_Fail)
 # field_list包含(name, tableoid, attnum, typoid, typlen, typmod, fmtcode)
 @mputils.SeqAccess(attname='field_list', restype='Field', resfields='name tableoid attnum typoid typlen typmod fmtcode')
 class RowDescription(Msg):
