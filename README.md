@@ -1,5 +1,54 @@
 
-pg_proxy.py [conf_file]
+pgstmtpool.py [conf_file] 语句级别连接池
+========================================
+* 配置文件是个python文件，all变量字典包含配置参数，其中admin_cnn和master是必须指定的参数，具体参数包括：
+
+        'listen' : (host, port)       指定监听ip和port。
+        'admin_cnn' : {}              指定连接参数，不要指定host/port，连接池在需要做些admin操作的时候用该参数连接到主库和从库。
+        'enable_ha' : False           是否支持HA。
+        'ha_after_fail_cnt' : 10      当主库连续出现指定次数的连接失败时启动主库切换。
+        'lo_oid' : 9999               主库中大对象id，用于在从库中生成trigger文件。
+        'trigger_file' : 'trigger'    从库的recovery.conf配置的触发promote的文件名。
+        'worker_min_cnt' : []         用于指定当有n个前端连接时需要的后端worker数。第idx个值表示当有idx+1个前端连接时需要的worker数。
+        'worker_per_fe_cnt' : 10      当前端数超过worker_min_cnt的大小时，指定每多少个前端连接需要一个后端连接。
+        'master' : (host, port)       主库地址。
+        'slaver' : [(),...]           从库地址列表。
+        'conn_params' : [{},...]      连接参数列表(不能包含host/port)，当前端参数和其中一个匹配的时候才会启动从库worker。
+* 在pg_hba.conf中不要把连接池的host/ip配置成trust，因为当前端第一个次连接时是由数据库端auth的，此时数据库端看到的是连接池的host/ip。
+admin_cnn参数中的用户需要是超级用户。admin_cnn/conn_params中除了包含startup_msg消息中的参数外，可能还需要password(如果不是trust auth)。
+
+* 前端在连接的时候会首先发送一个startup_msg消息，该消息包含database/user以及其他数据库参数，比如client_encoding/application_name，
+不支持SSL连接和复制连接。每个后端都有一个pool，pool包含worker，worker按startup_msg分组，来自前端的查询会根据startup_msg分发到相应
+的worker，缺省所有查询都分发到主库worker，如果查询语句的开头是/*s*/并且存在从库worker的话则分发给从库worker。
+
+HA主库切换
+==========
+* 当主库连续出现ha_after_fail_cnt次连接失败并且enable_ha为True，则会开始切换操作，切换过程如下：
+
+        1) 从所有从库中选一个接收的wal日志最新的从库。
+        2) 把选定的从库提升为主库。
+        3) 修改其他从库的recovery.conf配置文件。
+        4) 在新的主库上创建从库用到的复制slot。
+        5) 重启从库使得修改生效。
+* 前面的3/4/5中需要用到switchfunc.sql中的函数，这些函数是用pl/python3u编写的。
+
+伪数据库pseudo
+==============
+* 可以用psql连接到数据库pseudo查看连接池的各种信息，用数据库中的用户名/密码，还可以在pg_hba.conf中设置pseudo的auth方法。
+
+* 连接到pseudo后只能执行支持的命令，包括下面这些命令：
+        .) cmd                  列出所有命令
+        .) fe [list]            列出所有前端连接
+        .) pool [list]          列出所有pool
+        .) pool show            列出指定pool中的worker，多个pool id用逗号分割，如果没指定pool id则列出所有pool的worker。
+        .) pool add             增加一个pool，参数是host:port，只能增加从库pool。
+        .) pool remove          删除一个pool，参数是pool id，只能删除从库pool。
+        .) pool remove_worker   删除一个worker，参数是pool id和worker id。可以删除主库或者从库pool中的worker。
+        .) pool new_worker      增加一个worker，参数是pool id和连接参数。
+* 不要多个用户同时连接到pseudo执行修改操作。
+
+
+<作废>pg_proxy.py [conf_file]
 =======================
 * 配置文件conf_file是个python文件，里面有一个dict对象pg_proxy_conf，该字典包含下面这些项：
 

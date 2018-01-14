@@ -4,7 +4,7 @@
 # 语句级别的连接池。
 # 使用有名字的Parse/Bind的时候，如果前端在发送Close之前就异常断开了，那么语句/portal不会被close。
 # 
-import sys, os
+import sys, os, time
 import collections, socket, copy
 import threading, queue
 import pgnet
@@ -407,7 +407,8 @@ class pgworkerpools():
         pool = self.get(w.pool_id)
         if not pool:
             return
-        pool.remove(w)
+        if not pool.remove(w): # w之前已经被remove。有时可能会被remove2次，一次手动remove，一次worker异常退出时remove。
+            return
         if pool.count(w.startup_msg):
             return
         pool_list = self.pools_map[w.startup_msg]
@@ -601,6 +602,39 @@ class pooldb(pseudodb.pseudodb):
             res = res[:-1]
         res += b'}'
         return res
+# misc worker。负责额外的一些任务，目前包括: 
+#   .) 发送CancelRequest
+#   .) 发送报警邮件
+class pgmiscworker():
+    def __init__(self):
+        self.work_queue = queue.Queue()
+    def put(self, name, args):
+        self.work_queue.put_nowait((name, args))
+    def run(self):
+        while True:
+            name, args = self.work_queue.get()
+            if name is None:
+                return
+            if name == 'CancelRequest':
+                self._process_CancelRequest(args)
+            else:
+                print('<miscworker> unknown work name:%s args:%s' % (name, args))
+    def _process_CancelRequest(self, args):
+        msg, addr_list = args
+        for addr in addr_list:
+            try:
+                cnn = pgnet.beconn(addr)
+            except pgnet.pgexception as ex:
+                print('<miscworker> connecting to %s fail: %s' % (addr, ex))
+                continue
+            cnn.write_msgs_until_done((msg,))
+            cnn.close()
+    @classmethod
+    def start(cls):
+        w = cls()
+        thr = threading.Thread(target=w.run)
+        thr.start()
+        return w
 # main
 def get_match_cnn_param(startup_msg):
     for param in g_conf.get('conn_params',()):
@@ -615,9 +649,9 @@ def need_new_worker(startup_msg):
     else:
         fecnt = fepool.count(startup_msg) + 1
         worker_min_cnt = g_conf.get('worker_min_cnt', [])
-        worker_cnt_per = g_conf.get('worker_cnt_per', 10)
+        worker_per_fe_cnt = g_conf.get('worker_per_fe_cnt', 10)
         if fecnt > len(worker_min_cnt):
-            need = fecnt/worker_cnt_per > wcnt
+            need = fecnt/worker_per_fe_cnt > wcnt
         else:
             need = worker_min_cnt[fecnt-1] > wcnt
     param = get_match_cnn_param(startup_msg) if need else None
@@ -645,7 +679,7 @@ def get_newest_slaver():
             cnn = pool.get_admin_cnn(g_conf['admin_cnn'])
             res = cnn.query('select  pg_last_wal_receive_lsn()')
         except pgnet.pgexception as ex:
-            print('get_admin_cnn fail for pool %s: %s' % (pool.id, ex))
+            print('pg_last_wal_receive_lsn fail for pool %s: %s' % (pool.id, ex))
             continue
         if res[0][0] is None:
             continue
@@ -665,6 +699,39 @@ def promote_slaver(pool):
         print('promote_slaver fail: %s' % ex)
         return False
     return True
+# 修改从库中的recovery.conf指向新的主库，并且返回从库使用的复制slot名字列表。
+def modify_recovery_conf():
+    slot_name_list = []
+    m_host, m_port = master_pool.be_addr
+    for pool in slaver_pools:
+        try:
+            cnn = pool.get_admin_cnn(g_conf['admin_cnn'])
+            res = cnn.query("select z_change_recovery_conf('%s', %s)" % (m_host, m_port))
+        except pgnet.pgexception as ex:
+            print('z_change_recovery_conf fail for pool %s: %s' % (pool.id, ex))
+            continue
+        if res[0][0]:
+            slot_name_list.append(res[0][0])
+    return slot_name_list
+# 返回创建成功的slot名字列表。
+def create_slot_for_slaver(slot_name_list):
+    ret = []
+    for name in slot_name_list:
+        try:
+            cnn = master_pool.get_admin_cnn(g_conf['admin_cnn'])
+            cnn.query("select pg_create_physical_replication_slot('%s')" % name)
+        except pgnet.pgexception as ex:
+            print('pg_create_physical_replication_slot fail for %s: %s' % (name, ex))
+            continue
+        ret.append(name)
+    return ret
+def restart_slaver():
+    for pool in slaver_pools:
+        try:
+            cnn = pool.get_admin_cnn(g_conf['admin_cnn'])
+            cnn.query("select z_restart_pg()")
+        except pgnet.pgexception as ex:
+            pass
 # in event loop
 def process_main_queue():
     # process main_queue
@@ -717,17 +784,19 @@ def process_main_queue():
         else:
             raise RuntimeError('unknow x from main_queue:%s' % (x,))
 def process_ha():
+    global master_pool
     if not g_conf.get('enable_ha', False):
-        if len(master_fail_history) >= 10:
+        if len(master_fail_history) >= g_conf.get('', 10):
             print('master_fail_history: %s' % master_fail_history)
             master_fail_history.clear()
         return
-    if len(master_fail_history) < 10:
+    if len(master_fail_history) < g_conf.get('', 10):
         return
     print('start process_ha')
     master_fail_history.clear()
     pool, max_lsn = get_newest_slaver()
     if not pool:
+        print('no newest slaver')
         slaver_pools.close_admin_cnn()
         return
     if not promote_slaver(pool):
@@ -738,7 +807,11 @@ def process_ha():
     master_pool = pool
     g_conf['master'] = master_pool.be_addr
     g_conf['slaver'].remove(master_pool.be_addr)
-    # TODO: 如果有多个slaver的话，还需要把它们指向新的主库。
+    # 把剩下的从库指向新的主库
+    slot_name_list = modify_recovery_conf()
+    create_slot_for_slaver([s for s in slot_name_list if s])
+    if slot_name_list:
+        restart_slaver()
     master_pool.close_admin_cnn()
     slaver_pools.close_admin_cnn()
     print('process_ha done. master changed to %s' % (master_pool.be_addr,))
@@ -758,6 +831,8 @@ if __name__ == '__main__':
     slaver_workers_to_start = {} # 记录下需要启动的slaver workers
     master_fail_history = [] # 后端连续出问题的时间记录，如果有连接成功则清空
     
+    misc_worker = pgmiscworker.start()
+    
     listen = netutils.listener(g_conf.get('listen', ('', 7777)), async=True)
     poll = netutils.spoller()
     poll.register(listen, poll.POLLIN)
@@ -775,7 +850,8 @@ if __name__ == '__main__':
                         continue
                     poll.unregister(fobj)
                     if m.code == p.PG_CANCELREQUEST_CODE:
-                        # 需要一个专门的worker来处理这个以及其他任务
+                        addr_list = [g_conf['master']] + g_conf.get('slaver', [])
+                        misc_worker.put('CancelRequest', (m, addr_list))
                         fobj.close()
                         continue
                     if m.code != p.PG_PROTO_VERSION3_NUM or 'replication' in m.get_params():
