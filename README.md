@@ -37,14 +37,15 @@ HA主库切换
 * 可以用psql连接到数据库pseudo查看连接池的各种信息，用数据库中的用户名/密码，还可以在pg_hba.conf中设置pseudo的auth方法。
 
 * 连接到pseudo后只能执行支持的命令，包括下面这些命令：
-        cmd                  列出所有命令
-        fe [list]            列出所有前端连接
-        pool [list]          列出所有pool
-        pool show            列出指定pool中的worker，多个pool id用逗号分割，如果没指定pool id则列出所有pool的worker。
-        pool add             增加一个pool，参数是host:port，只能增加从库pool。
-        pool remove          删除一个pool，参数是pool id，只能删除从库pool。
-        pool remove_worker   删除一个worker，参数是pool id和worker id。可以删除主库或者从库pool中的worker。
-        pool new_worker      增加一个worker，参数是pool id和连接参数。
+
+        .) cmd                  列出所有命令
+        .) fe [list]            列出所有前端连接
+        .) pool [list]          列出所有pool
+        .) pool show            列出指定pool中的worker，多个pool id用逗号分割，如果没指定pool id则列出所有pool的worker。
+        .) pool add             增加一个pool，参数是host:port，只能增加从库pool。
+        .) pool remove          删除一个pool，参数是pool id，只能删除从库pool。
+        .) pool remove_worker   删除一个worker，参数是pool id和worker id。可以删除主库或者从库pool中的worker。
+        .) pool new_worker      增加一个worker，参数是pool id和连接参数。
 * 不要多个用户同时连接到pseudo执行修改操作。
 
 
