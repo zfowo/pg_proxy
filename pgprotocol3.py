@@ -614,7 +614,24 @@ def parse_pg_msg(data, max_msg=0, stop=None, *, fe=True):
         if max_msg > 0 and cnt >= max_msg:
             break
     return (idx, msg_list)
-
+# other utility
+def make_auth_ok_msgs(params, be_keydata):
+    msg_list = []
+    msg_list.append(Authentication.Ok)
+    for k, v in params.items():
+        msg_list.append(ParameterStatus.make(k, v))
+    msg_list.append(BackendKeyData(pid=be_keydata[0], skey=be_keydata[1]))
+    msg_list.append(ReadyForQuery.Idle)
+    return msg_list
+def parse_auth_ok_msgs(msg_list):
+    params = {}
+    be_keydata = None
+    for msg in msg_list:
+        if msg.msg_type == MsgType.MT_ParameterStatus:
+            params[bytes(msg.name).decode('ascii')] = bytes(msg.val).decode('ascii')
+        elif msg.msg_type == MsgType.MT_BackendKeyData:
+            be_keydata = (msg.pid,  msg.skey)
+    return params, be_keydata
 # main
 if __name__ == '__main__':
     pass

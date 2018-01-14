@@ -25,6 +25,8 @@ class connbase():
     def close(self):
         self.s.close()
         self.status = 'disconnected'
+    def __repr__(self):
+        return '<%s peer=%s>' % (type(self).__name__, self.s.getpeername())
     def __getattr__(self, name):
         return getattr(self.s, name)
     # 读取数据直到没有数据可读
@@ -94,7 +96,10 @@ class feconn(connbase):
             return self.startup_msg
         self._read()
         if p.startup_msg_is_complete(self.recv_buf):
-            self.startup_msg = p.parse_startup_msg(self.recv_buf[4:])
+            try:
+                self.startup_msg = p.parse_startup_msg(self.recv_buf[4:])
+            except RuntimeError as ex:
+                raise pgfatal(None, 'RuntimeError: %s' % ex)
             self.recv_buf = b''
         return self.startup_msg
     def read_msgs(self, max_msg=0, stop=None):
@@ -262,13 +267,7 @@ class pgconn(beconn):
             raise pgerror(None, 'sql(%s) is not copy out statement' % sql)
     # 获得auth成功后从服务器端返回给客户端的消息。从AuthenticationOk开始直到ReadyForQuery。
     def make_auth_ok_msgs(self):
-        msg_list = []
-        msg_list.append(p.Authentication(authtype=p.AuthType.AT_Ok, data=b''))
-        for k, v in self.params.items():
-            msg_list.append(p.ParameterStatus.make(k, v))
-        msg_list.append(p.BackendKeyData(pid=self.be_keydata[0], skey=self.be_keydata[1]))
-        msg_list.append(p.ReadyForQuery.Idle)
-        return msg_list
+        return p.make_auth_ok_msgs(self.params, self.be_keydata)
 # errmsg是ErrorResponse或其他不认识的消息, pgerror表示连接还可以继续使用；而pgfatal表示发生的错误导致连接不可用。
 # pgfatal如果是由于socket读写失败导致的，则cnn设置为相应的连接对象。
 # 其他和postgresql无关的错误则抛出RuntimeError。

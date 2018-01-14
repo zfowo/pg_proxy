@@ -91,12 +91,7 @@ class pseudodb():
 class testdb(pseudodb):
     def process_query(self, query):
         query = query.upper()
-        return self.write_msgs((
-            p.RowDescription.make({'name':b'response'}), 
-            p.DataRow.make(query.encode('utf8')), 
-            p.CommandComplete(tag=b'SELECT 1'), 
-            p.ReadyForQuery.Idle, 
-            ))
+        return self._write_result(['response'], [(query,)])
 # main
 if __name__ == '__main__':
     pass

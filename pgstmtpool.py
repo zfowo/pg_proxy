@@ -28,14 +28,19 @@ class pgworker():
         self.startup_msg = None
         self.auth_ok_msgs = []
         self.num_processed_msg = 0
+    def __repr__(self):
+        return '<pgworker pool_id=%s id=%s be_addr=%s>' % (self.pool_id, self.id, self.be_addr)
+    def put(self, fecnn, msg):
+        self.msg_queue.put_nowait((fecnn, msg))
     def _process_auth(self, fecnn, main_queue):
         self.startup_msg = fecnn.startup_msg
         try:
             self.becnn = pgnet.beconn(self.be_addr)
         except pgnet.pgfatal as ex:
-            print('<thread %d> %s' % ex)
+            print('<thread %d> %s' % (self.id, ex))
             main_queue.put(('fail', fecnn, self, True))
             return False
+        self.becnn.startup_msg = self.startup_msg
         self.becnn.write_msgs_until_done((fecnn.startup_msg,))
         while True:
             msg_list = self.becnn.read_msgs_until_avail()
@@ -55,6 +60,7 @@ class pgworker():
             if msg.msg_type == p.MsgType.MT_Authentication and msg.authtype == p.AuthType.AT_Ok:
                 self.auth_ok_msgs = self.auth_ok_msgs[idx:]
                 break
+        self.becnn.params, self.becnn.be_keydata = p.parse_auth_ok_msgs(self.auth_ok_msgs)
         main_queue.put(('ok', fecnn, self))
         return True
     # 当由前端负责auth的时候用该函数作为线程的target。
@@ -95,17 +101,23 @@ class pgworker():
         while True:
             self.fe_fatal = None
             try:
+                # fecnn可以是前端连接对象，None，或者字符串
                 fecnn, msg = self.msg_queue.get()
-                if not fecnn: # 结束线程
+                if fecnn is None: # 结束线程
                     return True
-                self._process_one(fecnn, msg)
+                elif type(fecnn) is str:
+                    self._process_cmd(fecnn, msg)
+                else:
+                    self._process_msg(fecnn, msg)
             except pgnet.pgfatal as ex:
                 fecnn.close()
                 print('<thread %d> BE%s: %s' % (self.id, self.becnn.getpeername(), ex))
                 return False
             else:
                 main_queue.put(('done', fecnn))
-    def _process_one(self, fecnn, msg):
+    def _process_cmd(self, cmd, args):
+        pass
+    def _process_msg(self, fecnn, msg):
         if msg.msg_type == p.MsgType.MT_Terminate:
             print('<trhead %d> recved Terminate from %s' % (self.id, fecnn.getpeername()))
             self.num_processed_msg -= 1
@@ -192,8 +204,6 @@ class pgworker():
             if msg_list[-1].msg_type == p.MsgType.MT_ReadyForQuery:
                 return
             msg_list = self.becnn.read_msgs_until_avail()
-    def put(self, fecnn, msg):
-        self.msg_queue.put_nowait((fecnn, msg))
 # 记录某个be_addr的所有pgworker，按startup_msg分组。
 # pgworker中记录所属的pool的id。
 @mputils.generateid
@@ -300,6 +310,9 @@ class pgworkerpools():
             self.pools.append(pgworkerpool(be_addr))
         self.pools_map = collections.defaultdict(list) # startup_msg -> pool_list
         self.nextidx_map = collections.defaultdict(int) # startup_msg -> nextidx for pool_list
+    def close_admin_cnn(self):
+        for pool in self:
+            pool.close_admin_cnn()
     def has_worker(self, startup_msg):
         if type(startup_msg) is not p.StartupMessage:
             startup_msg = startup_msg.startup_msg
@@ -311,20 +324,20 @@ class pgworkerpools():
     def __iter__(self):
         yield from self.pools
     def add(self, be_addr):
-        p = pgworkerpool(be_addr)
-        self.pools.append(p)
-        return p
+        pool = pgworkerpool(be_addr)
+        self.pools.append(pool)
+        return pool
     # id参数可以是整数也可以是pool对象
     # clear表示停止pool中的workers
     def remove(self, id, clear=True):
-        p = self.get(id) if type(id) is int else id
-        if not p:
+        pool = self.get(id) if type(id) is int else id
+        if not pool:
             return None
-        self.pools.remove(p)
+        self.pools.remove(pool)
         msg_list = []
         for msg, pool_list in self.pools_map.items():
             try:
-                pool_list.remove(p)
+                pool_list.remove(pool)
                 if not pool_list:
                     msg_list.append(msg)
             except ValueError:
@@ -332,59 +345,73 @@ class pgworkerpools():
         for msg in msg_list:
             self.pools_map.pop(msg)
         if clear:
-            p.clear()
-        return p
+            pool.clear()
+        return pool
     def get(self, id):
-        for p in self.pools:
-            if p.id == id:
-                return p
+        for pool in self.pools:
+            if pool.id == id:
+                return pool
         return None
     def get_some(self, id_list):
         res = []
-        for p in self:
-            if p.id in id_list:
-                res.append(p)
+        for pool in self:
+            if pool.id in id_list:
+                res.append(pool)
             else:
                 res.append(None)
         return res
     def new_worker(self, id, fecnn, main_queue):
-        p = self.get(id)
-        if not p:
+        pool = self.get(id) if type(id) is int else id
+        if not pool:
             return None
-        return p.new_worker(fecnn, main_queue)
+        return pool.new_worker(fecnn, main_queue)
     # 在指定的pool中启动cnt个worker
     def new_worker2(self, id, cnt, kwargs, main_queue):
-        p = self.get(id)
-        if not p:
+        pool = self.get(id) if type(id) is int else id
+        if not pool:
             return None
         worker_list = []
         for i in range(cnt):
-            worker_list.append(p.new_worker2(kwargs, main_queue))
+            worker_list.append(pool.new_worker2(kwargs, main_queue))
         return worker_list
     # 每个pool都启动cnt个worker
     def new_some_workers(self, cnt, kwargs, main_queue):
         worker_list = []
-        for p in self:
+        for pool in self:
             for i in range(cnt):
-                worker_list.append(p.new_worker2(kwargs, main_queue))
+                worker_list.append(pool.new_worker2(kwargs, main_queue))
         return worker_list
+    # cnt是主库已有的worker数目，启动从库worker使得每个slaver pool都有cnt个worker
+    def new_some_workers_if(self, cnt, startup_msg, kwargs, main_queue):
+        if type(startup_msg) is not p.StartupMessage:
+            startup_msg = startup_msg.startup_msg
+        pool_list = self.pools_map[startup_msg]
+        for pool in pool_list:
+            avail_cnt = pool.count(startup_msg)
+            if avail_cnt >= cnt:
+                continue
+            self.new_worker2(pool, cnt-avail_cnt, kwargs, main_queue)
+        for pool in self:
+            if pool in pool_list:
+                continue
+            self.new_worker2(pool, cnt, kwargs, main_queue)
     def add_worker(self, w):
-        p = self.get(w.pool_id)
-        if not p:
-            p = self.add(w.be_addr)
-        p.add(w)
+        pool = self.get(w.pool_id)
+        if not pool:
+            pool = self.add(w.be_addr)
+        pool.add(w)
         pool_list = self.pools_map[w.startup_msg]
-        if p not in pool_list:
-            pool_list.append(p)
+        if pool not in pool_list:
+            pool_list.append(pool)
     def remove_worker(self, w):
-        p = self.get(w.pool_id)
-        if not p:
+        pool = self.get(w.pool_id)
+        if not pool:
             return
-        p.remove(w)
-        if p.count(w.startup_msg):
+        pool.remove(w)
+        if pool.count(w.startup_msg):
             return
         pool_list = self.pools_map[w.startup_msg]
-        pool_list.remove(p)
+        pool_list.remove(pool)
     # 把来自前端cnn的消息msg分发给相应的worker
     def dispatch_fe_msg(self, poll, cnn, msg):
         if not cnn:
@@ -443,6 +470,15 @@ class pooldb(pseudodb.pseudodb):
         return f(self, args, sub_cmd_map)
     # 各种命令实现。args参数是list，为空或者只有一个元素。
     cmd_map = {}
+    def _process_listcmd(self, args, sub_cmd_map):
+        cmd_list = []
+        for cmd, (_, x) in self.cmd_map.items():
+            cmd_list.append(cmd)
+            for sub_cmd in x:
+                cmd_list.append(cmd + ' ' + sub_cmd)
+        self._write_result(['cmd'], [(cmd,) for cmd in cmd_list])
+    cmd_map['cmd'] = (_process_listcmd, {})
+    del _process_listcmd
     def _process_shutdown(self, args, sub_cmd_map):
         print('shutdown...')
         # sys.exit(1) will waiting threads to exit
@@ -471,10 +507,10 @@ class pooldb(pseudodb.pseudodb):
     # pool [list|show|add|remove|remove_worker|new_worker] ...
     def _process_pool_list(self, args):
         rows = []
-        p = self.master_pool
-        rows.append((p.id, 'true', p.be_addr, len(p)))
-        for p in slaver_pools:
-            rows.append((p.id, 'false', p.be_addr, len(p)))
+        pool = self.master_pool
+        rows.append((pool.id, 'true', pool.be_addr, len(pool)))
+        for pool in slaver_pools:
+            rows.append((pool.id, 'false', pool.be_addr, len(pool)))
         return self._write_result(['pool_id', 'master', 'addr', 'worker'], rows)
     def _process_pool_show(self, args):
         pool_list = []
@@ -485,28 +521,28 @@ class pooldb(pseudodb.pseudodb):
             pool_id_list = [int(i) for i in args[0].split(',')]
             if self.master_pool.id in pool_id_list:
                 pool_list.append(self.master_pool)
-            pool_list += [p for p in self.slaver_pools.get_some(pool_id_list) if p]
+            pool_list += [pool for pool in self.slaver_pools.get_some(pool_id_list) if pool]
         rows = []
-        for p in pool_list:
-            for m, w in p:
+        for pool in pool_list:
+            for m, w in pool:
                 startup_msg = self._make_startup_msg(m)
-                rows.append((p.id, w.id, w.be_addr, m['database'], m['user'], startup_msg, w.num_processed_msg))
+                rows.append((pool.id, w.id, w.be_addr, m['database'], m['user'], startup_msg, w.num_processed_msg))
         return self._write_result(['pool_id', 'worker_id', 'addr', 'database', 'user', 'startup_msg', 'processed'], rows)
     def _process_pool_add(self, args):
         if not args:
             return self._write_error("'pool add' should provide addr(host:port)")
         host, port = args[0].split(':')
         port = int(port)
-        p = self.slaver_pools.add((host, port))
-        self._write_result(['pool_id'], [[p.id]])
+        pool = self.slaver_pools.add((host, port))
+        self._write_result(['pool_id'], [[pool.id]])
     def _process_pool_remove(self, args):
         if not args:
             return self._write_error("'pool remove' should provide pool id")
         pool_id = int(args[0])
-        p = self.slaver_pools.remove(pool_id)
-        if not p:
+        pool = self.slaver_pools.remove(pool_id)
+        if not pool:
             return self._write_error('no pool for id %d' % pool_id)
-        return self._write_result(['pool_id', 'addr', 'worker'], [[p.id, p.be_addr, len(p)]])
+        return self._write_result(['pool_id', 'addr', 'worker'], [[pool.id, pool.be_addr, len(pool)]])
     def _process_pool_remove_worker(self, args):
         if not args:
             return self._write_error("'pool remove_worker' should provide pool id and worker id")
@@ -516,10 +552,10 @@ class pooldb(pseudodb.pseudodb):
         if pool_id == self.master_pool.id:
             w = self.master_pool.remove_byid(worker_id)
         else:
-            p = self.slaver_pools.get(pool_id)
-            if not p:
+            pool = self.slaver_pools.get(pool_id)
+            if not pool:
                 return self._write_error('no pool for id %d' % pool_id)
-            w = p.get_byid(worker_id)
+            w = pool.get_byid(worker_id)
             if w:
                 self.slaver_pools.remove_worker(w)
         if not w:
@@ -538,12 +574,12 @@ class pooldb(pseudodb.pseudodb):
         kvs = (kv.split('=', maxsplit=1) for kv in params.split(',') if kv)
         kwargs = {k : v for k, v in kvs}
         if pool_id == self.master_pool.id:
-            p = self.master_pool
+            pool = self.master_pool
         else:
-            p = self.slaver_pools.get(pool_id)
-            if not p:
+            pool = self.slaver_pools.get(pool_id)
+            if not pool:
                 return self._write_error('no pool for id %d' % pool_id)
-        w = p.new_worker2(kwargs, self.main_queue)
+        w = pool.new_worker2(kwargs, self.main_queue)
         return self._write_result(['pool_id', 'worker_id'], [[pool_id, w.id]])
     # 
     cmd_map['pool'] = (_process_cmd, {})
@@ -566,26 +602,34 @@ class pooldb(pseudodb.pseudodb):
         res += b'}'
         return res
 # main
+def get_match_cnn_param(startup_msg):
+    for param in g_conf.get('conn_params',()):
+        if startup_msg.match(param):
+            return param
+    return None
 def need_new_worker(startup_msg):
     need = False
     wcnt = master_pool.count(startup_msg)
     if wcnt == 0:
         need = True
     else:
-        fecnt = fepool.count(startup_msg)
-        need = fecnt/wcnt >= 10
-    if need:
-        for param in g_conf['conn_params']:
-            if startup_msg.match(param):
-                return need, param
-    return need, None
-def can_send_to_slaver(msg):
+        fecnt = fepool.count(startup_msg) + 1
+        worker_min_cnt = g_conf.get('worker_min_cnt', [])
+        worker_cnt_per = g_conf.get('worker_cnt_per', 10)
+        if fecnt > len(worker_min_cnt):
+            need = fecnt/worker_cnt_per > wcnt
+        else:
+            need = worker_min_cnt[fecnt-1] > wcnt
+    param = get_match_cnn_param(startup_msg) if need else None
+    return need, param
+def can_send_to_slaver(fecnn, msg):
     if msg.msg_type != p.MsgType.MT_Query:
         return False
     sql = bytes(msg.query)
     if sql.startswith(b'/*s*/'):
         return True
     return False
+# HA
 # 检查大对象lo_oid是否存在，如果不存在则创建。
 def check_largeobject(cnn, lo_oid):
     res = cnn.query('select * from pg_largeobject_metadata where oid=%s' % lo_oid)
@@ -596,18 +640,32 @@ def check_largeobject(cnn, lo_oid):
 def get_newest_slaver():
     max_lsn = (0, 0)
     newest_pool = None
-    for p in slaver_pools:
-        cnn = p.get_admin_cnn(g_conf['admin_cnn'])
-        res = cnn.query('select  pg_last_wal_receive_lsn()')
+    for pool in slaver_pools:
+        try:
+            cnn = pool.get_admin_cnn(g_conf['admin_cnn'])
+            res = cnn.query('select  pg_last_wal_receive_lsn()')
+        except pgnet.pgexception as ex:
+            print('get_admin_cnn fail for pool %s: %s' % (pool.id, ex))
+            continue
         if res[0][0] is None:
             continue
         hi, lo = res[0][0].split('/')
         hi, lo = int(hi, 16), int(lo, 16)
         if max_lsn < (hi, lo):
             max_lsn = (hi, lo)
-            newest_pool = p
+            newest_pool = pool
     return (newest_pool, max_lsn)
-# 
+def promote_slaver(pool):
+    try:
+        cnn = pool.get_admin_cnn(g_conf['admin_cnn'])
+        lo_oid = g_conf.get('lo_oid', 9999)
+        trigger_file = g_conf.get('trigger_file', 'trigger')
+        cnn.query("select lo_export(%s, '%s')" % (lo_oid, trigger_file))
+    except pgnet.pgexception as ex:
+        print('promote_slaver fail: %s' % ex)
+        return False
+    return True
+# in event loop
 def process_main_queue():
     # process main_queue
     while True:
@@ -627,9 +685,10 @@ def process_main_queue():
             else:
                 slaver_pools.add_worker(w)
             # 启动slaver workers
-            params = slaver_workers_to_start.pop(w.id, None)
-            if params:
-                slaver_pools.new_some_workers(*params)
+            param = slaver_workers_to_start.pop(w.id, None)
+            if param:
+                wcnt = master_pool.count(w)
+                slaver_pools.new_some_workers_if(wcnt, w.startup_msg, param, main_queue)
         elif x[0] == 'fail': # ('fail', fecnn, worker, is_be_problem)
             if x[1]:
                 x[1].close()
@@ -658,9 +717,31 @@ def process_main_queue():
         else:
             raise RuntimeError('unknow x from main_queue:%s' % (x,))
 def process_ha():
-    if len(master_fail_history) >= 10:
-        print('master_fail_history: %s' % master_fail_history)
-        master_fail_history.clear()
+    if not g_conf.get('enable_ha', False):
+        if len(master_fail_history) >= 10:
+            print('master_fail_history: %s' % master_fail_history)
+            master_fail_history.clear()
+        return
+    if len(master_fail_history) < 10:
+        return
+    print('start process_ha')
+    master_fail_history.clear()
+    pool, max_lsn = get_newest_slaver()
+    if not pool:
+        slaver_pools.close_admin_cnn()
+        return
+    if not promote_slaver(pool):
+        slaver_pools.close_admin_cnn()
+        return
+    slaver_pools.remove(pool, clear=False)
+    master_pool.clear()
+    master_pool = pool
+    g_conf['master'] = master_pool.be_addr
+    g_conf['slaver'].remove(master_pool.be_addr)
+    # TODO: 如果有多个slaver的话，还需要把它们指向新的主库。
+    master_pool.close_admin_cnn()
+    slaver_pools.close_admin_cnn()
+    print('process_ha done. master changed to %s' % (master_pool.be_addr,))
 if __name__ == '__main__':
     g_conf = miscutils.read_conf(os.path.dirname(__file__))
     
@@ -671,13 +752,13 @@ if __name__ == '__main__':
     admin_cnn.close()
     
     master_pool = pgworkerpool(g_conf['master'])
-    slaver_pools = pgworkerpools(*g_conf['slaver'])
+    slaver_pools = pgworkerpools(*g_conf.get('slaver',()))
     fepool = feconnpool()
     main_queue = queue.Queue()
     slaver_workers_to_start = {} # 记录下需要启动的slaver workers
     master_fail_history = [] # 后端连续出问题的时间记录，如果有连接成功则清空
     
-    listen = netutils.listener(g_conf['listen'], async=True)
+    listen = netutils.listener(g_conf.get('listen', ('', 7777)), async=True)
     poll = netutils.spoller()
     poll.register(listen, poll.POLLIN)
     while True:
@@ -693,15 +774,23 @@ if __name__ == '__main__':
                     if not m:
                         continue
                     poll.unregister(fobj)
-                    is_pseudo = (m['database'] == b'pseudo')
+                    if m.code == p.PG_CANCELREQUEST_CODE:
+                        # 需要一个专门的worker来处理这个以及其他任务
+                        fobj.close()
+                        continue
+                    if m.code != p.PG_PROTO_VERSION3_NUM or 'replication' in m.get_params():
+                        fobj.write_msgs((p.ErrorResponse.make_error(b'do not support SSL or replication connection'),))
+                        fobj.close()
+                        continue
                     # 由于SCRAM，一个fecnn无法用于auth多个后端，所以现在只有当g_conf['conn_params']中有和startup_msg匹配的时候才会启动slaver workers。
                     # 另外slaver workers只有当master worker启动成功后才会启动。因为psql会用一个立马断开的连接来判断是否需要密码。
+                    is_pseudo = (m['database'] == b'pseudo')
                     if not is_pseudo:
                         need, param = need_new_worker(m)
                         if need:
                             w = master_pool.new_worker(fobj.cnn, main_queue)
                             if param:
-                                slaver_workers_to_start[w.id] = (1, param, main_queue)
+                                slaver_workers_to_start[w.id] = param
                             continue
                     
                     auth_ok_msgs = pooldb.auth_ok_msgs if is_pseudo else master_pool.get(m)[0].auth_ok_msgs
@@ -723,11 +812,21 @@ if __name__ == '__main__':
                     m = fobj.read_msgs(max_msg=1)
                     if not m:
                         continue
+                    m = m[0]
                     poll.unregister(fobj) # 主线程停止检测，把控制权交给worker
-                    if can_send_to_slaver(m[0]) and slaver_pools.has_worker(fobj):
-                        slaver_pools.dispatch_fe_msg(poll, fobj, m[0])
-                    else:
-                        master_pool.dispatch_fe_msg(poll, fobj, m[0])
+                    if not can_send_to_slaver(fobj, m):
+                        master_pool.dispatch_fe_msg(poll, fobj, m)
+                        continue
+                    if slaver_pools.has_worker(fobj):
+                        slaver_pools.dispatch_fe_msg(poll, fobj, m)
+                    else: 
+                        # fobj.startup_msg和g_conf['conn_params']不匹配，或者所有从库worker已经异常结束。
+                        master_pool.dispatch_fe_msg(poll, fobj, m)
+                        wcnt = master_pool.count(fobj)
+                        if wcnt > 0: 
+                            cnn_param = get_match_cnn_param(fobj.startup_msg)
+                            if cnn_param:
+                                slaver_pools.new_some_workers_if(wcnt, fobj, cnn_param, main_queue)
                 elif isinstance(fobj, pseudodb.pseudodb):
                     fobj.handle_event(poll, event)
             except pgnet.pgfatal as ex:
@@ -735,5 +834,6 @@ if __name__ == '__main__':
                 poll.clear((fobj,))
                 if type(fobj) is pgnet.feconn:
                     fepool.remove(fobj)
+                fobj.close()
         process_main_queue()
         process_ha()
