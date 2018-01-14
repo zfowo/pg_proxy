@@ -19,7 +19,7 @@ admin_cnn²ÎÊıÖĞµÄÓÃ»§ĞèÒªÊÇ³¬¼¶ÓÃ»§¡£admin_cnn/conn_paramsÖĞ³ıÁË°üº¬startup_msgÏ
 
 * Ç°¶ËÔÚÁ¬½ÓµÄÊ±ºò»áÊ×ÏÈ·¢ËÍÒ»¸östartup_msgÏûÏ¢£¬¸ÃÏûÏ¢°üº¬database/userÒÔ¼°ÆäËûÊı¾İ¿â²ÎÊı£¬±ÈÈçclient_encoding/application_name£¬
 ²»Ö§³ÖSSLÁ¬½ÓºÍ¸´ÖÆÁ¬½Ó¡£Ã¿¸öºó¶Ë¶¼ÓĞÒ»¸öpool£¬pool°üº¬worker£¬worker°´startup_msg·Ö×é£¬À´×ÔÇ°¶ËµÄ²éÑ¯»á¸ù¾İstartup_msg·Ö·¢µ½ÏàÓ¦
-µÄworker£¬È±Ê¡ËùÓĞ²éÑ¯¶¼·Ö·¢µ½Ö÷¿âworker£¬Èç¹û²éÑ¯Óï¾äµÄ¿ªÍ·ÊÇ/*s*/²¢ÇÒ´æÔÚ´Ó¿âworkerµÄ»°Ôò·Ö·¢¸ø´Ó¿âworker¡£
+µÄworker£¬È±Ê¡ËùÓĞ²éÑ¯¶¼·Ö·¢µ½Ö÷¿âworker£¬Èç¹û²éÑ¯Óï¾äµÄ¿ªÍ·ÊÇ/\*s\*/²¢ÇÒ´æÔÚ´Ó¿âworkerµÄ»°Ôò·Ö·¢¸ø´Ó¿âworker¡£
 
 HAÖ÷¿âÇĞ»»
 ==========
