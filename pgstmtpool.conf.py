@@ -26,6 +26,3 @@ all = {
         {'database':'postgres', 'user':'user1', 'client_encoding':'GBK', 'application_name':'psql', 'password':'123456'}, 
     ], 
 }
-if 'host' not in all['admin_cnn']:
-    all['admin_cnn']['host'] = all['master'][0]
-    all['admin_cnn']['port'] = all['master'][1]

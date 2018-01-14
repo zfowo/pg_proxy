@@ -818,7 +818,10 @@ def process_ha():
 if __name__ == '__main__':
     g_conf = miscutils.read_conf(os.path.dirname(__file__))
     
-    admin_cnn = pgnet.pgconn(**g_conf['admin_cnn'])
+    cnn_param = copy.copy(g_conf['admin_cnn'])
+    cnn_param['host'] = g_conf['master'][0]
+    cnn_param['port'] = g_conf['master'][1]
+    admin_cnn = pgnet.pgconn(**cnn_param)
     check_largeobject(admin_cnn, g_conf.get('lo_oid', 9999))
     hba = pghba.pghba.from_database(admin_cnn)
     shadows = pghba.pgshadow.from_database(admin_cnn)

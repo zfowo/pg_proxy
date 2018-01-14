@@ -14,12 +14,16 @@ pgstmtpool.py [conf_file] 语句级别连接池
         'master' : (host, port)       主库地址。
         'slaver' : [(),...]           从库地址列表。
         'conn_params' : [{},...]      连接参数列表(不能包含host/port)，当前端参数和其中一个匹配的时候才会启动从库worker。
-* 在pg_hba.conf中不要把连接池的host/ip配置成trust，因为当前端第一个次连接时是由数据库端auth的，此时数据库端看到的是连接池的host/ip。
+* 在pg_hba.conf中不要把连接池的host/ip配置成trust，因为当前端第一次连接时是由数据库端auth的，此时数据库端看到的是连接池的host/ip。
 admin_cnn参数中的用户需要是超级用户。admin_cnn/conn_params中除了包含startup_msg消息中的参数外，可能还需要password(如果不是trust auth)。
 
 * 前端在连接的时候会首先发送一个startup_msg消息，该消息包含database/user以及其他数据库参数，比如client_encoding/application_name，
 不支持SSL连接和复制连接。每个后端都有一个pool，pool包含worker，worker按startup_msg分组，来自前端的查询会根据startup_msg分发到相应
 的worker，缺省所有查询都分发到主库worker，如果查询语句的开头是/\*s\*/并且存在从库worker的话则分发给从库worker。
+
+* pgstmtpool.py使用线程来实现，由于python的GIL限制，导致只能使用一个CPU，所以worker数目可能会有限制。可以启动多个pgstmtpool.py，但是
+只有一个的enable_ha设为True，其他都设为False，然后前面放一个haproxy。不过这种方法当发生主库切换的时候，其他enable_ha=False的pgstmtpool.py
+只能处理只读查询。TODO:将来版本将允许多个pgstmtpool.py相互通信，执行主库切换的pgstmtpool.py在切换完成后把切换结果发给其他pgstmtpool.py。
 
 HA主库切换
 ==========
@@ -30,7 +34,7 @@ HA主库切换
         3) 修改其他从库的recovery.conf配置文件。
         4) 在新的主库上创建从库用到的复制slot。
         5) 重启从库使得修改生效。
-* 前面的3/4/5中需要用到switchfunc.sql中的函数，这些函数是用pl/python3u编写的。
+* 前面的3/4/5中需要用到switchfunc.sql中的函数，这些函数是用pl/python3u编写的。如果只有一个从库，那么不需要这些函数。
 
 伪数据库pseudo
 ==============
@@ -39,6 +43,7 @@ HA主库切换
 * 连接到pseudo后只能执行支持的命令，包括下面这些命令：
 
         .) cmd                  列出所有命令
+        .) shutdown             shutdown连接池
         .) fe [list]            列出所有前端连接
         .) pool [list]          列出所有pool
         .) pool show            列出指定pool中的worker，多个pool id用逗号分割，如果没指定pool id则列出所有pool的worker。
