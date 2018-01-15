@@ -88,7 +88,7 @@ class pgworker():
             self.becnn = pgnet.pgconn(**kwargs)
         except pgnet.pgfatal as ex:
             print('<thread %d> %s' % ex)
-            main_queue.put(('fail', None, self, True))
+            main_queue.put(('fail', None, self, True if ex.cnn else False))
             return
         self.startup_msg = self.becnn.startup_msg
         self.auth_ok_msgs = self.becnn.make_auth_ok_msgs()

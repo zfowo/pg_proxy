@@ -166,7 +166,10 @@ class pgconn(beconn):
         self.write_msg(self.startup_msg)
         self.auth_ctx.password = password.encode('utf8') if type(password) is str else password
         self.auth_ctx.user = kwargs['user'].encode('utf8')
-        self._process_auth()
+        try:
+            self._process_auth()
+        except RuntimeError as ex:
+            raise pgfatal(None, '%s' % ex)
         # auth ok后会生成self.params和self.be_keydata
     def _process_auth(self):
         m = self.processer.process()
@@ -204,7 +207,7 @@ class pgconn(beconn):
         self._process_auth()
     def write_msg(self, msg):
         if self.processer:
-            raise RuntimeError('you should not call write_msg while processer(%s) is not None' % self.processer)
+            raise SystemError('BUG:you should not call write_msg while processer(%s) is not None' % self.processer)
         ret = super().write_msg(msg)
         self.processer = get_processer_for_msg(msg)(self)
         return self.processer
@@ -268,7 +271,8 @@ class pgconn(beconn):
     # 获得auth成功后从服务器端返回给客户端的消息。从AuthenticationOk开始直到ReadyForQuery。
     def make_auth_ok_msgs(self):
         return p.make_auth_ok_msgs(self.params, self.be_keydata)
-# errmsg是ErrorResponse或其他不认识的消息, pgerror表示连接还可以继续使用；而pgfatal表示发生的错误导致连接不可用。
+# errmsg是ErrorResponse或其他不认识的消息。
+# pgerror表示连接还可以继续使用；而pgfatal表示发生的错误导致连接不可用。
 # pgfatal如果是由于socket读写失败导致的，则cnn设置为相应的连接对象。
 # 其他和postgresql无关的错误则抛出RuntimeError。
 class pgexception(Exception):
