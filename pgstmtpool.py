@@ -16,8 +16,9 @@ import mputils
 import miscutils
 
 class fepgfatal(Exception):
-    def __init__(self, fatal_ex):
+    def __init__(self, fatal_ex, last_fe_msg=None):
         self.fatal_ex = fatal_ex
+        self.last_fe_msg = None
 @mputils.generateid
 class pgworker():
     def __init__(self, pool_id, be_addr, max_msg=0):
@@ -140,10 +141,15 @@ class pgworker():
         else:
             self._process_query2(fecnn, m)
     def _process_query2(self, fecnn, bemsg):
-        msg_list = (bemsg,)
+        msg_list = [bemsg] + self.becnn.read_msgs()
         while True:
-            self._write_msgs_to_fe(fecnn, msg_list)
-            if msg_list[-1].msg_type == p.MsgType.MT_ReadyForQuery:
+            if self._write_msgs_to_fe(fecnn, msg_list)[1]:
+                break
+            msg_list = self.becnn.read_msgs_until_avail()
+    def _process_copyout(self, fecnn, bemsg):
+        msg_list = [bemsg] + self.becnn.read_msgs()
+        while True:
+            if self._write_msgs_to_fe(fecnn, msg_list)[1]:
                 break
             msg_list = self.becnn.read_msgs_until_avail()
     def _process_copyin(self, fecnn, bemsg):
@@ -151,36 +157,33 @@ class pgworker():
         try:
             self._process_both(fecnn)
         except fepgfatal as ex:
-            err_msg = str(ex.fatal_ex).encode('utf8')
-            self.becnn.write_msgs_until_done((p.CopyFail(err_msg=err_msg),))
+            if ex.last_fe_msg and ex.last_fe_msg.msg_type not in (p.MsgType.MT_CopyDone, p.MsgType.MT_CopyFail):
+                err_msg = str(ex.fatal_ex).encode('utf8')
+                self.becnn.write_msgs_until_done((p.CopyFail(err_msg=err_msg),))
             self._skip_be_msgs()
-    def _process_copyout(self, fecnn, bemsg):
-        self._write_msgs_to_fe(fecnn, (bemsg,))
-        while True:
-            msg_list = self.becnn.read_msgs_until_avail()
-            self._write_msgs_to_fe(fecnn, msg_list)
-            if msg_list[-1].msg_type == p.MsgType.MT_ReadyForQuery:
-                break
     def _process_parse(self, fecnn, femsg):
         self.becnn.write_msgs_until_done((femsg,))
         try:
             self._process_both(fecnn)
         except fepgfatal as ex:
             # 这里有个问题，如果Parse/Bind使用了有名字的语句/portal，那么它们不会被close。
-            self.becnn.write_msgs_until_done((p.Sync(),))
+            if ex.last_fe_msg and ex.last_fe_msg.msg_type != p.MsgType.MT_Sync:
+                self.becnn.write_msgs_until_done((p.Sync(),))
             self._skip_be_msgs()
     # 处理前后端消息直到从后端接收到ReadyForQuery
     def _process_both(self, fecnn):
+        last_fe_msg = None
         while True:
             netutils.poll2in(fecnn, self.becnn)
             try:
                 msg_list = fecnn.read_msgs()
+                if msg_list:
+                    last_fe_msg = msg_list[-1]
             except pgnet.pgfatal as ex:
-                raise fepgfatal(ex)
+                raise fepgfatal(ex, last_fe_msg_type)
             self.becnn.write_msgs_until_done(msg_list)
             msg_list = self.becnn.read_msgs()
-            self._write_msgs_to_fe(fecnn, msg_list)
-            if msg_list and msg_list[-1].msg_type == p.MsgType.MT_ReadyForQuery:
+            if self._write_msgs_to_fe(fecnn, msg_list)[1]:
                 break
     def _process_unsupported(self, fecnn, femsg):
         errmsg = p.ErrorResponse.make_error(b'unsupported msg type:%s' % femsg.msg_type)
@@ -188,15 +191,23 @@ class pgworker():
             fecnn.write_msgs_until_done((errmsg, p.ReadyForQuery.Idle))
         except pgnet.pgfatal as ex:
             pass # 不需要处理，主线程在下次read的时候会报错
+    # 返回(是否写成功, 是否有ReadyForQuery消息)
     def _write_msgs_to_fe(self, fecnn, msg_list):
+        got_ready = False
+        if  msg_list and msg_list[-1].msg_type == p.MsgType.MT_ReadyForQuery:
+            got_ready = True
+            if msg_list[-1].trans_status != p.TransStatus.TS_Idle:
+                self.becnn.write_msgs_until_done((p.Query(query=b'abort'),))
+                self._skip_be_msgs()
+                self._change_msgs_to_idle(msg_list)
         if self.fe_fatal:
-            return False
+            return False, got_ready
         try:
             fecnn.write_msgs_until_done(msg_list)
         except pgnet.pgfatal as ex:
             self.fe_fatal = ex
-            return False
-        return True
+            return False, got_ready
+        return True, got_ready
     def _skip_be_msgs(self, msg_list=()):
         if not msg_list:
             msg_list = self.becnn.read_msgs_until_avail()
@@ -204,6 +215,17 @@ class pgworker():
             if msg_list[-1].msg_type == p.MsgType.MT_ReadyForQuery:
                 return
             msg_list = self.becnn.read_msgs_until_avail()
+    def _change_msgs_to_idle(self, msg_list):
+        m = msg_list[-1]
+        msg_list[-1] = p.ReadyForQuery.Idle
+        if m.trans_status == p.TransStatus.TS_InBlock:
+            msg_list.insert(-1, p.ErrorResponse.make_error(b'do not supoort transaction statement. abort it'))
+            return
+        # TS_Fail
+        for i in range(len(msg_list)-1, -1, -1):
+            if msg_list[i].msg_type == p.MsgType.MT_ErrorResponse:
+                msg_list[i] = p.ErrorResponse.make_error(b'do not supoort transaction statement. abort it')
+                return
 # 记录某个be_addr的所有pgworker，按startup_msg分组。
 # pgworker中记录所属的pool的id。
 @mputils.generateid
@@ -360,6 +382,12 @@ class pgworkerpools():
             else:
                 res.append(None)
         return res
+    def get_byaddr(self, addr):
+        ret = []
+        for pool in self.pools:
+            if pool.be_addr == addr:
+                ret.append(pool)
+        return ret
     def new_worker(self, id, fecnn, main_queue):
         pool = self.get(id) if type(id) is int else id
         if not pool:
@@ -672,9 +700,13 @@ def check_largeobject(cnn, lo_oid):
     print('no largeobject with oid %s. create it' % lo_oid)
     cnn.query('select lo_create(%s)' % lo_oid)
 def get_newest_slaver():
+    addrs_processed = set()
     max_lsn = (0, 0)
     newest_pool = None
     for pool in slaver_pools:
+        if pool.be_addr in addrs_processed:
+            continue
+        addrs_processed.add(pool.be_addr)
         try:
             cnn = pool.get_admin_cnn(g_conf['admin_cnn'])
             res = cnn.query('select  pg_last_wal_receive_lsn()')
@@ -699,19 +731,24 @@ def promote_slaver(pool):
         print('promote_slaver fail: %s' % ex)
         return False
     return True
-# 修改从库中的recovery.conf指向新的主库，并且返回从库使用的复制slot名字列表。
+# 修改从库中的recovery.conf指向新的主库。
+# 返回从库使用的复制slot名字列表。如果没有使用slot则返回空串。
 def modify_recovery_conf():
+    addrs_processed = set()
+    addrs_processed.add(master_pool.be_addr)
     slot_name_list = []
     m_host, m_port = master_pool.be_addr
     for pool in slaver_pools:
+        if pool.be_addr in addrs_processed:
+            continue
+        addrs_processed.add(pool.be_addr)
         try:
             cnn = pool.get_admin_cnn(g_conf['admin_cnn'])
             res = cnn.query("select z_change_recovery_conf('%s', %s)" % (m_host, m_port))
         except pgnet.pgexception as ex:
             print('z_change_recovery_conf fail for pool %s: %s' % (pool.id, ex))
             continue
-        if res[0][0]:
-            slot_name_list.append(res[0][0])
+        slot_name_list.append(res[0][0])
     return slot_name_list
 # 返回创建成功的slot名字列表。
 def create_slot_for_slaver(slot_name_list):
@@ -726,7 +763,12 @@ def create_slot_for_slaver(slot_name_list):
         ret.append(name)
     return ret
 def restart_slaver():
+    addrs_processed = set()
+    addrs_processed.add(master_pool.be_addr)
     for pool in slaver_pools:
+        if pool.be_addr in addrs_processed:
+            continue
+        addrs_processed.add(pool.be_addr)
         try:
             cnn = pool.get_admin_cnn(g_conf['admin_cnn'])
             cnn.query("select z_restart_pg()")
@@ -810,8 +852,7 @@ def process_ha():
     # 把剩下的从库指向新的主库
     slot_name_list = modify_recovery_conf()
     create_slot_for_slaver([s for s in slot_name_list if s])
-    if slot_name_list:
-        restart_slaver()
+    restart_slaver()
     master_pool.close_admin_cnn()
     slaver_pools.close_admin_cnn()
     print('process_ha done. master changed to %s' % (master_pool.be_addr,))

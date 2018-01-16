@@ -180,6 +180,9 @@ def BE(cls):
 # FE msg
 # 
 # simple query
+# 如果query包含分号分隔的多条语句，那么会返回每条语句的结果消息直到出错的语句(出错语句后面的语句不会执行)，最后是一个ReadyForQuery消息。
+# 而且这多条语句是在一个事务里执行的。如果多条语句是用begin/end包起来的话也是一样的，除了有错误语句的时候，最后的ReadyForQuery的trans_status不一样，
+# 对于没有begin/end的多条语句，trans_status为TS_Idle，而有begin/end的话，trans_status为TS_Fail。
 class Query(Msg):
     _formats = '>x'
     _fields = 'query'
@@ -385,7 +388,7 @@ class ErrorNoticeResponse(Msg):
                 continue
             res.append((FieldType.v2smap[t], v))
         return res
-    # fields是(t,v)列表
+    # fields是(t,v)或者Field列表
     @classmethod
     def make(cls, *fields):
         field_list = []
