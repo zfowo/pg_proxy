@@ -24,11 +24,12 @@ pgstmtpool.py [args] 语句级别连接池
         'worker_per_fe_cnt' : 10      当前端数超过worker_min_cnt的大小时，指定每多少个前端连接需要一个后端连接。
         'master' : (host, port)       主库地址。
         'slaver' : [(),...]           从库地址列表。同一个从库可以包含多次，也可以包含主库。
-        'password' : {}               包含用户密码，从库worker用这些密码连接到从库。如果用户的auth方法是md5则不需要指定，
+        'user_pwds' : {}              包含用户密码，从库worker用这些密码连接到从库。如果用户的auth方法是md5则不需要指定，
                                       如果auth方法是password/scram-sha256则必须指定密码，如果是trust则指定空串。
+                                      如果auth不是md5并且没有指定密码，那么不会启动从库worker。
 
 * 在pg_hba.conf中不要把连接池的host/ip配置成trust，因为当前端第一次连接时是由数据库端auth的，此时数据库端看到的是连接池的host/ip。
-admin_cnn参数中的用户需要是超级用户。admin_cnn中除了包含startup_msg消息中的参数外，可能还需要password(如果不是trust auth)。
+admin_cnn参数中的用户需要是超级用户，需要指定密码，如果是md5 auth，密码可以是md5后的密码。
 
 * 前端不许使用事务语句(比如begin/end)，包含事务语句的查询都会被abort，除非整个语句序列用一个Query消息被一次完整执行。
 psycopg2缺省的autocommit是False，所以它会自动发送begin语句，必须把autocommit设为True才可以使用本连接池。
@@ -65,8 +66,14 @@ HA主库切换
 * 连接到pseudo后只能执行支持的命令，包括下面这些命令：
 
         .) cmd                  列出所有命令
+        .) log_msg              是否打印出消息。没有指定参数则显示当前的log_msg设置，否则设为指定的值。
+                                on/1/true/t表示True，其他表示False。
+        .) spool                列出从连接池。
+        .) register             内部用命令
+        .) change_master        内部用命令
         .) shutdown             shutdown连接池
         .) fe [list]            列出所有前端连接
+        .) fe count             显示前端连接数
         .) pool [list]          列出所有pool
         .) pool show            列出指定pool中的worker，多个pool id用逗号分割，如果没指定pool id则列出所有pool的worker。
         .) pool add             增加一个pool，参数是host:port，只能增加从库pool。

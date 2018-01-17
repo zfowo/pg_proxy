@@ -139,28 +139,28 @@ class pgauth():
         self.user = user.encode('utf8') if type(user) is str else user
         self.shadow = shadow
         self.status = 0
+    def __getattr__(self, name):
+        return getattr(self.cnn, name)
     # 读取下一个消息，如果还有之前的消息没有发送完则返回'pollout'，如果还没有消息则返回'pollin'
     def _read_next_msg(self):
-        if self.cnn.write_msgs():
+        if self.write_msgs():
             return 'pollout'
-        m = self.cnn.read_msgs(max_msg=1)
+        m = self.read_msgs(max_msg=1)
         if not m:
             return 'pollin'
         return m[0]
-    def fileno(self):
-        return self.cnn.fileno()
     # 在调用之前需要poll.unregister本auth。返回True表示auth成功。
     def handle_event(self, poll, event):
         ret = self.go()
         if ret == AUTH_OK:
-            if self.cnn.write_msgs(self.auth_ok_msgs):
+            if self.write_msgs(self.auth_ok_msgs):
                 poll.register(self.cnn, poll.POLLOUT)
             else:
                 poll.register(self.cnn, poll.POLLIN)
             return True
         elif ret == AUTH_FAIL:
-            self.cnn.write_msgs(self.auth_fail_msgs)
-            self.cnn.close()
+            self.write_msgs(self.auth_fail_msgs)
+            self.close()
         elif ret == 'pollin':
             poll.register(self, poll.POLLIN)
         elif ret == 'pollout':
@@ -179,7 +179,7 @@ class pgpwdauth(pgauth):
         if self.status == 0:
             self.status = 1
             m = p.Authentication(authtype=p.AuthType.AT_CleartextPassword, data=b'')
-            self.cnn.write_msgs((m,))
+            self.write_msgs((m,))
             return self.go()
         if self.status == 1:
             m = self._read_next_msg()
@@ -211,7 +211,7 @@ class pgmd5auth(pgauth):
         if self.status == 0:
             self.status = 1
             m = p.Authentication(authtype=p.AuthType.AT_MD5Password, data=self.salt)
-            self.cnn.write_msgs((m,))
+            self.write_msgs((m,))
             return self.go()
         if self.status == 1:
             m = self._read_next_msg()
@@ -229,7 +229,7 @@ class pgscramauth(pgauth):
             self.status = 1
             sasl = p.SASL.make('SCRAM-SHA-256')
             m = p.Authentication(authtype=p.AuthType.AT_SASL, data=bytes(sasl))
-            self.cnn.write_msgs((m,))
+            self.write_msgs((m,))
             return self.go()
         if self.status == 1:
             m = self._read_next_msg()
@@ -245,7 +245,7 @@ class pgscramauth(pgauth):
             scram.parse_SASLInitialResponse(self.sasl_init_resp_msg)
             # send SASLContinue to client
             self.sasl_continue_msg = scram.make_SASLContinue(self.sasl_init_resp_msg.client_nonce, self.shadow[2], self.shadow[1])
-            self.cnn.write_msgs((self.sasl_continue_msg,))
+            self.write_msgs((self.sasl_continue_msg,))
             return self.go()
         if self.status == 2:
             m = self._read_next_msg()
@@ -267,10 +267,10 @@ class pgscramauth(pgauth):
             # send SASLFinal to client
             serverkey = b64decode(self.shadow[4])
             self.sasl_final_msg = scram.make_SASLFinal(serverkey, self.sasl_init_resp_msg, self.sasl_continue_msg, self.sasl_resp_msg)
-            self.cnn.write_msgs((self.sasl_final_msg,))
+            self.write_msgs((self.sasl_final_msg,))
             return self.go()
         if self.status == 3:
-            if self.cnn.write_msgs():
+            if self.write_msgs():
                 return 'pollout'
             self.status = 4
             self.result = AUTH_OK

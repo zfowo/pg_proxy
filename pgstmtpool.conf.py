@@ -4,7 +4,7 @@
 import sys, os
 
 # admin_cnn, master必须指定。
-# 对于pseudo_cnn/password参数，如果用户的auth方法是md5，那么不需要指定密码。
+# 对于pseudo_cnn/user_pwds参数，如果用户的auth方法是md5，那么不需要指定密码。
 # admin_cnn必须指定密码，如果用户的auth方法是md5，那么可以用pg_shadow中的md5开头的那个密码，否则必须是明文密码。
 all = {
     'listen' : ('', 7777), 
@@ -23,9 +23,9 @@ all = {
     'worker_per_fe_cnt' : 10, 
     'master' : ('127.0.0.1', 5432), 
     'slaver' : [('127.0.0.1', 5433),], 
-    # password包含用户密码，从库worker用这些密码连接到从库。如果用户的auth方法是md5则不需要指定，
+    # user_pwds包含用户密码，从库worker用这些密码连接到从库。如果用户的auth方法是md5则不需要指定，
     # 如果auth方法是password/scram-sha256则必须指定密码，如果是trust则指定空串。
-    'password' : {
+    'user_pwds' : {
         'user2' : '123456', 
     }, 
 }

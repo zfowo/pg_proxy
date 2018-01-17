@@ -475,6 +475,11 @@ class feconnpool():
         if type(startup_msg) is not p.StartupMessage:
             startup_msg = startup_msg.startup_msg
         return len(self.fecnns_map[startup_msg])
+    def __len__(self):
+        cnt = 0
+        for _, fecnns in self.fecnns_map.items():
+            cnt += len(fecnns)
+        return cnt
     def __contains__(self, fecnn):
         return fecnn in self.fecnns_map[fecnn.startup_msg]
     def __iter__(self):
@@ -502,7 +507,10 @@ class pooldb(pseudodb.pseudodb):
     # log_msg
     @mputils.mycmd('log_msg', cmd_map)
     def cmd(self, args, sub_cmd_map):
-        pgnet.connbase.log_msg = not pgnet.connbase.log_msg
+        if not args:
+            return self._write_result(['log_msg'], [(pgnet.connbase.log_msg,)])
+        v = args[0].lower() in ('on', 1, 'true', 't')
+        pgnet.connbase.log_msg = v
         return self._write_result(['log_msg'], [(pgnet.connbase.log_msg,)])
     # register
     @mputils.mycmd('register', cmd_map)
@@ -564,7 +572,7 @@ class pooldb(pseudodb.pseudodb):
         if sub_cmd not in sub_cmd_map:
             return self._write_error('unknown sub cmd:%s' % sub_cmd)
         return sub_cmd_map[sub_cmd](self, sub_cmd_args)
-    # fe [list] ...
+    # fe [list|count] ...
     @mputils.mycmd('fe', cmd_map)
     def cmd(self, args, sub_cmd_map):
         return self._common_with_sub_cmd(args, sub_cmd_map)
@@ -576,6 +584,9 @@ class pooldb(pseudodb.pseudodb):
             startup_msg = self._make_startup_msg(m)
             rows.append((host, port, m['database'], m['user'], startup_msg))
         return self._write_result(['host', 'port', 'database', 'user', 'startup_msg'], rows)
+    @cmd.sub_cmd(name='count')
+    def cmd(self, args):
+        return self._write_result(['count'], [(len(self.fepool),)])
     # pool [list|show|add|remove|remove_worker|new_worker] ...
     @mputils.mycmd('pool', cmd_map)
     def cmd(self, args, sub_cmd_map):
@@ -706,12 +717,14 @@ class pgmiscworker():
         thr.start()
         return w
 # main
+# 如果cnn_param没有password，那么把用户的md5密码作为password
 def add_pwd_md5_if(cnn_param):
     if 'password' in cnn_param:
         return
     pwd = get_pwd_md5(g_conf['shadows'], cnn_param['user'])
     if pwd:
         cnn_param['password'] = pwd
+# 获得pg_shadow中的md5密码，如果不是md5则返回None
 def get_pwd_md5(shadows, username):
     shadow = shadows.get_shadow(username)
     if shadow and shadow[0] == pghba.MD5_PREFIX:
@@ -721,7 +734,7 @@ def get_pwd_md5(shadows, username):
 # 获得建立从库worker需要的连接参数
 def get_slaver_cnn_param(startup_msg):
     username = startup_msg['user'].decode('utf8')
-    pwd = g_conf.get('password', {}).get(username, None)
+    pwd = g_conf.get('user_pwds', {}).get(username, None)
     if pwd is None:
         pwd = get_pwd_md5(g_conf['shadows'], username)
     if pwd is None:
@@ -840,8 +853,8 @@ def notify_spool():
         return
     cnn_param = g_conf.get('pseudo_cnn', g_conf['admin_cnn'])
     cnn_param = copy.copy(cnn_param)
+    add_pwd_md5_if(cnn_param)
     for addr in g_conf['spool']:
-        add_pwd_md5_if(cnn_param)
         cnn_param.update(host=addr[0], port=addr[1], database='pseudo')
         try:
             with pgnet.pgconn(**cnn_param) as cnn:
@@ -995,7 +1008,7 @@ if __name__ == '__main__':
     
     misc_worker = pgmiscworker.start()
     
-    listen = netutils.listener(g_conf.get('listen', ('', 7777)), async=True)
+    listen = netutils.listener(g_conf['listen'], async=True)
     register_to_mpool(listen.getsockname())
     poll = netutils.spoller()
     poll.register(listen, poll.POLLIN)
@@ -1026,7 +1039,7 @@ if __name__ == '__main__':
                         fobj.write_msgs((p.ErrorResponse.make_error(b'do not support SSL or replication connection'),))
                         fobj.close()
                         continue
-                    # 由于SCRAM，一个fecnn无法用于auth多个后端，所以现在只有当g_conf['conn_params']中有和startup_msg匹配的时候才会启动slaver workers。
+                    # 由于SCRAM，无法用pg_shadow中保存的密码来模拟登陆，所以只能由前端和后端直接进行auth。
                     # 另外slaver workers只有当master worker启动成功后才会启动。因为psql会用一个立马断开的连接来判断是否需要密码。
                     is_pseudo = (m['database'] == b'pseudo')
                     if not is_pseudo:
@@ -1036,7 +1049,7 @@ if __name__ == '__main__':
                             if param:
                                 slaver_workers_to_start[w.id] = param
                             continue
-                    
+                    # 由连接池进行auth
                     auth_ok_msgs = pooldb.auth_ok_msgs if is_pseudo else master_pool.get(m)[0].auth_ok_msgs
                     cnn = pooldb(fobj.cnn, g_conf, master_pool, slaver_pools, fepool, main_queue) if is_pseudo else fobj.cnn
                     auth = pghba.get_auth(hba, shadows, cnn, m, auth_ok_msgs)
