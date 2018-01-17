@@ -29,6 +29,7 @@ pgstmtpool.py [args] 语句级别连接池
 admin_cnn参数中的用户需要是超级用户。admin_cnn/conn_params中除了包含startup_msg消息中的参数外，可能还需要password(如果不是trust auth)。
 
 * 前端不许使用事务语句(比如begin/end)，包含事务语句的查询都会被abort，除非整个语句序列用一个Query消息被一次完整执行。
+psycopg2缺省的autocommit是False，所以它会自动发送begin语句，必须把autocommit设为True才可以使用本连接池。
 
 * 前端在连接的时候会首先发送一个startup_msg消息，该消息包含database/user以及其他数据库参数，比如client_encoding/application_name，
 不支持SSL连接和复制连接。每个后端都有一个pool，pool包含worker，worker按startup_msg分组，来自前端的查询会根据startup_msg分发到相应

@@ -636,8 +636,7 @@ class pooldb(pseudodb.pseudodb):
         if not w:
             return self._write_error('no worker with id(%s) in pool %d' % (worker_id, pool_id))
         return self._write_result(['pool_id', 'worker_id'], [[pool_id, worker_id]])
-    # args指定pool_id和connection params，可以包含password，不需要包含host/port
-    # connection params的格式为: key=value,key=value...
+    # args指定pool_id和conn params,可以包含password,不需要包含host/port,conn params的格式为:key=value,key=value...
     @cmd.sub_cmd(name='new_worker')
     def cmd(self, args):
         if not args:
@@ -714,7 +713,7 @@ def need_new_worker(startup_msg):
         need = True
     else:
         fecnt = fepool.count(startup_msg) + 1
-        worker_min_cnt = g_conf.get('worker_min_cnt', [])
+        worker_min_cnt = g_conf.get('worker_min_cnt', [1,1,2,2,2,2,3,3,3,3])
         worker_per_fe_cnt = g_conf.get('worker_per_fe_cnt', 10)
         if fecnt > len(worker_min_cnt):
             need = fecnt/worker_per_fe_cnt > wcnt
@@ -935,6 +934,8 @@ def process_args():
     if xargs['listen']:
         host, port = xargs['listen'][0].split(':')
         g_conf['listen'] = (host, int(port))
+    if 'listen' not in g_conf:
+        g_conf['listen'] = ('', 7777)
     if xargs['mpool']:
         host, port = xargs['mpool'][0].split(':')
         g_conf['mpool'] = (host, int(port))
@@ -948,6 +949,7 @@ def process_args():
     return g_conf
 if __name__ == '__main__':
     g_conf = process_args()
+    print('mode:%s  listen:%s  mpool:%s' % (g_conf['mode'], g_conf['listen'], g_conf['mpool']))
     
     cnn_param = copy.copy(g_conf['admin_cnn'])
     cnn_param['host'] = g_conf['master'][0]
@@ -988,6 +990,11 @@ if __name__ == '__main__':
                         addr_list = [g_conf['master']] + g_conf.get('slaver', [])
                         misc_worker.put('CancelRequest', (m, addr_list))
                         fobj.close()
+                        continue
+                    if m.code == p.PG_SSLREQUEST_CODE:
+                        fobj.cnn.send_buf = b'N'
+                        fobj.write_msgs_until_done()
+                        poll.register(fobj, poll.POLLIN)
                         continue
                     if m.code != p.PG_PROTO_VERSION3_NUM or 'replication' in m.get_params():
                         fobj.write_msgs((p.ErrorResponse.make_error(b'do not support SSL or replication connection'),))

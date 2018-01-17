@@ -14,6 +14,7 @@ import scram
 # 连接是非阻塞的，除了connect的时候。
 @netutils.pollize
 class connbase():
+    log_msg = False
     def __init__(self, s):
         self.s = s
         self.s.settimeout(0)
@@ -65,7 +66,7 @@ class connbase():
     def write_msgs(self, msg_list=(), *, fe):
         prefix_str = 'BE' if fe else 'FE'
         for msg in msg_list:
-            #print('%s: %s' % (prefix_str, msg))
+            if self.log_msg: print('%s: %s' % (prefix_str, msg))
             self.send_buf += msg.tobytes()
         self._write()
         return len(self.send_buf)
@@ -78,7 +79,9 @@ class connbase():
         return msg_list
     # 一直写直到写完为止
     def write_msgs_until_done(self, msg_list=()):
-        self.write_msgs(msg_list)
+        if msg_list:
+            if not self.write_msgs(msg_list):
+                return
         while self.write_msgs():
             self.pollout()
     def __enter__(self):
@@ -90,10 +93,8 @@ class feconn(connbase):
         self.status = 'connected'
         super().__init__(s)
         self.startup_msg = None
-    # 读取第一个消息，如果还没有收到则返回None。
+    # 读取第一个消息，如果第1个是SSLRequest，那么会有第2个startup_msg。
     def read_startup_msg(self):
-        if self.startup_msg:
-            return self.startup_msg
         self._read()
         if p.startup_msg_is_complete(self.recv_buf):
             try:
@@ -101,7 +102,9 @@ class feconn(connbase):
             except RuntimeError as ex:
                 raise pgfatal(None, 'RuntimeError: %s' % ex)
             self.recv_buf = b''
-        return self.startup_msg
+            return self.startup_msg
+        else:
+            return None
     def read_msgs(self, max_msg=0, stop=None):
         return super().read_msgs(max_msg, stop, fe=True)
     def write_msgs(self, msg_list=()):
@@ -557,10 +560,7 @@ if __name__ == '__main__':
         listen_addr = (host, int(port))
     print(be_addr, listen_addr)
         
-    listen_s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    listen_s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    listen_s.bind(listen_addr)
-    listen_s.listen()
+    listen_s = netutils.listener(listen_addr)
     poll = netutils.spoller()
     while True:
         s, peer = listen_s.accept()
@@ -569,11 +569,16 @@ if __name__ == '__main__':
         try:
             with feconn(s) as fe_c, beconn(be_addr) as be_c:
                 while True:
-                    m = fe_c.read_startup_msg()
-                    if m:
-                        be_c.write_msgs([m])
-                        break
-                    time.sleep(0.01)
+                    m = fe_c.read_startup_msg();
+                    if not m:
+                        time.sleep(0.001)
+                        continue
+                    if m.code == p.PG_SSLREQUEST_CODE:
+                        fe_c.send_buf = b'N'
+                        fe_c.write_msgs_until_done()
+                        continue
+                    be_c.write_msgs_until_done([m])
+                    break
                 poll.register(fe_c, poll.POLLIN)
                 poll.register(be_c, poll.POLLIN)
                 while True:
