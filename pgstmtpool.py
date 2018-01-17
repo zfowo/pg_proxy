@@ -240,8 +240,7 @@ class pgworkerpool():
         if self.admin_cnn:
             return self.admin_cnn
         cnn_params = copy.copy(cnn_params)
-        cnn_params['host'] = self.be_addr[0]
-        cnn_params['port'] = self.be_addr[1]
+        cnn_params.update(host=self.be_addr[0], port=self.be_addr[1])
         self.admin_cnn = pgnet.pgconn(**cnn_params)
         return self.admin_cnn
     def close_admin_cnn(self):
@@ -484,8 +483,9 @@ class feconnpool():
                 yield msg, cnn
 # pseudo db
 class pooldb(pseudodb.pseudodb):
-    def __init__(self, cnn, master_pool, slaver_pools, fepool, main_queue):
+    def __init__(self, cnn, g_conf, master_pool, slaver_pools, fepool, main_queue):
         super().__init__(cnn)
+        self.g_conf = g_conf
         self.master_pool = master_pool
         self.slaver_pools = slaver_pools
         self.fepool = fepool
@@ -499,15 +499,57 @@ class pooldb(pseudodb.pseudodb):
         return f(self, args, sub_cmd_map)
     # 各种命令实现。args参数是list，为空或者只有一个元素。
     cmd_map = {}
+    # register
+    def _process_register(self, args, sub_cmd_map):
+        if self.g_conf['mode'] != 'master':
+            return self._write_error('only master connection pool can run register command ')
+        if not args:
+            return self._write_error('register need args host:port')
+        host, port = args[0].split(':')
+        if host == '0.0.0.0':
+            host = self.getpeername()[0]
+        self.g_conf['spool'].append((host, int(port)))
+        return self._write_result(['register'], [('ok',)])
+    cmd_map['register'] = (_process_register, {})
+    del _process_register
+    # spool
+    def _process_spool(self, args, sub_cmd_map):
+        if self.g_conf['mode'] != 'master':
+            return self._write_error('only master connection pool can run spool command')
+        return self._write_result(['host', 'port'], self.g_conf['spool'])
+    cmd_map['spool'] = (_process_spool, {})
+    del _process_spool
+    # change_master
+    def _process_change_master(self, args, sub_cmd_map):
+        if self.g_conf['mode'] != 'slaver':
+            return self._write_error('only slaver connection pool can run change_master command')
+        if not args:
+            return self._write_error('change_master need args host:port')
+        host, port = args[0].split(':')
+        new_master_addr = (host, int(port))
+        pool_list = self.slaver_pools.get_byaddr(new_master_addr)
+        if not pool_list:
+            self._write_error('no pool for %s' % (new_master_addr,))
+        self.slaver_pools.remove(pool_list[0], clear=False)
+        self.master_pool.clear()
+        globals()['master_pool'] = pool_list[0]
+        self.master_pool = globals()['master_pool']
+        self.g_conf['master'] = self.master_pool.be_addr
+        self.g_conf['slaver'].remove(self.master_pool.be_addr)
+        return self._write_result(['change_master'], [('ok',)])
+    cmd_map['change_master'] = (_process_change_master, {})
+    del _process_change_master
+    # cmd
     def _process_listcmd(self, args, sub_cmd_map):
         cmd_list = []
         for cmd, (_, x) in self.cmd_map.items():
             cmd_list.append(cmd)
             for sub_cmd in x:
                 cmd_list.append(cmd + ' ' + sub_cmd)
-        self._write_result(['cmd'], [(cmd,) for cmd in cmd_list])
+        return self._write_result(['cmd'], [(cmd,) for cmd in cmd_list])
     cmd_map['cmd'] = (_process_listcmd, {})
     del _process_listcmd
+    # shutdown
     def _process_shutdown(self, args, sub_cmd_map):
         print('shutdown...')
         # sys.exit(1) will waiting threads to exit
@@ -774,6 +816,29 @@ def restart_slaver():
             cnn.query("select z_restart_pg()")
         except pgnet.pgexception as ex:
             pass
+# 通知从连接池主库切换结果
+def notify_spool():
+    if g_conf['mode'] == 'slaver' or not g_conf['spool']:
+        return
+    cnn_param = g_conf.get('pseudo_cnn', g_conf['admin_cnn'])
+    cnn_param = copy.copy(cnn_param)
+    for addr in g_conf['spool']:
+        cnn_param.update(host=addr[0], port=addr[1])
+        try:
+            with pgnet.pgconn(**cnn_param) as cnn:
+                cnn.query('change_master %s:%s' % master_pool.be_addr)
+        except pgnet.pgexception as ex:
+            print('notify %s fail: %s' % (addr, ex))
+# 从连接池把自己的listen_addr告诉主连接池
+def register_to_mpool(addr):
+    if g_conf['mode'] == 'master' or not g_conf['mpool']:
+        return
+    mhost, mport = g_conf['mpool']
+    cnn_param = g_conf.get('pseudo_cnn', g_conf['admin_cnn'])
+    cnn_param = copy.copy(cnn_param)
+    cnn_param.update(host=mhost, port=mport, database='pseudo')
+    with pgnet.pgconn(**cnn_param) as cnn:
+        cnn.query('register %s:%s' % (addr[0], addr[1]))
 # in event loop
 def process_main_queue():
     # process main_queue
@@ -855,9 +920,37 @@ def process_ha():
     restart_slaver()
     master_pool.close_admin_cnn()
     slaver_pools.close_admin_cnn()
-    print('process_ha done. master changed to %s' % (master_pool.be_addr,))
+    print('process_ha done. master changed to %s. notify spool to change master' % (master_pool.be_addr,))
+    notify_spool()
+# 处理命令行参数以及读取配置文件，返回g_conf。
+def process_args():
+    xargs = miscutils.parse_args(sys.argv[1:])
+    if not xargs.keys() <= set(('mode', 'listen', 'conf', 'mpool')):
+        print('usage: %s [mode=master|slaver] [listen=host:port] [mpool=host:port] [conf=pgstmtpool.conf.py]' % sys.argv[0])
+        sys.exit(1)
+    conf_file = xargs['conf'][0] if xargs['conf'] else os.path.join(os.path.dirname(__file__), 'pgstmtpool.conf.py')
+    g_conf = miscutils.read_conf_file(conf_file, 'all')
+    if xargs['mode']:
+        g_conf['mode'] = xargs['mode'][0]
+    else:
+        g_conf['mode'] = 'master' if g_conf.get('enable_ha', False) else 'slaver'
+    g_conf['enable_ha'] = g_conf['mode'] == 'master'
+    g_conf['spool'] = [] # 记录从连接池的addr
+    if xargs['listen']:
+        host, port = xargs['listen'][0].split(':')
+        g_conf['listen'] = (host, int(port))
+    if xargs['mpool']:
+        host, port = xargs['mpool'][0].split(':')
+        g_conf['mpool'] = (host, int(port))
+    else:
+        g_conf['mpool'] = None
+    if g_conf['mode'] not in ('master', 'slaver'):
+        print('mode shoule be master or slaver')
+        sys.exit(1)
+    if (g_conf['mode'] == 'master' and g_conf['mpool']) or (g_conf['mode'] == 'slaver' and not g_conf['mpool']):
+        print('WARNING: master mode should not specify mpool' if g_conf['mode'] == 'master' else 'WARNING: slaver mode should specify mpool')
 if __name__ == '__main__':
-    g_conf = miscutils.read_conf(os.path.dirname(__file__))
+    g_conf = process_args()
     
     cnn_param = copy.copy(g_conf['admin_cnn'])
     cnn_param['host'] = g_conf['master'][0]
@@ -878,6 +971,7 @@ if __name__ == '__main__':
     misc_worker = pgmiscworker.start()
     
     listen = netutils.listener(g_conf.get('listen', ('', 7777)), async=True)
+    register_to_mpool(listen.getsockname())
     poll = netutils.spoller()
     poll.register(listen, poll.POLLIN)
     while True:
@@ -914,7 +1008,7 @@ if __name__ == '__main__':
                             continue
                     
                     auth_ok_msgs = pooldb.auth_ok_msgs if is_pseudo else master_pool.get(m)[0].auth_ok_msgs
-                    cnn = pooldb(fobj.cnn, master_pool, slaver_pools, fepool, main_queue) if is_pseudo else fobj.cnn
+                    cnn = pooldb(fobj.cnn, g_conf, master_pool, slaver_pools, fepool, main_queue) if is_pseudo else fobj.cnn
                     auth = pghba.get_auth(hba, shadows, cnn, m, auth_ok_msgs)
                     if auth.handle_event(poll, event):
                         if not isinstance(auth.cnn, pseudodb.pseudodb):

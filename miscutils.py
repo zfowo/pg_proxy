@@ -68,7 +68,7 @@ def get_now_time():
     d = datetime.datetime.now()
     return '%.4d-%.2d-%.2d %.2d:%.2d:%.2d' % (d.year, d.month, d.day, d.hour, d.minute, d.second)
 
-def parse_args(args, sep, **kwargs):
+def parse_args(args, sep='=', **kwargs):
     res = collections.defaultdict(list)
     for kv in args:
         kv = kv.strip()

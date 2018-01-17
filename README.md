@@ -1,9 +1,19 @@
 
-pgstmtpool.py [conf_file] 语句级别连接池
+pgstmtpool.py [args] 语句级别连接池
 ========================================
+* 命令行参数包括：[mode=master|slaver] [listen=host:port] [mpool=host:port] [conf=pgstmtpool.conf.py]
+
+        mode=master|slaver            指定本连接池是主连接池还是从连接池。如果没有指定那么根据配置文件中的enable_ha来确定，
+                                      enable_ha=True是主连接池否则是从连接池。如果指定了mode命令行参数，那么enalbe_ha由mode
+                                      来确定，mode=master表示enable_ha为True，否则为False。
+        listen=host:port              指定本连接池的监听ip地址和端口。如果没有指定就用配置文件中的listen参数。
+        mpool=host:port               指定主连接池的ip地址和端口。只对从连接池有效，如果指定了，那么会把本从连接池注册到主连接池。
+        conf=pgstmtpool.conf.py       指定配置文件。
+
 * 配置文件是个python文件(缺省是pgstmtpool.conf.py)，all变量字典包含配置参数，其中admin_cnn和master是必须指定的参数，具体参数包括：
 
         'listen' : (host, port)       指定监听ip和port。
+        'pseudo_cnn' : {}             主从连接池相互通信时用该连接参数去连接到伪数据库，不要包含host/port/database。如果没指定就用admin_cnn。
         'admin_cnn' : {}              指定连接参数，不要指定host/port，连接池在需要做些admin操作的时候用该参数连接到主库和从库。
         'enable_ha' : False           是否支持HA。
         'ha_after_fail_cnt' : 10      当主库连续出现指定次数的连接失败时启动主库切换。
@@ -14,19 +24,23 @@ pgstmtpool.py [conf_file] 语句级别连接池
         'master' : (host, port)       主库地址。
         'slaver' : [(),...]           从库地址列表。同一个从库可以包含多次，也可以包含主库。
         'conn_params' : [{},...]      连接参数列表(不能包含host/port)，当前端参数和其中一个匹配的时候才会启动从库worker。
+
 * 在pg_hba.conf中不要把连接池的host/ip配置成trust，因为当前端第一次连接时是由数据库端auth的，此时数据库端看到的是连接池的host/ip。
 admin_cnn参数中的用户需要是超级用户。admin_cnn/conn_params中除了包含startup_msg消息中的参数外，可能还需要password(如果不是trust auth)。
 
-* 前端不许使用事务语句(比如begin/end)，包含事务语句的查询都会被abort，除非整个语句序列被一次完整执行。
+* 前端不许使用事务语句(比如begin/end)，包含事务语句的查询都会被abort，除非整个语句序列用一个Query消息被一次完整执行。
 
 * 前端在连接的时候会首先发送一个startup_msg消息，该消息包含database/user以及其他数据库参数，比如client_encoding/application_name，
 不支持SSL连接和复制连接。每个后端都有一个pool，pool包含worker，worker按startup_msg分组，来自前端的查询会根据startup_msg分发到相应
 的worker，缺省所有查询都分发到主库worker，如果查询语句的开头是/\*s\*/并且存在从库worker的话则分发到从库worker。
 
-* pgstmtpool.py使用线程来实现，由于python的GIL限制，导致只能使用一个CPU，所以worker数目可能会有限制。可以启动多个pgstmtpool.py，但是
-只有一个的enable_ha设为True(称为主连接池)，其他都设为False(称为从连接池)，然后前面放一个haproxy。不过这种方法当发生主库切换的时候，
-从连接池只能处理只读查询。TODO:将来版本将允许主从连接池之间通信，主连接池在切换完成后把切换结果发给从连接池。具体实现可以这样：
-主连接池连接到从连接池的伪数据库pseudo，然后执行命令pool changemaster <new_master_host:new_master_port>。
+* pgstmtpool.py使用线程来实现，由于python的GIL限制，导致只能使用一个CPU，所以worker数目可能会受限制。可以启动多个pgstmtpool.py，把其中
+一个的enable_ha设为True(称为主连接池)，其他都设为False(称为从连接池)，然后前面放一个haproxy。主连接池在切换完成后把切换结果发给从连接池。
+比如下面启动主连接池和2个从连接池:
+
+        .) python pgstmtpool.py
+        .) python pgstmtpool.py mode=slaver listen=:7778 mpool=127.0.0.1:7777
+        .) python pgstmtpool.py mode=slaver listen=:7779 mpool=127.0.0.1:7777
 
 HA主库切换
 ==========
@@ -37,6 +51,7 @@ HA主库切换
         3) 修改其他从库的recovery.conf配置文件。
         4) 在新的主库上创建从库用到的复制slot。
         5) 重启从库使得修改生效。
+
 * 前面的3/4/5中需要用到switchfunc.sql中的函数，这些函数是用pl/python3u编写的。如果只有一个从库，那么不需要这些函数。
 目前switchfunc.sql中的函数有2个限制：postgresql的安装目录和data目录不能包含空格；以及primary_conninfo中的项值不能包含空格。
 
@@ -55,6 +70,7 @@ HA主库切换
         .) pool remove          删除一个pool，参数是pool id，只能删除从库pool。
         .) pool remove_worker   删除一个worker，参数是pool id和worker id。可以删除主库或者从库pool中的worker。
         .) pool new_worker      增加一个worker，参数是pool id和连接参数。
+
 * 不要多个用户同时连接到pseudo执行修改操作。
 
 
