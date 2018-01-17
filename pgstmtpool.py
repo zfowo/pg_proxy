@@ -499,6 +499,11 @@ class pooldb(pseudodb.pseudodb):
         return f(self, args, sub_cmd_map)
     # 各种命令实现。args参数是list，为空或者只有一个元素。
     cmd_map = {}
+    # log_msg
+    @mputils.mycmd('log_msg', cmd_map)
+    def cmd(self, args, sub_cmd_map):
+        pgnet.connbase.log_msg = not pgnet.connbase.log_msg
+        return self._write_result(['log_msg'], [(pgnet.connbase.log_msg,)])
     # register
     @mputils.mycmd('register', cmd_map)
     def cmd(self, args, sub_cmd_map):

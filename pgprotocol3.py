@@ -266,13 +266,16 @@ class AuthResponse(Msg):
 class PasswordMessage(struct_base):
     _formats = '>x'
     _fields = 'password'
-    # 参数必须是字节串
+    # 参数必须是字节串。如果password是md5开头那说明已经经过一次md5了.
     @classmethod
     def make(cls, password, user=None, md5salt=None):
         if md5salt:
             if not user:
                 raise SystemError('BUG: should provide user for md5 authentication')
-            password = b'md5' + md5(md5(password + user) + md5salt)
+            if password[:3] == b'md5' and len(password) == 35:
+                password = b'md5' + md5(password[3:] + md5salt)
+            else:
+                password = b'md5' + md5(md5(password + user) + md5salt)
         return cls(password=password)
 class SASLInitialResponse(struct_base):
     _formats = '>x >4x'
