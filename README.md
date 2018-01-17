@@ -15,6 +15,7 @@ pgstmtpool.py [args] 语句级别连接池
         'listen' : (host, port)       指定监听ip和port。
         'pseudo_cnn' : {}             主从连接池相互通信时用该连接参数去连接到伪数据库，不要包含host/port/database。如果没指定就用admin_cnn。
         'admin_cnn' : {}              指定连接参数，不要指定host/port，连接池在需要做些admin操作的时候用该参数连接到主库和从库。
+                                      需要指定密码，如果auth方法是md5则可以指定md5后的密码，否则指定明文密码。
         'enable_ha' : False           是否支持HA。
         'ha_after_fail_cnt' : 10      当主库连续出现指定次数的连接失败时启动主库切换。
         'lo_oid' : 9999               主库中大对象id，用于在从库中生成trigger文件。
@@ -23,10 +24,11 @@ pgstmtpool.py [args] 语句级别连接池
         'worker_per_fe_cnt' : 10      当前端数超过worker_min_cnt的大小时，指定每多少个前端连接需要一个后端连接。
         'master' : (host, port)       主库地址。
         'slaver' : [(),...]           从库地址列表。同一个从库可以包含多次，也可以包含主库。
-        'conn_params' : [{},...]      连接参数列表(不能包含host/port)，当前端参数和其中一个匹配的时候才会启动从库worker。
+        'password' : {}               包含用户密码，从库worker用这些密码连接到从库。如果用户的auth方法是md5则不需要指定，
+                                      如果auth方法是password/scram-sha256则必须指定密码，如果是trust则指定空串。
 
 * 在pg_hba.conf中不要把连接池的host/ip配置成trust，因为当前端第一次连接时是由数据库端auth的，此时数据库端看到的是连接池的host/ip。
-admin_cnn参数中的用户需要是超级用户。admin_cnn/conn_params中除了包含startup_msg消息中的参数外，可能还需要password(如果不是trust auth)。
+admin_cnn参数中的用户需要是超级用户。admin_cnn中除了包含startup_msg消息中的参数外，可能还需要password(如果不是trust auth)。
 
 * 前端不许使用事务语句(比如begin/end)，包含事务语句的查询都会被abort，除非整个语句序列用一个Query消息被一次完整执行。
 psycopg2缺省的autocommit是False，所以它会自动发送begin语句，必须把autocommit设为True才可以使用本连接池。

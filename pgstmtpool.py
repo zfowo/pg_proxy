@@ -70,9 +70,9 @@ class pgworker():
             if not self._process_auth(fecnn, main_queue):
                 return
         except pgnet.pgfatal as ex:
-            err = '<thread %d> %s fe:%s be:%s' % (self.id, ex, fecnn.getpeername(), self.becnn.be_addr)
+            err = '<thread %d> %s(ex.cnn:%s) fe:%s be:%s' % (self.id, ex, ex.cnn, fecnn.getpeername(), self.becnn.getpeername())
             print(err)
-            if self.becnn and ex.cnn is self.becnn:
+            if ex.cnn is self.becnn:
                 main_queue.put(('fail', fecnn, self, True))
             else:
                 main_queue.put(('fail', fecnn, self, False))
@@ -236,12 +236,12 @@ class pgworkerpool():
         self.nextidx_map = collections.defaultdict(int)  # startup_msg -> nextidx for accessing worker_list
         self.id2worker_map = {}
         self.admin_cnn = None # 用于管理目的的连接，一般是超级用户
-    def get_admin_cnn(self, cnn_params):
+    def get_admin_cnn(self, cnn_param):
         if self.admin_cnn:
             return self.admin_cnn
-        cnn_params = copy.copy(cnn_params)
-        cnn_params.update(host=self.be_addr[0], port=self.be_addr[1])
-        self.admin_cnn = pgnet.pgconn(**cnn_params)
+        cnn_param = copy.copy(cnn_param)
+        cnn_param.update(host=self.be_addr[0], port=self.be_addr[1])
+        self.admin_cnn = pgnet.pgconn(**cnn_param)
         return self.admin_cnn
     def close_admin_cnn(self):
         if self.admin_cnn:
@@ -706,11 +706,29 @@ class pgmiscworker():
         thr.start()
         return w
 # main
-def get_match_cnn_param(startup_msg):
-    for param in g_conf.get('conn_params',()):
-        if startup_msg.match(param):
-            return param
-    return None
+def add_pwd_md5_if(cnn_param):
+    if 'password' in cnn_param:
+        return
+    pwd = get_pwd_md5(g_conf['shadows'], cnn_param['user'])
+    if pwd:
+        cnn_param['password'] = pwd
+def get_pwd_md5(shadows, username):
+    shadow = shadows.get_shadow(username)
+    if shadow and shadow[0] == pghba.MD5_PREFIX:
+        return pghba.MD5_PREFIX + shadow[1]
+    else:
+        return None
+# 获得建立从库worker需要的连接参数
+def get_slaver_cnn_param(startup_msg):
+    username = startup_msg['user'].decode('utf8')
+    pwd = g_conf.get('password', {}).get(username, None)
+    if pwd is None:
+        pwd = get_pwd_md5(g_conf['shadows'], username)
+    if pwd is None:
+        return None
+    param = copy.copy(startup_msg.get_params())
+    param['password'] = pwd
+    return param
 def need_new_worker(startup_msg):
     need = False
     wcnt = master_pool.count(startup_msg)
@@ -724,7 +742,7 @@ def need_new_worker(startup_msg):
             need = fecnt/worker_per_fe_cnt > wcnt
         else:
             need = worker_min_cnt[fecnt-1] > wcnt
-    param = get_match_cnn_param(startup_msg) if need else None
+    param = get_slaver_cnn_param(startup_msg) if need else None
     return need, param
 def can_send_to_slaver(fecnn, msg):
     if msg.msg_type != p.MsgType.MT_Query:
@@ -823,7 +841,8 @@ def notify_spool():
     cnn_param = g_conf.get('pseudo_cnn', g_conf['admin_cnn'])
     cnn_param = copy.copy(cnn_param)
     for addr in g_conf['spool']:
-        cnn_param.update(host=addr[0], port=addr[1])
+        add_pwd_md5_if(cnn_param)
+        cnn_param.update(host=addr[0], port=addr[1], database='pseudo')
         try:
             with pgnet.pgconn(**cnn_param) as cnn:
                 cnn.query('change_master %s:%s' % master_pool.be_addr)
@@ -833,9 +852,10 @@ def notify_spool():
 def register_to_mpool(addr):
     if g_conf['mode'] == 'master' or not g_conf['mpool']:
         return
-    mhost, mport = g_conf['mpool']
     cnn_param = g_conf.get('pseudo_cnn', g_conf['admin_cnn'])
     cnn_param = copy.copy(cnn_param)
+    add_pwd_md5_if(cnn_param)
+    mhost, mport = g_conf['mpool']
     cnn_param.update(host=mhost, port=mport, database='pseudo')
     with pgnet.pgconn(**cnn_param) as cnn:
         cnn.query('register %s:%s' % (addr[0], addr[1]))
@@ -957,13 +977,14 @@ if __name__ == '__main__':
     print('mode:%s  listen:%s  mpool:%s' % (g_conf['mode'], g_conf['listen'], g_conf['mpool']))
     
     cnn_param = copy.copy(g_conf['admin_cnn'])
-    cnn_param['host'] = g_conf['master'][0]
-    cnn_param['port'] = g_conf['master'][1]
+    cnn_param.update(host=g_conf['master'][0], port=g_conf['master'][1])
     admin_cnn = pgnet.pgconn(**cnn_param)
     check_largeobject(admin_cnn, g_conf.get('lo_oid', 9999))
     hba = pghba.pghba.from_database(admin_cnn)
     shadows = pghba.pgshadow.from_database(admin_cnn)
     admin_cnn.close()
+    g_conf['hba'] = hba
+    g_conf['shadows'] = shadows
     
     master_pool = pgworkerpool(g_conf['master'])
     slaver_pools = pgworkerpools(*g_conf.get('slaver',()))
@@ -1047,7 +1068,7 @@ if __name__ == '__main__':
                         master_pool.dispatch_fe_msg(poll, fobj, m)
                         wcnt = master_pool.count(fobj)
                         if wcnt > 0: 
-                            cnn_param = get_match_cnn_param(fobj.startup_msg)
+                            cnn_param = get_slaver_cnn_param(fobj.startup_msg)
                             if cnn_param:
                                 slaver_pools.new_some_workers_if(wcnt, fobj, cnn_param, main_queue)
                 elif isinstance(fobj, pseudodb.pseudodb):

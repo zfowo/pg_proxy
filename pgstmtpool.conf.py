@@ -4,7 +4,8 @@
 import sys, os
 
 # admin_cnn, master必须指定。
-# conn_params是个列表，列表中的元素是连接参数(不包括host和port)，当前端和其中一个匹配的时候才会启动slaver worker。
+# 对于pseudo_cnn/password参数，如果用户的auth方法是md5，那么不需要指定密码。
+# admin_cnn必须指定密码，如果用户的auth方法是md5，那么可以用pg_shadow中的md5开头的那个密码，否则必须是明文密码。
 all = {
     'listen' : ('', 7777), 
     # pseudo_cnn是主从连接池之间通信时用的连接参数(无需指定host/port/database)，如果没有指定则使用admin_cnn。
@@ -22,9 +23,9 @@ all = {
     'worker_per_fe_cnt' : 10, 
     'master' : ('127.0.0.1', 5432), 
     'slaver' : [('127.0.0.1', 5433),], 
-    'conn_params' : [
-        {'database':'postgres', 'user':'zhb'}, 
-        {'database':'postgres', 'user':'zhb', 'client_encoding':'GBK', 'application_name':'psql'}, 
-        {'database':'postgres', 'user':'user1', 'client_encoding':'GBK', 'application_name':'psql', 'password':'123456'}, 
-    ], 
+    # password包含用户密码，从库worker用这些密码连接到从库。如果用户的auth方法是md5则不需要指定，
+    # 如果auth方法是password/scram-sha256则必须指定密码，如果是trust则指定空串。
+    'password' : {
+        'user2' : '123456', 
+    }, 
 }

@@ -168,7 +168,7 @@ class pgconn(beconn):
         self.startup_msg = p.StartupMessage.make(**kwargs)
         self.write_msg(self.startup_msg)
         self.auth_ctx.password = password.encode('utf8') if type(password) is str else password
-        self.auth_ctx.user = kwargs['user'].encode('utf8')
+        self.auth_ctx.user = kwargs['user'].encode('utf8') if type(kwargs['user']) is str else kwargs['user']
         try:
             self._process_auth()
         except RuntimeError as ex:
