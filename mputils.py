@@ -120,3 +120,34 @@ def generateid(cls):
         return obj
     cls.__new__ = mynew
     return cls
+# cmd_map±£´æcmd_name -> (cmd_process_func, sub_cmd_map)
+class mycmd():
+    def __init__(self, name, cmd_map):
+        self.name = name
+        self.cmd_map = cmd_map
+    def __call__(self, func):
+        oldname = func.__name__
+        func.__name__ = '%s_%s' % ('_cmd', self.name)
+        func.__qualname__ = func.__qualname__.replace(oldname, func.__name__)
+        self.cmd_map[self.name] = (func, {})
+        return self
+    def sub_cmd(self, func=None, *, name):
+        if func is None:
+            return functools.partial(self.sub_cmd, name=name)
+        oldname = func.__name__
+        func.__name__ = '%s_%s_%s' % ('_cmd', self.name, name)
+        func.__qualname__ = func.__qualname__.replace(oldname, func.__name__)
+        self.cmd_map[self.name][1][name] = func
+        return self
+# main
+if __name__ == '__main__':
+    class A:
+      cmd_map = {}
+      @mycmd('cmd1', cmd_map)
+      def cmd(self): pass
+      @cmd.sub_cmd(name='cmd11')
+      def cmd(self): pass
+      @mycmd('cmd2', cmd_map)
+      def cmd(self): pass
+      del cmd
+    print(A.cmd_map)

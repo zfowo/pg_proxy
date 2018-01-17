@@ -500,7 +500,8 @@ class pooldb(pseudodb.pseudodb):
     # 各种命令实现。args参数是list，为空或者只有一个元素。
     cmd_map = {}
     # register
-    def _process_register(self, args, sub_cmd_map):
+    @mputils.mycmd('register', cmd_map)
+    def cmd(self, args, sub_cmd_map):
         if self.g_conf['mode'] != 'master':
             return self._write_error('only master connection pool can run register command ')
         if not args:
@@ -510,17 +511,15 @@ class pooldb(pseudodb.pseudodb):
             host = self.getpeername()[0]
         self.g_conf['spool'].append((host, int(port)))
         return self._write_result(['register'], [('ok',)])
-    cmd_map['register'] = (_process_register, {})
-    del _process_register
     # spool
-    def _process_spool(self, args, sub_cmd_map):
+    @mputils.mycmd('spool', cmd_map)
+    def cmd(self, args, sub_cmd_map):
         if self.g_conf['mode'] != 'master':
             return self._write_error('only master connection pool can run spool command')
         return self._write_result(['host', 'port'], self.g_conf['spool'])
-    cmd_map['spool'] = (_process_spool, {})
-    del _process_spool
     # change_master
-    def _process_change_master(self, args, sub_cmd_map):
+    @mputils.mycmd('change_master', cmd_map)
+    def cmd(self, args, sub_cmd_map):
         if self.g_conf['mode'] != 'slaver':
             return self._write_error('only slaver connection pool can run change_master command')
         if not args:
@@ -537,27 +536,23 @@ class pooldb(pseudodb.pseudodb):
         self.g_conf['master'] = self.master_pool.be_addr
         self.g_conf['slaver'].remove(self.master_pool.be_addr)
         return self._write_result(['change_master'], [('ok',)])
-    cmd_map['change_master'] = (_process_change_master, {})
-    del _process_change_master
     # cmd
-    def _process_listcmd(self, args, sub_cmd_map):
+    @mputils.mycmd('cmd', cmd_map)
+    def cmd(self, args, sub_cmd_map):
         cmd_list = []
         for cmd, (_, x) in self.cmd_map.items():
             cmd_list.append(cmd)
             for sub_cmd in x:
                 cmd_list.append(cmd + ' ' + sub_cmd)
         return self._write_result(['cmd'], [(cmd,) for cmd in cmd_list])
-    cmd_map['cmd'] = (_process_listcmd, {})
-    del _process_listcmd
     # shutdown
-    def _process_shutdown(self, args, sub_cmd_map):
+    @mputils.mycmd('shutdown', cmd_map)
+    def cmd(self, args, sub_cmd_map):
         print('shutdown...')
         # sys.exit(1) will waiting threads to exit
         os._exit(1)
-    cmd_map['shutdown'] = (_process_shutdown, {})
-    del _process_shutdown
     # 有子命令的通用入口
-    def _process_cmd(self, args, sub_cmd_map, default_sub_cmd='list'):
+    def _common_with_sub_cmd(self, args, sub_cmd_map, default_sub_cmd='list'):
         if not args:
             args.append(default_sub_cmd)
         sub_cmd, *sub_cmd_args = args[0].split(maxsplit=1)
@@ -565,25 +560,31 @@ class pooldb(pseudodb.pseudodb):
             return self._write_error('unknown sub cmd:%s' % sub_cmd)
         return sub_cmd_map[sub_cmd](self, sub_cmd_args)
     # fe [list] ...
-    def _process_fe_list(self, args):
+    @mputils.mycmd('fe', cmd_map)
+    def cmd(self, args, sub_cmd_map):
+        return self._common_with_sub_cmd(args, sub_cmd_map)
+    @cmd.sub_cmd(name='list')
+    def cmd(self, args):
         rows = []
         for m, fecnn in self.fepool:
             host, port = fecnn.getpeername()
             startup_msg = self._make_startup_msg(m)
             rows.append((host, port, m['database'], m['user'], startup_msg))
         return self._write_result(['host', 'port', 'database', 'user', 'startup_msg'], rows)
-    cmd_map['fe'] = (_process_cmd, {})
-    cmd_map['fe'][1]['list'] = _process_fe_list
-    del _process_fe_list
     # pool [list|show|add|remove|remove_worker|new_worker] ...
-    def _process_pool_list(self, args):
+    @mputils.mycmd('pool', cmd_map)
+    def cmd(self, args, sub_cmd_map):
+        return self._common_with_sub_cmd(args, sub_cmd_map)
+    @cmd.sub_cmd(name='list')
+    def cmd(self, args):
         rows = []
         pool = self.master_pool
         rows.append((pool.id, 'true', pool.be_addr, len(pool)))
         for pool in slaver_pools:
             rows.append((pool.id, 'false', pool.be_addr, len(pool)))
         return self._write_result(['pool_id', 'master', 'addr', 'worker'], rows)
-    def _process_pool_show(self, args):
+    @cmd.sub_cmd(name='show')
+    def cmd(self, args):
         pool_list = []
         if not args:
             pool_list.append(self.master_pool)
@@ -599,14 +600,16 @@ class pooldb(pseudodb.pseudodb):
                 startup_msg = self._make_startup_msg(m)
                 rows.append((pool.id, w.id, w.be_addr, m['database'], m['user'], startup_msg, w.num_processed_msg))
         return self._write_result(['pool_id', 'worker_id', 'addr', 'database', 'user', 'startup_msg', 'processed'], rows)
-    def _process_pool_add(self, args):
+    @cmd.sub_cmd(name='add')
+    def cmd(self, args):
         if not args:
             return self._write_error("'pool add' should provide addr(host:port)")
         host, port = args[0].split(':')
         port = int(port)
         pool = self.slaver_pools.add((host, port))
         self._write_result(['pool_id'], [[pool.id]])
-    def _process_pool_remove(self, args):
+    @cmd.sub_cmd(name='remove')
+    def cmd(self, args):
         if not args:
             return self._write_error("'pool remove' should provide pool id")
         pool_id = int(args[0])
@@ -614,7 +617,8 @@ class pooldb(pseudodb.pseudodb):
         if not pool:
             return self._write_error('no pool for id %d' % pool_id)
         return self._write_result(['pool_id', 'addr', 'worker'], [[pool.id, pool.be_addr, len(pool)]])
-    def _process_pool_remove_worker(self, args):
+    @cmd.sub_cmd(name='remove_worker')
+    def cmd(self, args):
         if not args:
             return self._write_error("'pool remove_worker' should provide pool id and worker id")
         pool_id, worker_id = args[0].split()
@@ -634,7 +638,8 @@ class pooldb(pseudodb.pseudodb):
         return self._write_result(['pool_id', 'worker_id'], [[pool_id, worker_id]])
     # args指定pool_id和connection params，可以包含password，不需要包含host/port
     # connection params的格式为: key=value,key=value...
-    def _process_pool_new_worker(self, args):
+    @cmd.sub_cmd(name='new_worker')
+    def cmd(self, args):
         if not args:
             return self._write_error("'pool new_worker' should provide pool id and connection params")
         pool_id, *params = args[0].split()
@@ -652,16 +657,7 @@ class pooldb(pseudodb.pseudodb):
                 return self._write_error('no pool for id %d' % pool_id)
         w = pool.new_worker2(kwargs, self.main_queue)
         return self._write_result(['pool_id', 'worker_id'], [[pool_id, w.id]])
-    # 
-    cmd_map['pool'] = (_process_cmd, {})
-    cmd_map['pool'][1]['list'] = _process_pool_list
-    cmd_map['pool'][1]['show'] = _process_pool_show
-    cmd_map['pool'][1]['add'] = _process_pool_add
-    cmd_map['pool'][1]['remove'] = _process_pool_remove
-    cmd_map['pool'][1]['remove_worker'] = _process_pool_remove_worker
-    cmd_map['pool'][1]['new_worker'] = _process_pool_new_worker
-    del _process_pool_list, _process_pool_show, _process_pool_add, _process_pool_remove, _process_pool_remove_worker, _process_pool_new_worker
-    del _process_cmd # 最后删除
+    del cmd
     def _make_startup_msg(self, m):
         params = [(k, v) for k, v in m.get_params().items() if k not in ('database', 'user')]
         params.sort()
@@ -949,6 +945,7 @@ def process_args():
         sys.exit(1)
     if (g_conf['mode'] == 'master' and g_conf['mpool']) or (g_conf['mode'] == 'slaver' and not g_conf['mpool']):
         print('WARNING: master mode should not specify mpool' if g_conf['mode'] == 'master' else 'WARNING: slaver mode should specify mpool')
+    return g_conf
 if __name__ == '__main__':
     g_conf = process_args()
     
