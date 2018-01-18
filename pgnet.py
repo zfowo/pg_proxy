@@ -53,6 +53,8 @@ class connbase():
                 sz = self.s.send(self.send_buf)
             except ConnectionError as ex:
                 raise pgfatal(None, '%s' % ex, self)
+            except BlockingIOError:
+                return
             self.send_buf = self.send_buf[sz:]
     # 返回解析后的消息列表。max_msg指定最多返回多少个消息。
     def read_msgs(self, max_msg=0, stop=None, *, fe):
@@ -83,6 +85,8 @@ class connbase():
         if msg_list:
             if not self.write_msgs(msg_list):
                 return
+        if not self.send_buf:
+            return
         while self.write_msgs():
             self.pollout()
     def __enter__(self):
@@ -238,15 +242,21 @@ class pgconn(beconn):
         return self.write_msg(p.Query(query=sql)).process()
     # 扩展查询，如果返回值是CopyResponse则需要调用process继续进行copy操作。
     # sql语句中的参数用$1..$n表示。
+    # 当args_list很大时，发送消息后必须检查是否可读，否则会发不了数据，因为服务器端也会不停的往客户端写消息，
+    # 当服务器端写buffer满了之后就阻塞了，这样就读不了客户端发送的消息。造成死锁。
     def query2(self, sql, args_list):
+        processer = Query2Processer(self)
         sql = self.encode(sql)
         self.write_msgs((p.Parse.make(sql),))
+        processer.process()
         for args in args_list:
             x = (self.encode(arg) for arg in args)
             self.write_msgs((p.Bind.make(x), p.Describe.portal(), p.Execute.make()))
-        self.write_msgs((p.Close.portal(), p.Sync()))
-        self.processer = QueryProcesser(self)
-        return self.processer.process()
+            processer.process()
+        self.write_msgs((p.Close.stmt(), p.Sync()))
+        while not processer.process(synced=True):
+            self.pollin()
+        return processer.qres_list
     def copyin(self, sql, data_list):
         m = self.query(sql)
         if isinstance(m, p.CopyInResponse):
@@ -306,7 +316,7 @@ class pgfatal(pgexception):
 class pgtrans():
     def __init__(self, cnn):
         self.cnn = cnn
-        sele.cnn.query('begin')
+        self.cnn.query('begin')
     def __enter__(self):
         return self
     def __exit__(self, exc_type, exc_val, exc_tb):
@@ -353,11 +363,11 @@ class QueryResult():
         self._parse_cmdtag()
         self._make_field_map()
     def _parse_cmdtag(self):
-        s1, s2 = self.cmdtag.split(maxsplit=1)
+        s1, *s2 = self.cmdtag.split(maxsplit=1)
         if s1 in ('UPDATE', 'DELETE', 'SELECT', 'MOVE', 'FETCH', 'COPY'):
-            self.cmdtag = (s1, int(s2))
+            self.cmdtag = (s1, int(s2[0]))
         elif s1 in ('INSERT',):
-            oid, rownum = s2.split(maxsplit=1)
+            oid, rownum = s2[0].split(maxsplit=1)
             self.cmdtag = (s1, int(rownum), int(oid))
         else:
             self.cmdtag = (self.cmdtag, )
@@ -471,7 +481,11 @@ class QueryProcesser(MsgProcesser):
             self.msgs_from_copy = []
         else:
             msg_list = self.cnn.read_msgs_until_avail()
-        ret = self._process_msg_list(msg_list)
+        while True:
+            ret = self._process_msg_list(msg_list)
+            if ret: # True or CopyResponse
+                break
+            msg_list = self.cnn.read_msgs_until_avail()
         if isinstance(ret, p.CopyResponse):
             return ret
         if self.ex:
@@ -480,6 +494,7 @@ class QueryProcesser(MsgProcesser):
             return self.qres_list[0]
         else:
             return self.qres_list
+    # 返回True/False或者CopyResponse
     def _process_msg_list(self, msg_list):
         got_ready = False
         for idx, m in enumerate(msg_list):
@@ -519,10 +534,26 @@ class QueryProcesser(MsgProcesser):
             else:
                 # 这里不直接抛出异常，需要处理到ReadyForQuery之后才能把它抛出。
                 self.ex = pgerror(m, self.UnknownMsgErr)
-        if got_ready:
-            return
-        msg_list = self.cnn.read_msgs_until_avail()
-        return self._process_msg_list(msg_list)
+        return got_ready
+class Query2Processer(QueryProcesser):
+    def __init__(self, cnn):
+        super().__init__(cnn)
+    def process(self, synced=False):
+        self.cnn.write_msgs_until_done()
+        msg_list = self.cnn.read_msgs()
+        ret = self._process_msg_list(msg_list)
+        if self.ex:
+            self._finish(synced)
+            raise self.ex
+        return ret
+    def _finish(self, synced):
+        if not synced:
+            self.cnn.sync()
+            self.cnn.write_msgs_until_done()
+        while True:
+            msg_list = self.cnn.read_msgs_until_avail()
+            if msg_list[-1].msg_type == p.MsgType.MT_ReadyForQuery:
+                break
 class CopyResponseProcesser(MsgProcesser):
     # msg_list[0] is CopyInResponse or CopyOutResponse msg
     def __init__(self, cnn, msg_list):
@@ -578,6 +609,7 @@ class CopyOutResponseProcesser(CopyResponseProcesser):
                     return
 # main
 if __name__ == '__main__':
+    #connbase.log_msg = True
     if len(sys.argv) > 3:
         print('usage: %s [be_addr [listen_addr]]' % sys.argv[0])
         sys.exit(1)
