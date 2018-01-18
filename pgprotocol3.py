@@ -179,14 +179,14 @@ def BE(cls):
 # 
 # FE msg
 # 
-# simple query
+# simple query。允许分号分隔的多条语句。
 # 如果query包含分号分隔的多条语句，那么会返回每条语句的结果消息直到出错的语句(出错语句后面的语句不会执行)，最后是一个ReadyForQuery消息。
 # 而且这多条语句是在一个事务里执行的。如果多条语句是用begin/end包起来的话也是一样的，除了有错误语句的时候，最后的ReadyForQuery的trans_status不一样，
 # 对于没有begin/end的多条语句，trans_status为TS_Idle，而有begin/end的话，trans_status为TS_Fail。
 class Query(Msg):
     _formats = '>x'
     _fields = 'query'
-# extended query。
+# extended query。不允许多条语句。
 # 一般顺序为: Parse->Bind->Describe->Execute->Close->Sync。
 # 如果想立刻收到消息的结果的话则需要后面发送Flush(Sync后面不需要Flush)，如果有错误则服务器端会立刻发回ErrorResponse(不需要Flush)。
 # 如果有错则服务器端会忽略后面的所有消息直到Sync，所以每个消息后面可以先检查是否收到ErrorResponse，如果没收到再发送后续的消息。

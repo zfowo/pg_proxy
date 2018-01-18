@@ -10,6 +10,7 @@ import getpass
 import netutils
 import pgprotocol3 as p
 import scram
+import pgtypes
 
 # 连接是非阻塞的，除了connect的时候。
 @netutils.pollize
@@ -224,17 +225,28 @@ class pgconn(beconn):
             self.params[bytes(m.name).decode('ascii')] = bytes(m.val).decode('ascii')
     # str <-> bytes
     def encode(self, data):
-        if type(data) is str:
-            data = data.encode(self.params['client_encoding'])
+        if data is not None and type(data) is not bytes:
+            data = str(data).encode(self.params['client_encoding'])
         return data
     def decode(self, data):
-        if type(data) is not str:
+        if data is not None and type(data) is not str:
             data = bytes(data).decode(self.params['client_encoding'])
         return data
-    # 执行查询，如果返回值是CopyResponse则需要调用process继续进行copy操作。
+    # 简单查询，如果返回值是CopyResponse则需要调用process继续进行copy操作。
     def query(self, sql):
         sql = self.encode(sql)
         return self.write_msg(p.Query(query=sql)).process()
+    # 扩展查询，如果返回值是CopyResponse则需要调用process继续进行copy操作。
+    # sql语句中的参数用$1..$n表示。
+    def query2(self, sql, args_list):
+        sql = self.encode(sql)
+        self.write_msgs((p.Parse.make(sql),))
+        for args in args_list:
+            x = (self.encode(arg) for arg in args)
+            self.write_msgs((p.Bind.make(x), p.Describe.portal(), p.Execute.make()))
+        self.write_msgs((p.Close.portal(), p.Sync()))
+        self.processer = QueryProcesser(self)
+        return self.processer.process()
     def copyin(self, sql, data_list):
         m = self.query(sql)
         if isinstance(m, p.CopyInResponse):
@@ -303,6 +315,7 @@ class pgtrans():
         else:
             self.cnn.query('abort')
 # 如果rowdesc!=None，则表明是有返回结果集的查询(比如select)，否则就是没有结果集的(比如insert/delete)。
+# 另外rowdesc中的列名可能是有同名的。
 class QueryResult():
     class rowtype():
         # r : row data
@@ -311,28 +324,32 @@ class QueryResult():
             self.r = r
             self.qres = qres
         def __iter__(self):
-            yield from self.r
+            for idx, c in enumerate(self.r):
+                yield self[idx]
         def __len__(self):
             return len(self.r)
         def __getitem__(self, idx):
             if type(idx) is str:
                 idx = self.qres.field_map[idx]
-            return self.r[idx]
+            field = self.qres.rowdesc[idx]
+            ti = self.qres.pgtypeinfo.get(field.typoid, (str, str, 'unknown'))
+            return ti[0](self.r[idx])
         def __getattr__(self, name):
             if name not in self.qres.field_map:
                 raise AttributeError('no attribute %s' % name)
             return self[name]
         def __repr__(self):
             ret = '('
-            for field in self.qres.rowdesc:
-                ret += '%s=%s, ' % (field.name, self[field.name])
+            for idx, field in enumerate(self.qres.rowdesc):
+                ret += '%s=%s, ' % (field.name, self[idx])
             ret = ret[:-2] + ')'
             return ret
     
-    def __init__(self, cmdtag, rowdesc, rows):
+    def __init__(self, cmdtag, rowdesc, rows, pgtypeinfo=pgtypes.pg_type_info_map):
         self.cmdtag = cmdtag
         self.rowdesc = rowdesc
         self.rows = rows
+        self.pgtypeinfo = pgtypeinfo
         self._parse_cmdtag()
         self._make_field_map()
     def _parse_cmdtag(self):
@@ -442,10 +459,10 @@ class QueryProcesser(MsgProcesser):
         super().__init__(cnn)
         self.msgs_from_copy = []
         self.ex = None
-        self.cmdtag = None
-        self.rowdesc = None
-        self.rows = None
-    # 返回(cmdtag, rowdesc, rows)，或者CopyResponse消息，或者抛出异常。
+        self.qres_list = []
+        self.cmdtag = self.rowdesc = self.rows = None
+    # 返回QueryResult或其列表(如果是多条语句)，或者CopyResponse消息，或者抛出异常。
+    # 如果rowdesc为None那么rows也为None。
     # 如果返回CopyResponse消息，那么需要继续调用cnn.processer.process来处理copy。
     # 最后再调用cnn.processer.process来获得copy命令的处理结果。
     def _process(self):
@@ -459,7 +476,10 @@ class QueryProcesser(MsgProcesser):
             return ret
         if self.ex:
             raise self.ex
-        return QueryResult(self.cmdtag, self.rowdesc, self.rows)
+        if len(self.qres_list) == 1:
+            return self.qres_list[0]
+        else:
+            return self.qres_list
     def _process_msg_list(self, msg_list):
         got_ready = False
         for idx, m in enumerate(msg_list):
@@ -474,6 +494,8 @@ class QueryProcesser(MsgProcesser):
                 self.rows.append(list(c if c is None else self.cnn.decode(c) for c in m))
             elif m.msg_type == p.MsgType.MT_CommandComplete:
                 self.cmdtag = self.cnn.decode(m.tag)
+                self.qres_list.append(QueryResult(self.cmdtag, self.rowdesc, self.rows))
+                self.cmdtag = self.rowdesc = self.rows = None
             elif m.msg_type == p.MsgType.MT_ReadyForQuery:
                 got_ready = True
                 break
@@ -485,6 +507,15 @@ class QueryProcesser(MsgProcesser):
             elif m.msg_type == p.MsgType.MT_CopyOutResponse:
                 self.cnn.processer = CopyOutResponseProcesser(self.cnn, msg_list[idx:])
                 return m
+            # 扩展查询相关的消息
+            elif m.msg_type == p.MsgType.MT_ParseComplete:
+                pass
+            elif m.msg_type == p.MsgType.MT_BindComplete:
+                pass
+            elif m.msg_type == p.MsgType.MT_NoData:
+                pass
+            elif m.msg_type == p.MsgType.MT_CloseComplete:
+                pass
             else:
                 # 这里不直接抛出异常，需要处理到ReadyForQuery之后才能把它抛出。
                 self.ex = pgerror(m, self.UnknownMsgErr)

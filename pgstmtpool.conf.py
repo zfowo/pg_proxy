@@ -24,7 +24,8 @@ all = {
     'master' : ('127.0.0.1', 5432), 
     'slaver' : [('127.0.0.1', 5433),], 
     # user_pwds包含用户密码，从库worker用这些密码连接到从库。如果用户的auth方法是md5则不需要指定，
-    # 如果auth方法是password/scram-sha256则必须指定密码，如果是trust则指定空串。
+    # 如果auth方法是password/scram-sha256则必须指定密码，如果是trust则可以指定任意值。
+    # 如果不指定也不是md5 auth，那么不会启动从库worker。
     'user_pwds' : {
         'user2' : '123456', 
     }, 

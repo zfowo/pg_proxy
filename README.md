@@ -25,14 +25,18 @@ pgstmtpool.py [args] 语句级别连接池
         'master' : (host, port)       主库地址。
         'slaver' : [(),...]           从库地址列表。同一个从库可以包含多次，也可以包含主库。
         'user_pwds' : {}              包含用户密码，从库worker用这些密码连接到从库。如果用户的auth方法是md5则不需要指定，
-                                      如果auth方法是password/scram-sha256则必须指定密码，如果是trust则指定空串。
+                                      如果auth方法是password/scram-sha-256则必须指定密码，如果是trust则指定空串。
                                       如果auth不是md5并且没有指定密码，那么不会启动从库worker。
 
-* 在pg_hba.conf中不要把连接池的host/ip配置成trust，因为当前端第一次连接时是由数据库端auth的，此时数据库端看到的是连接池的host/ip。
-admin_cnn参数中的用户需要是超级用户，需要指定密码，如果是md5 auth，密码可以是md5后的密码。
+* 在pg_hba.conf中不要把连接池的host/ip配置成trust，因为后端看到的host/ip是连接池的host/ip，而不是前端的。
+前端连接如果导致新的worker(由于当前worker数不够)，那么由数据库端对前端进行auth；否则就是连接池对前端进行auth。
+所以在pg_hba.conf中尽量把连接池和前端配置成一样。
+
+* admin_cnn参数中的用户需要是超级用户，需要指定密码，如果是md5 auth，密码可以是md5后的密码。
 
 * 前端不许使用事务语句(比如begin/end)，包含事务语句的查询都会被abort，除非整个语句序列用一个Query消息被一次完整执行。
-psycopg2缺省的autocommit是False，所以它会自动发送begin语句，必须把autocommit设为True才可以使用本连接池。
+psycopg2缺省的autocommit是False，所以它会自动发送begin语句，必须把autocommit设为True才可以使用本连接池。如果想让多条
+语句作为一个整体执行，可以把分号分隔的多条语句作为一个语句执行。
 
 * 前端在连接的时候会首先发送一个startup_msg消息，该消息包含database/user以及其他数据库参数，比如client_encoding/application_name，
 不支持SSL连接和复制连接。每个后端都有一个pool，pool包含worker，worker按startup_msg分组，来自前端的查询会根据startup_msg分发到相应
@@ -83,9 +87,36 @@ HA主库切换
 
 * 不要多个用户同时连接到pseudo执行修改操作。
 
+pgnet.pgconn
+===================
+* pgconn可以作为客户端库使用，不过不遵循python DB-API规范，接口如下：
+
+        pgconn(**kwargs)    创建一个连接，关键字参数包括：host/port/database/user/password/application_name/client_encoding，
+                            以及其他GUC参数，不支持unix domain socket。
+        query(sql)          执行sql语句，多条语句可以用分号分隔，返回QueryResult，如果是多条语句那么返回QueryResult列表。
+                            不要用该函数执行copy语句，用copyin/copyout函数。
+        query2(sql, args_list)  用扩展查询协议执行sql语句，sql不能包含多条语句，sql中的参数用$1..$n表示，args_list是参数值列表，
+                                是序列的序列，比如如果sql中有2个参数，那么args_list的元素必须是大小为2的序列。
+        copyin(sql, data_list)  执行copy...from stdin语句，data_list是行数据列表，缺省行数据中的列用\t分隔结尾是\n。
+        copyout(sql, outf)      执行copy...to stdout语句，如果给定outf函数，那么对每一行数据都回调用outf，如果outf=None，那么
+                                返回QueryResult和行数据列表。
+
+* QueryResult的rowdesc如果为None，就表示执行的是没有返回结果的语句，比如INSERT/DELETE。
+
+        cnn = pgnet.pgconn()
+        res = cnn.query('select * from t1')
+        for row in res:
+            print(list(row))
+        
+        cnn.query('insert into t1 values($1,$2)', ((i, i*i) for i in range(10)))
+        
+        _, rows = cnn.copyout('copy t1 to stdout')
+        for r in rows:
+            print(r)
+        
 
 <作废>pg_proxy.py [conf_file]
-=======================
+=============================
 * 配置文件conf_file是个python文件，里面有一个dict对象pg_proxy_conf，该字典包含下面这些项：
 
         'listen' : (host, port)                               指定监听的ip和端口。

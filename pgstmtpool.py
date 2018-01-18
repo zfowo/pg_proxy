@@ -102,7 +102,7 @@ class pgworker():
         while True:
             self.fe_fatal = None
             try:
-                # fecnn可以是前端连接对象，None，或者字符串
+                # fecnn可以是前端连接对象，None，或者命令名
                 fecnn, msg = self.msg_queue.get()
                 if fecnn is None: # 结束线程
                     return True
