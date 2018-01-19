@@ -116,7 +116,9 @@ pgnet.pgconn
         for row in res:
             print(list(row))
         
-        cnn.query('insert into t1 values($1,$2)', ((i, i*i) for i in range(10)))
+        cnn.query2('insert into t1 values($1,$2)', ((i, i*i) for i in range(1000)))
+        
+        cnn.copyin('copy t1 from stdin', ('%s\t%s\n' % (i, i*i) for i in range(1000)))
         
         _, rows = cnn.copyout('copy t1 to stdout')
         for r in rows:
