@@ -91,15 +91,23 @@ pgnet.pgconn
 ===================
 * pgconn可以作为客户端库使用，不过不遵循python DB-API规范，接口如下：
 
-        pgconn(**kwargs)    创建一个连接，关键字参数包括：host/port/database/user/password/application_name/client_encoding，
-                            以及其他GUC参数，不支持unix domain socket。
-        query(sql)          执行sql语句，多条语句可以用分号分隔，返回QueryResult，如果是多条语句那么返回QueryResult列表。
-                            不要用该函数执行copy语句，用copyin/copyout函数。
-        query2(sql, args_list)  用扩展查询协议执行sql语句，sql不能包含多条语句，sql中的参数用$1..$n表示，args_list是参数值列表，
-                                是序列的序列，比如如果sql中有2个参数，那么args_list的元素必须是大小为2的序列。
-        copyin(sql, data_list)  执行copy...from stdin语句，data_list是行数据列表，缺省行数据中的列用\t分隔结尾是\n。
-        copyout(sql, outf)      执行copy...to stdout语句，如果给定outf函数，那么对每一行数据都回调用outf，如果outf=None，那么
-                                返回QueryResult和行数据列表。
+        pgconn(**kwargs)
+          创建一个连接，关键字参数包括：host/port/database/user/password/application_name/client_encoding，
+          以及其他GUC参数，不支持unix domain socket。
+        query(sql)
+          执行sql语句，多条语句可以用分号分隔，返回QueryResult，如果是多条语句那么返回QueryResult列表。
+          不要用该函数执行copy语句，用copyin/copyout函数。
+        query2(sql, args_list, discard_qr=False)
+          用扩展查询协议执行sql语句，sql不能包含多条语句，sql中的参数用$1..$n表示，args_list是参数值列表，
+          是序列的序列，比如如果sql中有2个参数，那么args_list的元素必须是大小为2的序列。
+          如果不需要查询结果(比如INSERT/UPDATE/DELETE)，那么可以把discard_qr设为True，这样可以稍微提高性能。
+          不要用该函数执行copy语句，用copyin/copyout函数。
+        copyin(sql, data_list, batch=10)
+          执行copy...from stdin语句，data_list是行数据列表，缺省行数据中的列用\t分隔结尾是\n。
+          batch指定每次发送多少个消息，根据每行数据的大小设置相应的值。
+        copyout(sql, outf)
+          执行copy...to stdout语句，如果给定outf函数，那么对每一行数据都回调用outf，如果outf=None，那么
+          返回QueryResult和行数据列表。
 
 * QueryResult的rowdesc如果为None，就表示执行的是没有返回结果的语句，比如INSERT/DELETE。
 
@@ -113,6 +121,11 @@ pgnet.pgconn
         _, rows = cnn.copyout('copy t1 to stdout')
         for r in rows:
             print(r)
+        
+        with pgnet.pgtrans(cnn):
+            cnn.query('insert into t1 values(1, 1)')
+            ....
+            cnn.query('insert into t2 values(100, 100)')
         
 
 <作废>pg_proxy.py [conf_file]

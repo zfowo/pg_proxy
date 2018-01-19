@@ -8,6 +8,7 @@ import traceback
 import functools
 import getpass
 import netutils
+import miscutils
 import pgprotocol3 as p
 import scram
 import pgtypes
@@ -242,25 +243,30 @@ class pgconn(beconn):
         return self.write_msg(p.Query(query=sql)).process()
     # 扩展查询，如果返回值是CopyResponse则需要调用process继续进行copy操作。
     # sql语句中的参数用$1..$n表示。
+    # 当进行大量insert/update/delete的时候，可以把discard_qr设为True，这样就不会返回大量的QueryResult。
+    # 
     # 当args_list很大时，发送消息后必须检查是否可读，否则会发不了数据，因为服务器端也会不停的往客户端写消息，
     # 当服务器端写buffer满了之后就阻塞了，这样就读不了客户端发送的消息。造成死锁。
-    def query2(self, sql, args_list):
-        processer = Query2Processer(self)
+    def query2(self, sql, args_list, discard_qr=False):
+        processer = Query2Processer(self, discard_qr)
         sql = self.encode(sql)
         self.write_msgs((p.Parse.make(sql),))
         processer.process()
         for args in args_list:
             x = (self.encode(arg) for arg in args)
-            self.write_msgs((p.Bind.make(x), p.Describe.portal(), p.Execute.make()))
+            if discard_qr:
+                self.write_msgs((p.SimpleBind(x), p.Execute.Default))
+            else:
+                self.write_msgs((p.SimpleBind(x), p.Describe.DefaultPortal, p.Execute.Default))
             processer.process()
         self.write_msgs((p.Close.stmt(), p.Sync()))
         while not processer.process(synced=True):
             self.pollin()
         return processer.qres_list
-    def copyin(self, sql, data_list):
+    def copyin(self, sql, data_list, batch=10):
         m = self.query(sql)
         if isinstance(m, p.CopyInResponse):
-            self.processer.process(data_list)
+            self.processer.process(data_list, batch=batch)
             return self.processer.process()
         elif isinstance(m, p.CopyOutResponse):
             for r in self.processer.process_iter():
@@ -465,8 +471,9 @@ class AuthResponseProcesser(StartupMessageProcesser):
     UnknownMsgErr = 'unknown response msg for AuthResponse message'
 class QueryProcesser(MsgProcesser):
     UnknownMsgErr = 'unknown response msg for Query message'
-    def __init__(self, cnn):
+    def __init__(self, cnn, discard_qr=False):
         super().__init__(cnn)
+        self.discard_qr = discard_qr
         self.msgs_from_copy = []
         self.ex = None
         self.qres_list = []
@@ -509,7 +516,8 @@ class QueryProcesser(MsgProcesser):
                 self.rows.append(list(c if c is None else self.cnn.decode(c) for c in m))
             elif m.msg_type == p.MsgType.MT_CommandComplete:
                 self.cmdtag = self.cnn.decode(m.tag)
-                self.qres_list.append(QueryResult(self.cmdtag, self.rowdesc, self.rows))
+                if not self.discard_qr:
+                    self.qres_list.append(QueryResult(self.cmdtag, self.rowdesc, self.rows))
                 self.cmdtag = self.rowdesc = self.rows = None
             elif m.msg_type == p.MsgType.MT_ReadyForQuery:
                 got_ready = True
@@ -536,8 +544,8 @@ class QueryProcesser(MsgProcesser):
                 self.ex = pgerror(m, self.UnknownMsgErr)
         return got_ready
 class Query2Processer(QueryProcesser):
-    def __init__(self, cnn):
-        super().__init__(cnn)
+    def __init__(self, cnn, discard_qr=False):
+        super().__init__(cnn, discard_qr)
     def process(self, synced=False):
         self.cnn.write_msgs_until_done()
         msg_list = self.cnn.read_msgs()
@@ -569,23 +577,30 @@ class CopyResponseProcesser(MsgProcesser):
         return msg_list
 class CopyInResponseProcesser(CopyResponseProcesser):
     # 如果CopyIn成功则返回True，否则返回False。
-    def _process(self, data_list, abort=False):
+    # batch指定每次发送多少个CopyData消息。
+    def _process(self, data_list, abort=False, batch=10):
         if abort:
             self.cnn.write_msgs((p.CopyDone(),))
             return True
+        msgs = []
         for data in data_list:
             data = self.cnn.encode(data)
             m = p.CopyData(data=data)
-            self.cnn.write_msgs((m,))
+            msgs.append(m)
+            if len(msgs) < batch:
+                continue
+            self.cnn.write_msgs(msgs)
+            msgs = []
             msg_list = self._get_msg_list()
             for m in msg_list:
                 if m.msg_type in self.cnn.async_msgs:
                     self.cnn.got_async_msg(m)
-                else: # 异常消息(包括ErrorResponse)则退出CopyIn模式。
+                else: # 异常消息(包括ErrorResponse)则退出CopyIn模式。不需要发送CopyFail。
                     self.prev_processer.msgs_from_copy.append(m)
             if self.prev_processer.msgs_from_copy:
                 return False
-        self.cnn.write_msgs((p.CopyDone(),))
+        msgs.append(p.CopyDone())
+        self.cnn.write_msgs(msgs)
         return True
 class CopyOutResponseProcesser(CopyResponseProcesser):
     # 服务器端可能在返回部分结果后再发送ErrorResponse，所以必须查看QueryProcesser的结果看是否有错误。
@@ -609,18 +624,22 @@ class CopyOutResponseProcesser(CopyResponseProcesser):
                     return
 # main
 if __name__ == '__main__':
-    #connbase.log_msg = True
-    if len(sys.argv) > 3:
-        print('usage: %s [be_addr [listen_addr]]' % sys.argv[0])
+    if len(sys.argv) > 4:
+        print('usage: %s [be_addr=127.0.0.1:5432] [listen_addr=:9999] [log_msg=0]' % sys.argv[0])
         sys.exit(1)
+    xargs = miscutils.parse_args(sys.argv[1:])
     be_addr = ('127.0.0.1', 5432)
     listen_addr = ('0.0.0.0', 9999)
-    if len(sys.argv) >= 2:
-        host, port = sys.argv[1].split(':')
+    log_msg = 0
+    if xargs['be_addr']:
+        host, port = xargs['be_addr'][0].split(':')
         be_addr = (host, int(port))
-    if len(sys.argv) >= 3:
-        host, port = sys.argv[2].split(':')
+    if xargs['listen_addr']:
+        host, port = xargs['listen_addr'][0].split(':')
         listen_addr = (host, int(port))
+    if xargs['log_msg']:
+        log_msg = int(xargs['log_msg'][0])
+    connbase.log_msg = bool(log_msg)
     print(be_addr, listen_addr)
         
     listen_s = netutils.listener(listen_addr)

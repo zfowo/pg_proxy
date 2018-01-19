@@ -6,6 +6,8 @@
 # FE的第一个消息不包含type部分。
 # 传给Msg派生类的buf不包含开头的5个字节(或者4个字节)。
 # 
+# ** 所有消息类的对象在创建之后都不要修改已经赋值的属性 **
+# 
 # 现在对于不能识别的消息类型直接抛出异常，这样做可能不是很合适，因为pg新版本可能增加新的消息类型。
 # TODO: 有些消息类型的所有对象其实都是相同的，所以可以预先创建这些对象及其bytes。类似于NoneType类型只有None这一个对象。
 # 
@@ -157,10 +159,16 @@ class MsgMeta(struct_meta):
                 raise ValueError('unknown be msg type:[%s]' % msg_type)
 # 消息基类。
 class Msg(struct_base, metaclass=MsgMeta):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._cached_data = None
     def tobytes(self):
+        if self._cached_data:
+            return self._cached_data
         data = super().tobytes()
         header = self.msg_type + struct.pack('>i', len(data)+4)
-        return header + data
+        self._cached_data = header + data
+        return self._cached_data
     def __repr__(self):
         res = '<%s' % type(self).__name__
         for field in self._fields:
@@ -204,6 +212,7 @@ class Parse(Msg):
         return cls(stmt=stmt, query=query, param_cnt=len(param_oids), param_oids=param_oids)
 @mputils.SeqAccess(attname='params', f=lambda x:(None if x.sz < 0 else x.data))
 class Bind(Msg):
+    _check_assign = False
     _formats = '>x >x >h -0>h >24X >h -0>h'
     _fields = 'portal stmt fc_cnt fc_list params res_fc_cnt res_fc_list'
     # fc_list指定params中参数值的格式代码(fc)，0是文本格式1是二进制格式。如果为空则表示都是文本格式，
@@ -214,12 +223,22 @@ class Bind(Msg):
         params = List2Xval(params)
         return cls(portal=portal, stmt=stmt, fc_cnt=len(fc_list), fc_list=fc_list, 
                    params=params, res_fc_cnt=len(res_fc_list), res_fc_list=res_fc_list)
+# 当需要创建大量Bind消息然后发送出去的话，用该类可以提高性能。
+class SimpleBind():
+    def __init__(self, params):
+        xlist = (xval(b'', sz=-1) if v is None else v for v in params)
+        self.X = Xval(xlist, 2, 4)
+    def tobytes(self):
+        data = b'\x00\x00\x00\x00' + self.X.tobuf() + b'\x00\x00'
+        header = MsgType.MT_Bind + struct.pack('>i', len(data)+4)
+        return header + data
 class Execute(Msg):
     _formats = '>x >i'
     _fields = 'portal max_num'
     @classmethod
     def make(cls, portal=b'', max_num=0):
         return cls(portal=portal, max_num=max_num)
+Execute.Default = Execute.make()
 @mputils.Check(attname='obj_type', attvals=ObjType.v2smap)
 class DescribeClose(Msg):
     _formats = '>s >x'
@@ -233,6 +252,8 @@ class DescribeClose(Msg):
         return cls(obj_type=ObjType.OBJ_Portal, obj_name=name)
 class Describe(DescribeClose):
     pass
+Describe.DefaultStmt = Describe.stmt()
+Describe.DefaultPortal = Describe.portal()
 class Close(DescribeClose):
     pass
 class Sync(Msg):
@@ -348,6 +369,7 @@ class CommandComplete(Msg):
     _formats = '>x'
     _fields = 'tag'
 class CopyData(Msg):
+    _check_assign = False
     _formats = '>a'
     _fields = 'data'
 class CopyDone(Msg):
