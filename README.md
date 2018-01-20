@@ -108,6 +108,12 @@ pgnet.pgconn
         copyout(sql, outf)
           执行copy...to stdout语句，如果给定outf函数，那么对每一行数据都回调用outf，如果outf=None，那么
           返回QueryResult和行数据列表。
+        trans()
+          返回事务context manager。
+        quote_literal(v)
+          静态方法。对来历不明的外部串数据需要用该函数处理一下，以防止sql注入，或者用query2执行。
+        quote_ident(v)
+          静态方法。对来历不明的标识符名需要用该函数处理一下，以防止sql注入。注意大小写问题。
 
 * QueryResult的rowdesc如果为None，就表示执行的是没有返回结果的语句，比如INSERT/DELETE。
 
@@ -124,7 +130,7 @@ pgnet.pgconn
         for r in rows:
             print(r)
         
-        with pgnet.pgtrans(cnn):
+        with cnn.trans():
             cnn.query('insert into t1 values(1, 1)')
             ....
             cnn.query('insert into t2 values(100, 100)')

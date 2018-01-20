@@ -13,6 +13,29 @@ import pgprotocol3 as p
 import scram
 import pgtypes
 
+def quote_literal(v):
+    if v is None:
+        return 'NULL'
+    if type(v) is not str:
+        v = str(v)
+    if '\\' in v:
+        res = "E'"
+    else:
+        res = "'"
+    for c in v:
+        if c in ('\'', '\\'):
+            res += c
+        res += c
+    res += "'"
+    return res
+def quote_ident(v):
+    res = '"'
+    for c in v:
+        if c == '"':
+            res += c
+        res += c
+    res += '"'
+    return res
 # 连接是非阻塞的，除了connect的时候。
 @netutils.pollize
 class connbase():
@@ -241,7 +264,7 @@ class pgconn(beconn):
     def query(self, sql):
         sql = self.encode(sql)
         return self.write_msg(p.Query(query=sql)).process()
-    # 扩展查询，如果返回值是CopyResponse则需要调用process继续进行copy操作。
+    # 扩展查询，不支持copy语句。
     # sql语句中的参数用$1..$n表示。
     # 当进行大量insert/update/delete的时候，可以把discard_qr设为True，这样就不会返回大量的QueryResult。
     # 
@@ -262,7 +285,10 @@ class pgconn(beconn):
         self.write_msgs((p.Close.stmt(), p.Sync()))
         while not processer.process(synced=True):
             self.pollin()
-        return processer.qres_list
+        if len(processer.qres_list) == 1:
+            return processer.qres_list[0]
+        else:
+            return processer.qres_list
     def copyin(self, sql, data_list, batch=10):
         m = self.query(sql)
         if isinstance(m, p.CopyInResponse):
@@ -299,9 +325,17 @@ class pgconn(beconn):
             raise pgerror(None, 'sql(%s) is not copy out statement' % sql)
         else:
             raise pgerror(None, 'sql(%s) is not copy out statement' % sql)
+    def trans(self):
+        return pgtrans(self)
     # 获得auth成功后从服务器端返回给客户端的消息。从AuthenticationOk开始直到ReadyForQuery。
     def make_auth_ok_msgs(self):
         return p.make_auth_ok_msgs(self.params, self.be_keydata)
+    @staticmethod
+    def quote_literal(v):
+        return quote_literal(v)
+    @staticmethod
+    def quote_ident(v):
+        return quote_ident(v)
 # errmsg是ErrorResponse或其他不认识的消息。
 # pgerror表示连接还可以继续使用；而pgfatal表示发生的错误导致连接不可用。
 # pgfatal如果是由于socket读写失败导致的，则cnn设置为相应的连接对象。
@@ -322,8 +356,8 @@ class pgfatal(pgexception):
 class pgtrans():
     def __init__(self, cnn):
         self.cnn = cnn
-        self.cnn.query('begin')
     def __enter__(self):
+        self.cnn.query('begin')
         return self
     def __exit__(self, exc_type, exc_val, exc_tb):
         if exc_val is None:
