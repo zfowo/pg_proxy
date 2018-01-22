@@ -89,7 +89,10 @@ HA主库切换
 
 pgnet.pgconn
 ===================
-* pgconn可以作为客户端库使用，不过不遵循python DB-API规范，接口如下：
+* pgconn可以作为客户端库使用，不过不遵循python DB-API规范，如果出现错误会抛出异常pgfatal和pgerror，pgfatal表示连接已经不可用，
+  对于pgfatal，异常对象的errstr是错误串，errmsg是和异常相关的错误消息包；对于pgerror，errstr是错误串，errmsg是错误消息包ErrorResponse，
+  可以调用pgconn.errmsg(pgerror_ex)获得包含错误信息的map。errstr和errmsg可能其中一个为None，但不会两个都是None。
+  接口如下：
 
         pgconn(**kwargs)
           创建一个连接，关键字参数包括：host/port/database/user/password/application_name/client_encoding，
@@ -110,6 +113,8 @@ pgnet.pgconn
           返回QueryResult和行数据列表。
         trans()
           返回事务context manager。
+        errmsg(ex)
+          ex是pgerror对象，返回包含错误信息的map。
         quote_literal(v)
           静态方法。对来历不明的外部串数据需要用该函数处理一下，以防止sql注入，或者用query2执行。
         quote_ident(v)

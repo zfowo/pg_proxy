@@ -5,7 +5,7 @@
 # 
 import sys, os, socket, time
 import traceback
-import functools
+import functools, collections
 import getpass
 import netutils
 import miscutils
@@ -327,6 +327,10 @@ class pgconn(beconn):
             raise pgerror(None, 'sql(%s) is not copy out statement' % sql)
     def trans(self):
         return pgtrans(self)
+    def errmsg(self, pgerr_ex):
+        if pgerr_ex.errmsg is None:
+            return None
+        return collections.OrderedDict(pgerr_ex.errmsg.get(decode=self.decode))
     # 获得auth成功后从服务器端返回给客户端的消息。从AuthenticationOk开始直到ReadyForQuery。
     def make_auth_ok_msgs(self):
         return p.make_auth_ok_msgs(self.params, self.be_keydata)

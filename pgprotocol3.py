@@ -402,17 +402,22 @@ class EmptyQueryResponse(Msg):
 class ErrorNoticeResponse(Msg):
     _formats = '>X'
     _fields = 'field_list'
-    def get(self, fields):
+    def get(self, fields=(), decode=lambda x:x):
         res = []
         if type(fields) == bytes:
             fields = FieldType.ftstr2list(fields)
         if not (set(fields) <= FieldType.v2smap.keys()):
             raise ValueError('fields(%s) have unknown field type' % (fields,))
         for t, v in self:
-            if t not in fields:
+            if fields and t not in fields:
                 continue
-            res.append((FieldType.v2smap[t], v))
+            res.append((FieldType.v2smap[t], decode(v)))
         return res
+    def __repr__(self):
+        res = '<%s' % type(self).__name__
+        for t, v in self.get():
+            res += ' %s:%s' % (t, v)
+        return res + '>'
     # fields是(t,v)或者Field列表
     @classmethod
     def make(cls, *fields):
