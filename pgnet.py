@@ -252,13 +252,13 @@ class pgconn(beconn):
         ret = self.async_msgs[msgtype]
         self.async_msgs[msgtype] = []
         return ret
-    def parameter_status_as(self):
+    def parameter_status_am(self):
         msg_list = self._get_async_msg(p.MsgType.MT_ParameterStatus)
         return [(bytes(msg.name).decode('ascii'), bytes(msg.val).decode('ascii')) for msg in msg_list]
-    def notice_as(self):
+    def notice_am(self):
         msg_list = self._get_async_msg(p.MsgType.MT_NoticeResponse)
         return [collections.OrderedDict(msg.get(decode=self.decode)) for msg in msg_list]
-    def notification_as(self):
+    def notification_am(self):
         msg_list = self._get_async_msg(p.MsgType.MT_NotificationResponse)
         return [(msg.pid, self.decode(msg.channel), self.decode(msg.payload)) for msg in msg_list]
     def read_async_msgs(self, timeout=0):

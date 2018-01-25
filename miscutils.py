@@ -85,6 +85,31 @@ def mysplit(s, seps):
         return s
     res = s.split(seps[0])
     return [mysplit(x, seps[1:]) for x in res]
+# 固定大小的列表，老的数据将被丢弃。
+class SizedList():
+    def __init__(self, maxsz):
+        self.maxsz = maxsz
+        self.modsz = self.maxsz + 1
+        self.L = [None] * self.modsz
+        self.start = self.end = 0
+    def clear(self):
+        for idx, _ in enumerate(self.L):
+            self.L[idx] = None
+        self.start = self.end = 0
+    def append(self, v):
+        self.L[self.end] = v
+        self.end = (self.end + 1) % self.modsz
+        if self.end == self.start:
+            self.start = (self.start + 1) % self.modsz
+    def __iter__(self):
+        idx = self.start
+        while idx != self.end:
+            yield self.L[idx]
+            idx = (idx + 1) % self.modsz
+    def __len__(self):
+        if self.end >= self.start:
+            return self.end - self.start
+        return self.modsz + (self.end - self.start)
 # main
 if __name__ == '__main__':
     pass
