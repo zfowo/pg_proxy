@@ -140,6 +140,10 @@ pgnet.pgconn
             ....
             cnn.query('insert into t2 values(100, 100)')
         
+* 异步消息。异步消息有3种：ParameterStatus，NoticeResponse和NotificationResponse。在执行查询后可以调用parameter_status_as/notice_as/notification_as
+来获得相应的异步消息，需要注意的是在调用这些函数后异步消息就丢弃了。另外也可以调用read_async_msgs(timeout=0)来读取异步消息，其返回值表示读取到的
+异步消息个数，参数timeout是等待时间，如果为None或者小于0则一直等待直到有消息为止。
+
 
 <作废>pg_proxy.py [conf_file]
 =============================

@@ -78,7 +78,7 @@ class BeMsgType(metaclass=mputils.V2SMapMeta, skip=(b'',), strip=3):
     MT_RowDescription = b'T'       # RowDescription
     @classmethod
     def is_async_msg(cls, msgtype):
-        return msgtype in (cls.MT_NoticeResponse, cls.MT_NotificationResponse, cls.MT_ParameterDescription)
+        return msgtype in (cls.MT_NoticeResponse, cls.MT_NotificationResponse, cls.MT_ParameterStatus)
 class MsgType(FeMsgType, BeMsgType):
     pass
 
@@ -415,7 +415,7 @@ class ErrorNoticeResponse(Msg):
         return res
     def __repr__(self):
         res = '<%s' % type(self).__name__
-        for t, v in self.get():
+        for t, v in self:
             res += ' %s:%s' % (t, v)
         return res + '>'
     # fields是(t,v)或者Field列表

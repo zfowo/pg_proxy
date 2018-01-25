@@ -182,7 +182,7 @@ class pgconn(beconn):
         self.async_msgs = { 
             p.MsgType.MT_NoticeResponse :       [], 
             p.MsgType.MT_NotificationResponse : [], 
-            p.MsgType.MT_ParameterDescription : [], 
+            p.MsgType.MT_ParameterStatus : [], 
         }
         self.processer = None
         self.auth_ctx = AuthContext()
@@ -243,14 +243,33 @@ class pgconn(beconn):
         ret = super().write_msg(msg)
         self.processer = get_processer_for_msg(msg)(self)
         return self.processer
-    def flush(self):
-        return self.write_msgs((p.Flush(),))
-    def sync(self):
-        return self.write_msgs((p.Sync(),))
-    def got_async_msg(self, m):
+    # async msg
+    def _got_async_msg(self, m):
         self.async_msgs[m.msg_type].append(m)
         if m.msg_type == p.MsgType.MT_ParameterStatus:
             self.params[bytes(m.name).decode('ascii')] = bytes(m.val).decode('ascii')
+    def _get_async_msg(self, msgtype):
+        ret = self.async_msgs[msgtype]
+        self.async_msgs[msgtype] = []
+        return ret
+    def parameter_status_as(self):
+        msg_list = self._get_async_msg(p.MsgType.MT_ParameterStatus)
+        return [(bytes(msg.name).decode('ascii'), bytes(msg.val).decode('ascii')) for msg in msg_list]
+    def notice_as(self):
+        msg_list = self._get_async_msg(p.MsgType.MT_NoticeResponse)
+        return [collections.OrderedDict(msg.get(decode=self.decode)) for msg in msg_list]
+    def notification_as(self):
+        msg_list = self._get_async_msg(p.MsgType.MT_NotificationResponse)
+        return [(msg.pid, self.decode(msg.channel), self.decode(msg.payload)) for msg in msg_list]
+    def read_async_msgs(self, timeout=0):
+        if self.processer:
+            raise SystemError('BUG:you should not call read_async_msgs while processer(%s) is not None' % self.processer)
+        if not self.pollin(timeout):
+            return 0
+        msg_list = self.read_msgs()
+        for m in msg_list:
+            self._got_async_msg(m)
+        return len(msg_list)
     # str <-> bytes
     def encode(self, data):
         if data is not None and type(data) is not bytes:
@@ -496,7 +515,7 @@ class StartupMessageProcesser(MsgProcesser):
                 got_ready = True
                 break
             elif m.msg_type == p.MsgType.MT_NoticeResponse:
-                self.cnn.got_async_msg(m)
+                self.cnn._got_async_msg(m)
             elif m.msg_type == p.MsgType.MT_ErrorResponse:
                 raise pgfatal(m)
             else:
@@ -561,7 +580,7 @@ class QueryProcesser(MsgProcesser):
                 got_ready = True
                 break
             elif m.msg_type in self.cnn.async_msgs: # async msg
-                self.cnn.got_async_msg(m)
+                self.cnn._got_async_msg(m)
             elif m.msg_type == p.MsgType.MT_CopyInResponse:
                 self.cnn.processer = CopyInResponseProcesser(self.cnn, msg_list[idx:])
                 return m
@@ -594,8 +613,7 @@ class Query2Processer(QueryProcesser):
         return ret
     def _finish(self, synced):
         if not synced:
-            self.cnn.sync()
-            self.cnn.write_msgs_until_done()
+            self.cnn.write_msgs_until_done((p.Sync(),))
         while True:
             msg_list = self.cnn.read_msgs_until_avail()
             if msg_list[-1].msg_type == p.MsgType.MT_ReadyForQuery:
@@ -632,7 +650,7 @@ class CopyInResponseProcesser(CopyResponseProcesser):
             msg_list = self._get_msg_list()
             for m in msg_list:
                 if m.msg_type in self.cnn.async_msgs:
-                    self.cnn.got_async_msg(m)
+                    self.cnn._got_async_msg(m)
                 else: # 异常消息(包括ErrorResponse)则退出CopyIn模式。不需要发送CopyFail。
                     self.prev_processer.msgs_from_copy.append(m)
             if self.prev_processer.msgs_from_copy:
@@ -656,7 +674,7 @@ class CopyOutResponseProcesser(CopyResponseProcesser):
                     self.prev_processer.msgs_from_copy.extend(msg_list[idx+1:])
                     return
                 elif m.msg_type in self.cnn.async_msgs:
-                    self.cnn.got_async_msg(m)
+                    self.cnn._got_async_msg(m)
                 else: # 异常消息(包括ErrorResponse)则退出CopyOut模式。
                     self.prev_processer.msgs_from_copy.extend(msg_list[idx:])
                     return
