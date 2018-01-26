@@ -4,7 +4,7 @@
 # 语句级别的连接池。
 # 使用有名字的Parse/Bind的时候，如果前端在发送Close之前就异常断开了，那么语句/portal不会被close。
 # 
-import sys, os, time
+import sys, os, time, datetime
 import collections, socket, copy
 import threading, queue
 import pgnet
@@ -21,18 +21,24 @@ class fepgfatal(Exception):
         self.last_fe_msg = None
 @mputils.generateid
 class pgworker():
-    def __init__(self, pool_id, be_addr, max_msg=0):
+    def __init__(self, pool_id, be_addr, idle_timeout, max_msg=0):
         self.pool_id = pool_id
         self.be_addr = be_addr
+        self.idle_timeout = idle_timeout
         self.msg_queue = queue.Queue(maxsize=max_msg)
         self.becnn = None
         self.startup_msg = None
         self.auth_ok_msgs = []
         self.num_processed_msg = 0
+        self.start_time = time.time()
+        # 下面这些只能在主线程里修改
+        self.last_put_time = None
+        self.last_processed_msg_info = (None, None, None) # (put_time, get_time, done_time)
     def __repr__(self):
         return '<pgworker pool_id=%s id=%s be_addr=%s>' % (self.pool_id, self.id, self.be_addr)
     def put(self, fecnn, msg):
-        self.msg_queue.put_nowait((fecnn, msg))
+        self.last_put_time = time.time()
+        self.msg_queue.put_nowait((fecnn, msg, self.last_put_time))
     def _process_auth(self, fecnn, main_queue):
         self.startup_msg = fecnn.startup_msg
         try:
@@ -79,8 +85,8 @@ class pgworker():
             self.becnn.close()
             return
         
-        normal_exit = self._process_loop(main_queue)
-        main_queue.put(('exit', None if normal_exit else self))
+        exit_cause = self._process_loop(main_queue)
+        main_queue.put(('exit', exit_cause, self))
     # 不需要前端参与auth。关键字参数指定auth参数，关键字参数不能指定host/port。
     def run2(self, kwargs, main_queue):
         kwargs['host'] = self.be_addr[0]
@@ -95,27 +101,33 @@ class pgworker():
         self.auth_ok_msgs = self.becnn.make_auth_ok_msgs()
         main_queue.put(('ok', None, self))
         
-        normal_exit = self._process_loop(main_queue)
-        main_queue.put(('exit', None if normal_exit else self))
+        exit_cause = self._process_loop(main_queue)
+        main_queue.put(('exit', exit_cause, self))
     def _process_loop(self, main_queue):
         # process Query msg from queue
         while True:
             self.fe_fatal = None
             try:
                 # fecnn可以是前端连接对象，None，或者命令名
-                fecnn, msg = self.msg_queue.get()
+                try:
+                    fecnn, msg, put_time = self.msg_queue.get(timeout=self.idle_timeout)
+                    get_time = time.time()
+                except queue.Empty:
+                    self.becnn.close()
+                    return 'idle'
                 if fecnn is None: # 结束线程
-                    return True
+                    return 'normal'
                 elif type(fecnn) is str:
                     self._process_cmd(fecnn, msg)
                 else:
                     self._process_msg(fecnn, msg)
+                done_time = time.time()
             except pgnet.pgfatal as ex:
                 fecnn.close()
                 print('<thread %d> BE%s: %s' % (self.id, self.becnn.getpeername(), ex))
-                return False
+                return 'befatal'
             else:
-                main_queue.put(('done', fecnn))
+                main_queue.put(('done', fecnn, self, (put_time, get_time-put_time, done_time-get_time)))
     def _process_cmd(self, cmd, args):
         pass
     def _process_msg(self, fecnn, msg):
@@ -230,8 +242,9 @@ class pgworker():
 # pgworker中记录所属的pool的id。
 @mputils.generateid
 class pgworkerpool():
-    def __init__(self, be_addr):
+    def __init__(self, be_addr, idle_timeout):
         self.be_addr = be_addr
+        self.idle_timeout = idle_timeout
         self.workers_map = collections.defaultdict(list) # startup_msg -> worker_list
         self.nextidx_map = collections.defaultdict(int)  # startup_msg -> nextidx for accessing worker_list
         self.id2worker_map = {}
@@ -249,13 +262,13 @@ class pgworkerpool():
             self.admin_cnn = None
     # 启动一个新的worker，此时该worker还没有添加到pool里面，
     # 主线程从main_queue接收到auth成功之后才会把worker加到pool。
-    def new_worker(self, fecnn, main_queue):
-        w = pgworker(self.id, self.be_addr)
+    def new_worker(self, fecnn, main_queue,):
+        w = pgworker(self.id, self.be_addr, self.idle_timeout)
         thr = threading.Thread(target=w.run, args=(fecnn, main_queue))
         thr.start()
         return w
     def new_worker2(self, kwargs, main_queue):
-        w = pgworker(self.id, self.be_addr)
+        w = pgworker(self.id, self.be_addr, self.idle_timeout)
         thr = threading.Thread(target=w.run2, args=(kwargs, main_queue))
         thr.start()
         return w
@@ -319,16 +332,17 @@ class pgworkerpool():
     def dispatch_worker_remain_msg(self, poll, w):
         while True:
             try:
-                cnn, msg = w.msg_queue.get_nowait()
+                cnn, msg, put_time = w.msg_queue.get_nowait()
             except queue.Empty:
                 break
             self.dispatch_fe_msg(poll, cnn, msg)
 # 管理一组pool组成的列表
 class pgworkerpools():
-    def __init__(self, *be_addr_list):
+    def __init__(self, *be_addr_list, idle_timeout):
+        self.idle_timeout = idle_timeout
         self.pools = []
         for be_addr in be_addr_list:
-            self.pools.append(pgworkerpool(be_addr))
+            self.pools.append(pgworkerpool(be_addr, idle_timeout=self.idle_timeout))
         self.pools_map = collections.defaultdict(list) # startup_msg -> pool_list
         self.nextidx_map = collections.defaultdict(int) # startup_msg -> nextidx for pool_list
     def close_admin_cnn(self):
@@ -345,7 +359,7 @@ class pgworkerpools():
     def __iter__(self):
         yield from self.pools
     def add(self, be_addr):
-        pool = pgworkerpool(be_addr)
+        pool = pgworkerpool(be_addr, idle_timeout=self.idle_timeout)
         self.pools.append(pool)
         return pool
     # id参数可以是整数也可以是pool对象
@@ -412,16 +426,11 @@ class pgworkerpools():
     def new_some_workers_if(self, cnt, startup_msg, kwargs, main_queue):
         if type(startup_msg) is not p.StartupMessage:
             startup_msg = startup_msg.startup_msg
-        pool_list = self.pools_map[startup_msg]
-        for pool in pool_list:
-            avail_cnt = pool.count(startup_msg)
-            if avail_cnt >= cnt:
-                continue
-            self.new_worker2(pool, cnt-avail_cnt, kwargs, main_queue)
         for pool in self:
-            if pool in pool_list:
+            avail_worker_cnt = pool.count(startup_msg)
+            if avail_worker_cnt >= cnt:
                 continue
-            self.new_worker2(pool, cnt, kwargs, main_queue)
+            self.new_worker2(pool, cnt-avail_worker_cnt, kwargs, main_queue)
     def add_worker(self, w):
         pool = self.get(w.pool_id)
         if not pool:
@@ -455,7 +464,7 @@ class pgworkerpools():
     def dispatch_worker_remain_msg(self, poll, w):
         while True:
             try:
-                cnn, msg = w.msg_queue.get_nowait()
+                cnn, msg, put_time = w.msg_queue.get_nowait()
             except queue.Empty:
                 break
             self.dispatch_fe_msg(poll, cnn, msg)
@@ -614,8 +623,15 @@ class pooldb(pseudodb.pseudodb):
         for pool in pool_list:
             for m, w in pool:
                 startup_msg = self._make_startup_msg(m)
-                rows.append((pool.id, w.id, w.be_addr, m['database'], m['user'], startup_msg, w.num_processed_msg))
-        return self._write_result(['pool_id', 'worker_id', 'addr', 'database', 'user', 'startup_msg', 'processed'], rows)
+                f = datetime.datetime.fromtimestamp
+                last_put_time = f(w.last_put_time).time() if w.last_put_time is not None else 'None'
+                t1, t2, t3 = w.last_processed_msg_info
+                if t1 is None:
+                    lastinfo = '(None, None, None)'
+                else:
+                    lastinfo = '(%s, %g, %g)' % (f(t1).time(), t2*1000, t3*1000)
+                rows.append((pool.id, w.id, w.be_addr, m['database'], m['user'], startup_msg, w.num_processed_msg, last_put_time, lastinfo))
+        return self._write_result(['pool_id', 'worker_id', 'addr', 'database', 'user', 'startup_msg', 'processed', 'lastputtime', 'lastinfo'], rows)
     @cmd.sub_cmd(name='add')
     def cmd(self, args):
         if not args:
@@ -906,21 +922,25 @@ def process_main_queue():
                     master_fail_history.append(time.time())
                 else:
                     master_fail_history.clear()
-        elif x[0] == 'exit': # ('exit', worker)
-            # x[1]==None表示worker已经被删除，正常退出，此时队列里应该没有东西
-            # x[1]!=None表示后端出问题了
-            w = x[1]
-            if w is None:
+        elif x[0] == 'exit': # ('exit', exit_cause, worker)
+            # exit_cause='normal' 表示worker已经被删除，正常退出，此时队列里应该没有东西
+            # exit_cause='idle' 表示空闲超时，此时队列里可能有东西
+            # exit_cause='befatal' 表示后端导致pgfatal异常，此时队列里可能有东西
+            exit_cause, w = x[1], x[2]
+            if exit_cause == 'normal':
                 continue
             if w.pool_id == master_pool.id:
-                master_fail_history.append(time.time())
+                if exit_cause == 'befatal':
+                    master_fail_history.append(time.time())
                 master_pool.remove(w)
                 master_pool.dispatch_worker_remain_msg(poll, w)
             else:
                 slaver_pools.remove_worker(w)
                 slaver_pools.dispatch_worker_remain_msg(poll, w)
-        elif x[0] == 'done': # ('done', fecnn)
+        elif x[0] == 'done': # ('done', fecnn, self, (put_time, get_time, done_time))
             poll.register(x[1], poll.POLLIN)
+            w = x[2]
+            w.last_processed_msg_info = x[3]
         else:
             raise RuntimeError('unknow x from main_queue:%s' % (x,))
 def process_ha():
@@ -999,8 +1019,9 @@ if __name__ == '__main__':
     g_conf['hba'] = hba
     g_conf['shadows'] = shadows
     
-    master_pool = pgworkerpool(g_conf['master'])
-    slaver_pools = pgworkerpools(*g_conf.get('slaver',()))
+    idle_timeout = g_conf.get('idle_timeout', 600)
+    master_pool = pgworkerpool(g_conf['master'], idle_timeout=idle_timeout)
+    slaver_pools = pgworkerpools(*g_conf.get('slaver',()), idle_timeout=idle_timeout)
     fepool = feconnpool()
     main_queue = queue.Queue()
     slaver_workers_to_start = {} # 记录下需要启动的slaver workers
