@@ -80,6 +80,8 @@ HA主库切换
         .) fe count             显示前端连接数
         .) pool [list]          列出所有pool
         .) pool show            列出指定pool中的worker，多个pool id用逗号分割，如果没指定pool id则列出所有pool的worker。
+                                lastputtime是最后一个消息包分发给worker的时间，lastinfo是worker已经处理的最后一个消息包的信息，
+                                包括：消息包的分发时间，获得消息包花费的时间(单位毫秒)，以及处理完消息包花费的时间(单位毫秒)。
         .) pool add             增加一个pool，参数是host:port，只能增加从库pool。
         .) pool remove          删除一个pool，参数是pool id，只能删除从库pool。
         .) pool remove_worker   删除一个worker，参数是pool id和worker id。可以删除主库或者从库pool中的worker。

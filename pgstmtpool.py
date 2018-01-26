@@ -946,11 +946,11 @@ def process_main_queue():
 def process_ha():
     global master_pool
     if not g_conf.get('enable_ha', False):
-        if len(master_fail_history) >= g_conf.get('', 10):
+        if len(master_fail_history) >= g_conf.get('ha_after_fail_cnt', 10):
             print('master_fail_history: %s' % master_fail_history)
             master_fail_history.clear()
         return
-    if len(master_fail_history) < g_conf.get('', 10):
+    if len(master_fail_history) < g_conf.get('ha_after_fail_cnt', 10):
         return
     print('start process_ha')
     master_fail_history.clear()
