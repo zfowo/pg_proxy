@@ -170,6 +170,16 @@ class beconn(connbase):
         return super().write_msgs(msg_list, fe=False)
     def write_msg(self, msg):
         return self.write_msgs((msg,))
+    # 只有在登陆成功后，并且分析消息包设置self.params和self.be_keydata之后才可以调用。
+    # str <-> bytes
+    def encode(self, data):
+        if data is not None and type(data) is not bytes:
+            data = str(data).encode(self.params['client_encoding'])
+        return data
+    def decode(self, data):
+        if data is not None and type(data) is not str:
+            data = bytes(data).decode(self.params['client_encoding'])
+        return data
 # 有效的关键字参数包括: host, port, database, user, password, 以及其他GUC参数，比如client_encoding, application_name。
 # 关于password需要特别注意的是: 
 #   在用create role/alter role设置用户密码的时候，服务器端处理的密码是数据库编码格式的。而在建立连接的时候无法知道
@@ -270,15 +280,6 @@ class pgconn(beconn):
         for m in msg_list:
             self._got_async_msg(m)
         return len(msg_list)
-    # str <-> bytes
-    def encode(self, data):
-        if data is not None and type(data) is not bytes:
-            data = str(data).encode(self.params['client_encoding'])
-        return data
-    def decode(self, data):
-        if data is not None and type(data) is not str:
-            data = bytes(data).decode(self.params['client_encoding'])
-        return data
     # 简单查询，如果返回值是CopyResponse则需要调用process继续进行copy操作。
     def query(self, sql):
         sql = self.encode(sql)

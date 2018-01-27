@@ -40,7 +40,7 @@ psycopg2缺省的autocommit是False，所以它会自动发送begin语句，必须把autocommit设为
 
 * 前端在连接的时候会首先发送一个startup_msg消息，该消息包含database/user以及其他数据库参数，比如client_encoding/application_name，
 不支持SSL连接和复制连接。每个后端都有一个pool，pool包含worker，worker按startup_msg分组，来自前端的查询会根据startup_msg分发到相应
-的worker，缺省所有查询都分发到主库worker，如果查询语句的开头是/\*s\*/并且存在从库worker的话则分发到从库worker。
+的worker，缺省所有查询都分发到主库worker，如果查询语句的开头的注释中包含s(比如/\*s\*/)，并且存在从库worker的话则分发到从库worker。
 
 * pgstmtpool.py使用线程来实现，由于python的GIL限制，导致只能使用一个CPU，所以worker数目可能会受限制。可以启动多个pgstmtpool.py，把其中
 一个的enable_ha设为True(称为主连接池)，其他都设为False(称为从连接池)，然后前面放一个haproxy。主连接池在切换完成后把切换结果发给从连接池。
@@ -49,6 +49,12 @@ psycopg2缺省的autocommit是False，所以它会自动发送begin语句，必须把autocommit设为
         .) python pgstmtpool.py
         .) python pgstmtpool.py mode=slaver listen=:7778 mpool=127.0.0.1:7777
         .) python pgstmtpool.py mode=slaver listen=:7779 mpool=127.0.0.1:7777
+
+查询缓存
+========
+* 可以在select语句开头的注释里设置缓存，格式为/\*c:nnn t:t1,t2,...,tn\*/，其中c指定缓存的期限单位是秒，t指定表名列表，这些表和缓存相关，
+如果没指定c但指定了t，那么会清空表相关的所有缓存。比如：/\*c:60 t:t1\*/select count(*) from t1会缓存60秒，但是/\*t:t1\*/delete from t1 
+where id=10会清空缓存。缓存只对执行成功的SELECT有效。
 
 HA主库切换
 ==========
@@ -76,6 +82,7 @@ HA主库切换
         .) register             内部用命令
         .) change_master        内部用命令
         .) shutdown             shutdown连接池
+        .) cache                显示SELECT缓存
         .) fe [list]            列出所有前端连接
         .) fe count             显示前端连接数
         .) pool [list]          列出所有pool

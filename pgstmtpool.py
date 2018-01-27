@@ -15,16 +15,91 @@ import pseudodb
 import mputils
 import miscutils
 
+# tables列表里的表名以及sql都是str，不是bytes
+CacheItem = collections.namedtuple('CacheItem', 'timeout tables msg_list')
+class QueryCache():
+    def __init__(self):
+        self.cached_items = {} # sql -> CacheItem
+        self.t2sqls_map = collections.defaultdict(set) # table -> sql set
+        self.lock = threading.Lock()
+    @mputils.AutoLock
+    def __len__(self):
+        return len(self.cached_items)
+    @mputils.AutoLock
+    def get_all(self):
+        return list(self.cached_items.items())
+    # 获得cache item，如果没有或者已经超时则返回None
+    @mputils.AutoLock
+    def get(self, sql, decode):
+        sql = decode(sql)
+        item = self.cached_items.get(sql, None)
+        if item is None:
+            return None
+        if item.timeout > time.time():
+            return item
+        # timeout
+        self.cached_items.pop(sql)
+        for t in item.tables:
+            self.t2sqls_map[t].remove(sql)
+        return None
+    @mputils.AutoLock
+    def put(self, msg, msg_list, decode):
+        sql = decode(msg.query)
+        timeout = msg._comment_info.cache + time.time()
+        tables = tuple(decode(t) for t in msg._comment_info.tables)
+        self.cached_items[sql] = CacheItem(timeout, tables, msg_list)
+        for t in tables:
+            self.t2sqls_map[t].add(sql)
+    @mputils.AutoLock
+    def clear(self, tables, decode):
+        tables = tuple(decode(t) for t in tables)
+        cleared_items = []
+        for t in tables:
+            sqls = self.t2sqls_map.pop(t, None)
+            if not sqls:
+                continue
+            for sql in sqls:
+                cleared_items.append((sql, self.cached_items.pop(sql)))
+        for sql, item in cleared_items:
+            for t in item.tables:
+                try:
+                    self.t2sqls_map[t].remove(sql)
+                except KeyError:
+                    pass
+# comment格式: /*s c:nnn t:t1,t2,...,tn*/。其中s表示从从库读；c指定cache期限；t指定相关的表，表之间用逗号分隔。
+# tables是表名列表，表名是bytes；sql也是bytes
+# cache指定保存多少秒，必须指定；tables是本查询相关的表列表；
+# 当没有指定cache但是指定了tables的时候，会清空这些表相关的cache。
+QueryCommentInfo = collections.namedtuple('QueryInfo', 'master cache tables')
+def parse_query_comment(msg):
+    master, cache, tables = True, None, ()
+    sql = bytes(msg.query).strip().strip(b';')
+    if msg.msg_type != p.MsgType.MT_Query or sql[:2] != b'/*':
+        msg._comment_info = QueryCommentInfo(master, cache, tables)
+        return msg
+    idx = sql.index(b'*/')
+    info, sql = sql[2:idx], sql[idx+2:].strip()
+    item_list = info.split()
+    for item in item_list:
+        if item[:2] == b's':
+            master = False
+        elif item[:2] == b'c:':
+            cache = int(item[2:])
+        elif item[:2] == b't:':
+            tables = tuple(t for t in item[2:].split(b',') if t)
+    msg = p.Query(query=sql)
+    msg._comment_info = QueryCommentInfo(master, cache, tables)
+    return msg
+
 class fepgfatal(Exception):
     def __init__(self, fatal_ex, last_fe_msg=None):
         self.fatal_ex = fatal_ex
         self.last_fe_msg = None
 @mputils.generateid
 class pgworker():
-    def __init__(self, pool_id, be_addr, idle_timeout, max_msg=0):
+    def __init__(self, pool_id, be_addr, max_msg=0):
         self.pool_id = pool_id
         self.be_addr = be_addr
-        self.idle_timeout = idle_timeout
         self.msg_queue = queue.Queue(maxsize=max_msg)
         self.becnn = None
         self.startup_msg = None
@@ -34,6 +109,11 @@ class pgworker():
         # 下面这些只能在主线程里修改
         self.last_put_time = None
         self.last_processed_msg_info = (None, None, None) # (put_time, get_time, done_time)
+        # 当worker启动成功时在主线程里设置
+        self.query_cache = None 
+        self.idle_timeout = 600
+        # 最后处理的消息
+        self.last_msg = None
     def __repr__(self):
         return '<pgworker pool_id=%s id=%s be_addr=%s>' % (self.pool_id, self.id, self.be_addr)
     def put(self, fecnn, msg):
@@ -110,7 +190,7 @@ class pgworker():
             try:
                 # fecnn可以是前端连接对象，None，或者命令名
                 try:
-                    fecnn, msg, put_time = self.msg_queue.get(timeout=self.idle_timeout)
+                    fecnn, self.last_msg, put_time = self.msg_queue.get(timeout=self.idle_timeout)
                     get_time = time.time()
                 except queue.Empty:
                     self.becnn.close()
@@ -118,9 +198,9 @@ class pgworker():
                 if fecnn is None: # 结束线程
                     return 'normal'
                 elif type(fecnn) is str:
-                    self._process_cmd(fecnn, msg)
+                    self._process_cmd(fecnn, self.last_msg)
                 else:
-                    self._process_msg(fecnn, msg)
+                    self._process_msg(fecnn, self.last_msg)
                 done_time = time.time()
             except pgnet.pgfatal as ex:
                 fecnn.close()
@@ -142,6 +222,9 @@ class pgworker():
             self._process_unsupported(fecnn,  msg)
         self.num_processed_msg += 1
     def _process_query(self, fecnn, femsg):
+        if femsg._comment_info.cache:
+            if self._process_from_cache(fecnn, femsg):
+                return
         self.becnn.write_msgs_until_done((femsg,))
         m = self.becnn.read_msgs_until_avail(max_msg=1)[0]
         if m.msg_type == p.MsgType.MT_CopyInResponse:
@@ -152,12 +235,40 @@ class pgworker():
             raise pgnet.pgfatal(None, 'do not support CopyBothResponse')
         else:
             self._process_query2(fecnn, m)
+    def _process_from_cache(self, fecnn, femsg):
+        sql = bytes(femsg.query)
+        citem = self.query_cache.get(sql, self.becnn.decode)
+        if not citem:
+            return False
+        self._write_msgs_to_fe(fecnn, citem.msg_list)
+        return True
     def _process_query2(self, fecnn, bemsg):
+        cache = self.last_msg._comment_info.cache
+        be_msg_list = []
         msg_list = [bemsg] + self.becnn.read_msgs()
+        if cache:
+            be_msg_list.extend(msg_list)
         while True:
             if self._write_msgs_to_fe(fecnn, msg_list)[1]:
                 break
             msg_list = self.becnn.read_msgs_until_avail()
+            if cache:
+                be_msg_list.extend(msg_list)
+        if cache:
+            self._put_to_cache(be_msg_list)
+        else:
+            self.query_cache.clear(self.last_msg._comment_info.tables, self.becnn.decode)
+    def _put_to_cache(self, be_msg_list):
+        if be_msg_list[-1].trans_status != p.TransStatus.TS_Idle:
+            return
+        for m in reversed(be_msg_list):
+            if m.msg_type == p.MsgType.MT_ErrorResponse:
+                return
+            if m.msg_type == p.MsgType.MT_CommandComplete:
+                if not bytes(m.tag).startswith(b'SELECT'):
+                    return
+        be_msg_list = [m for m in be_msg_list if not p.MsgType.is_async_msg(m.msg_type)]
+        self.query_cache.put(self.last_msg, be_msg_list, self.becnn.decode)
     def _process_copyout(self, fecnn, bemsg):
         msg_list = [bemsg] + self.becnn.read_msgs()
         while True:
@@ -234,17 +345,16 @@ class pgworker():
             msg_list.insert(-1, p.ErrorResponse.make_error(b'do not supoort transaction statement. abort it'))
             return
         # TS_Fail
-        for i in range(len(msg_list)-1, -1, -1):
-            if msg_list[i].msg_type == p.MsgType.MT_ErrorResponse:
+        for m in reversed(msg_list):
+            if m.msg_type == p.MsgType.MT_ErrorResponse:
                 msg_list[i] = p.ErrorResponse.make_error(b'do not supoort transaction statement. abort it')
                 return
 # 记录某个be_addr的所有pgworker，按startup_msg分组。
 # pgworker中记录所属的pool的id。
 @mputils.generateid
 class pgworkerpool():
-    def __init__(self, be_addr, idle_timeout):
+    def __init__(self, be_addr):
         self.be_addr = be_addr
-        self.idle_timeout = idle_timeout
         self.workers_map = collections.defaultdict(list) # startup_msg -> worker_list
         self.nextidx_map = collections.defaultdict(int)  # startup_msg -> nextidx for accessing worker_list
         self.id2worker_map = {}
@@ -263,12 +373,12 @@ class pgworkerpool():
     # 启动一个新的worker，此时该worker还没有添加到pool里面，
     # 主线程从main_queue接收到auth成功之后才会把worker加到pool。
     def new_worker(self, fecnn, main_queue,):
-        w = pgworker(self.id, self.be_addr, self.idle_timeout)
+        w = pgworker(self.id, self.be_addr)
         thr = threading.Thread(target=w.run, args=(fecnn, main_queue))
         thr.start()
         return w
     def new_worker2(self, kwargs, main_queue):
-        w = pgworker(self.id, self.be_addr, self.idle_timeout)
+        w = pgworker(self.id, self.be_addr)
         thr = threading.Thread(target=w.run2, args=(kwargs, main_queue))
         thr.start()
         return w
@@ -338,11 +448,10 @@ class pgworkerpool():
             self.dispatch_fe_msg(poll, cnn, msg)
 # 管理一组pool组成的列表
 class pgworkerpools():
-    def __init__(self, *be_addr_list, idle_timeout):
-        self.idle_timeout = idle_timeout
+    def __init__(self, *be_addr_list):
         self.pools = []
         for be_addr in be_addr_list:
-            self.pools.append(pgworkerpool(be_addr, idle_timeout=self.idle_timeout))
+            self.pools.append(pgworkerpool(be_addr))
         self.pools_map = collections.defaultdict(list) # startup_msg -> pool_list
         self.nextidx_map = collections.defaultdict(int) # startup_msg -> nextidx for pool_list
     def close_admin_cnn(self):
@@ -359,7 +468,7 @@ class pgworkerpools():
     def __iter__(self):
         yield from self.pools
     def add(self, be_addr):
-        pool = pgworkerpool(be_addr, idle_timeout=self.idle_timeout)
+        pool = pgworkerpool(be_addr)
         self.pools.append(pool)
         return pool
     # id参数可以是整数也可以是pool对象
@@ -497,13 +606,14 @@ class feconnpool():
                 yield msg, cnn
 # pseudo db
 class pooldb(pseudodb.pseudodb):
-    def __init__(self, cnn, g_conf, master_pool, slaver_pools, fepool, main_queue):
+    def __init__(self, cnn, g_conf):
         super().__init__(cnn)
         self.g_conf = g_conf
-        self.master_pool = master_pool
-        self.slaver_pools = slaver_pools
-        self.fepool = fepool
-        self.main_queue = main_queue
+        self.master_pool = g_conf['global']['master_pool']
+        self.slaver_pools = g_conf['global']['slaver_pools']
+        self.fepool = g_conf['global']['fepool']
+        self.main_queue = g_conf['global']['main_queue']
+        self.query_cache_map = g_conf['global']['query_cache_map']
     def process_query(self, query):
         query = query.strip().strip(';')
         cmd, *args = query.split(maxsplit=1)
@@ -518,7 +628,7 @@ class pooldb(pseudodb.pseudodb):
     def cmd(self, args, sub_cmd_map):
         if not args:
             return self._write_result(['log_msg'], [(pgnet.connbase.log_msg,)])
-        v = args[0].lower() in ('on', 1, 'true', 't')
+        v = args[0].lower() in ('on', '1', 'true', 't')
         pgnet.connbase.log_msg = v
         return self._write_result(['log_msg'], [(pgnet.connbase.log_msg,)])
     # register
@@ -573,6 +683,16 @@ class pooldb(pseudodb.pseudodb):
         print('shutdown...')
         # sys.exit(1) will waiting threads to exit
         os._exit(1)
+    # cache
+    @mputils.mycmd('cache', cmd_map)
+    def cmd(self, args, sub_cmd_map):
+        rows = []
+        for m, qc in self.query_cache_map.items():
+            startup_msg = self._make_startup_msg(m)
+            for sql, citem in qc.get_all():
+                timeout = datetime.datetime.fromtimestamp(citem.timeout).time()
+                rows.append((m['database'], m['user'], startup_msg, sql, timeout, citem.tables, len(citem.msg_list)))
+        return self._write_result(['database', 'user', 'startup_msg', 'sql', 'timeout', 'tables', 'msg_list'], rows)
     # 有子命令的通用入口
     def _common_with_sub_cmd(self, args, sub_cmd_map, default_sub_cmd='list'):
         if not args:
@@ -737,7 +857,7 @@ class pgmiscworker():
 def add_pwd_md5_if(cnn_param):
     if 'password' in cnn_param:
         return
-    pwd = get_pwd_md5(g_conf['shadows'], cnn_param['user'])
+    pwd = get_pwd_md5(g_conf['global']['shadows'], cnn_param['user'])
     if pwd:
         cnn_param['password'] = pwd
 # 获得pg_shadow中的md5密码，如果不是md5则返回None
@@ -752,7 +872,7 @@ def get_slaver_cnn_param(startup_msg):
     username = startup_msg['user'].decode('utf8')
     pwd = g_conf.get('user_pwds', {}).get(username, None)
     if pwd is None:
-        pwd = get_pwd_md5(g_conf['shadows'], username)
+        pwd = get_pwd_md5(g_conf['global']['shadows'], username)
     if pwd is None:
         return None
     param = copy.copy(startup_msg.get_params())
@@ -902,6 +1022,8 @@ def process_main_queue():
                 poll.register(x[1], poll.POLLIN)
                 fepool.add(x[1])
             w = x[2]
+            w.idle_timeout = g_conf.get('idle_timeout', 600)
+            w.query_cache = query_cache_map[w.startup_msg]
             if w.pool_id == master_pool.id:
                 master_fail_history.clear()
                 master_pool.add(w)
@@ -1007,25 +1129,24 @@ def process_args():
     return g_conf
 if __name__ == '__main__':
     g_conf = process_args()
+    g_conf['global'] = {}
     print('mode:%s  listen:%s  mpool:%s' % (g_conf['mode'], g_conf['listen'], g_conf['mpool']))
     
     cnn_param = copy.copy(g_conf['admin_cnn'])
     cnn_param.update(host=g_conf['master'][0], port=g_conf['master'][1])
     admin_cnn = pgnet.pgconn(**cnn_param)
     check_largeobject(admin_cnn, g_conf.get('lo_oid', 9999))
-    hba = pghba.pghba.from_database(admin_cnn)
-    shadows = pghba.pgshadow.from_database(admin_cnn)
+    g_conf['global']['hba'] = hba = pghba.pghba.from_database(admin_cnn)
+    g_conf['global']['shadows'] = shadows = pghba.pgshadow.from_database(admin_cnn)
     admin_cnn.close()
-    g_conf['hba'] = hba
-    g_conf['shadows'] = shadows
     
-    idle_timeout = g_conf.get('idle_timeout', 600)
-    master_pool = pgworkerpool(g_conf['master'], idle_timeout=idle_timeout)
-    slaver_pools = pgworkerpools(*g_conf.get('slaver',()), idle_timeout=idle_timeout)
-    fepool = feconnpool()
-    main_queue = queue.Queue()
+    g_conf['global']['master_pool'] = master_pool = pgworkerpool(g_conf['master'])
+    g_conf['global']['slaver_pools'] = slaver_pools = pgworkerpools(*g_conf.get('slaver',()))
+    g_conf['global']['fepool'] = fepool = feconnpool()
+    g_conf['global']['main_queue'] = main_queue = queue.Queue()
     slaver_workers_to_start = {} # 记录下需要启动的slaver workers
     master_fail_history = [] # 后端连续出问题的时间记录，如果有连接成功则清空
+    g_conf['global']['query_cache_map'] = query_cache_map = collections.defaultdict(QueryCache) # startup_msg -> QueryCache
     
     misc_worker = pgmiscworker.start()
     
@@ -1072,7 +1193,7 @@ if __name__ == '__main__':
                             continue
                     # 由连接池进行auth
                     auth_ok_msgs = pooldb.auth_ok_msgs if is_pseudo else master_pool.get(m)[0].auth_ok_msgs
-                    cnn = pooldb(fobj.cnn, g_conf, master_pool, slaver_pools, fepool, main_queue) if is_pseudo else fobj.cnn
+                    cnn = pooldb(fobj.cnn, g_conf) if is_pseudo else fobj.cnn
                     auth = pghba.get_auth(hba, shadows, cnn, m, auth_ok_msgs)
                     if auth.handle_event(poll, event):
                         if not isinstance(auth.cnn, pseudodb.pseudodb):
@@ -1092,7 +1213,13 @@ if __name__ == '__main__':
                         continue
                     m = m[0]
                     poll.unregister(fobj) # 主线程停止检测，把控制权交给worker
-                    if not can_send_to_slaver(fobj, m):
+                    try:
+                        m = parse_query_comment(m)
+                    except Exception as ex:
+                        errmsg = p.ErrorResponse.make_error(str(ex).encode('utf8'))
+                        fobj.write_msgs_until_done((errmsg, p.ReadyForQuery.Idle))
+                        continue
+                    if m._comment_info.master:
                         master_pool.dispatch_fe_msg(poll, fobj, m)
                         continue
                     if slaver_pools.has_worker(fobj):

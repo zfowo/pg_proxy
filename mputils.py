@@ -139,6 +139,13 @@ class mycmd():
         func.__qualname__ = func.__qualname__.replace(oldname, func.__name__)
         self.cmd_map[self.name][1][name] = func
         return self
+# 对函数自动加/解锁
+def AutoLock(f):
+    @functools.wraps(f)
+    def wrapper(self, *args, **kwargs):
+        with self.lock:
+            return f(self, *args, **kwargs)
+    return wrapper
 # main
 if __name__ == '__main__':
     class A:
