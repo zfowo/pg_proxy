@@ -120,14 +120,8 @@ class pgworker():
         self.last_put_time = time.time()
         self.msg_queue.put_nowait((fecnn, msg, self.last_put_time))
     def _process_auth(self, fecnn, main_queue):
-        self.startup_msg = fecnn.startup_msg
-        try:
-            self.becnn = pgnet.beconn(self.be_addr)
-        except pgnet.pgfatal as ex:
-            print('<thread %d> %s' % (self.id, ex))
-            main_queue.put(('fail', fecnn, self, True))
-            return False
-        self.becnn.startup_msg = self.startup_msg
+        self.becnn = pgnet.beconn(self.be_addr)
+        self.becnn.startup_msg = self.startup_msg = fecnn.startup_msg
         self.becnn.write_msgs_until_done((fecnn.startup_msg,))
         while True:
             msg_list = self.becnn.read_msgs_until_avail()
@@ -156,9 +150,8 @@ class pgworker():
             if not self._process_auth(fecnn, main_queue):
                 return
         except pgnet.pgfatal as ex:
-            err = '<thread %d> %s(ex.cnn:%s) fe:%s be:%s' % (self.id, ex, ex.cnn, fecnn.getpeername(), self.becnn.getpeername())
-            print(err)
-            if ex.cnn is self.becnn:
+            print('<worker %d>: %s (ex.cnn:%s fe:%s be:%s)' % (self.id, ex, ex.cnn, fecnn, self.becnn))
+            if self.becnn is None or ex.cnn is self.becnn:
                 main_queue.put(('fail', fecnn, self, True))
             else:
                 main_queue.put(('fail', fecnn, self, False))
@@ -174,7 +167,7 @@ class pgworker():
         try:
             self.becnn = pgnet.pgconn(**kwargs)
         except pgnet.pgfatal as ex:
-            print('<thread %d> %s' % ex)
+            print('<worker %d>: %s' % ex)
             main_queue.put(('fail', None, self, True if ex.cnn else False))
             return
         self.startup_msg = self.becnn.startup_msg
@@ -204,7 +197,7 @@ class pgworker():
                 done_time = time.time()
             except pgnet.pgfatal as ex:
                 fecnn.close()
-                print('<thread %d> BE%s: %s' % (self.id, self.becnn.getpeername(), ex))
+                print('<worker %d>: BE%s: %s' % (self.id, self.becnn.getpeername(), ex))
                 return 'befatal'
             else:
                 main_queue.put(('done', fecnn, self, (put_time, get_time-put_time, done_time-get_time)))
@@ -212,7 +205,7 @@ class pgworker():
         pass
     def _process_msg(self, fecnn, msg):
         if msg.msg_type == p.MsgType.MT_Terminate:
-            print('<trhead %d> recved Terminate from %s' % (self.id, fecnn.getpeername()))
+            print('<worker %d>: recved Terminate from %s' % (self.id, fecnn.getpeername()))
             self.num_processed_msg -= 1
         elif msg.msg_type == p.MsgType.MT_Query:
             self._process_query(fecnn, msg)
@@ -1173,8 +1166,7 @@ if __name__ == '__main__':
                         fobj.close()
                         continue
                     if m.code == p.PG_SSLREQUEST_CODE:
-                        fobj.cnn.send_buf = b'N'
-                        fobj.write_msgs_until_done()
+                        fobj.write_no_ssl()
                         poll.register(fobj, poll.POLLIN)
                         continue
                     if m.code != p.PG_PROTO_VERSION3_NUM or 'replication' in m.get_params():

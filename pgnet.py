@@ -134,6 +134,10 @@ class feconn(connbase):
             return self.startup_msg
         else:
             return None
+    # 当接收到SSLRequest的时候，调用该函数告诉客户端不支持SSL。
+    def write_no_ssl(self):
+        self.send_buf = b'N'
+        self.write_msgs_until_done()
     def read_msgs(self, max_msg=0, stop=None):
         return super().read_msgs(max_msg, stop, fe=True)
     def write_msgs(self, msg_list=()):
@@ -713,8 +717,7 @@ if __name__ == '__main__':
                         time.sleep(0.001)
                         continue
                     if m.code == p.PG_SSLREQUEST_CODE:
-                        fe_c.send_buf = b'N'
-                        fe_c.write_msgs_until_done()
+                        fe_c.write_no_ssl()
                         continue
                     be_c.write_msgs_until_done([m])
                     break
