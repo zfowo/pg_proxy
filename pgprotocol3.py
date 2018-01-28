@@ -194,6 +194,9 @@ def BE(cls):
 class Query(Msg):
     _formats = '>x'
     _fields = 'query'
+    @classmethod
+    def make(cls, sql):
+        return cls(query=sql)
 # extended query。不允许多条语句。
 # 一般顺序为: Parse->Bind->Describe->Execute->Close->Sync。
 # 如果想立刻收到消息的结果的话则需要后面发送Flush(Sync后面不需要Flush)，如果有错误则服务器端会立刻发回ErrorResponse(不需要Flush)。

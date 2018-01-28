@@ -96,7 +96,7 @@ class fepgfatal(Exception):
         self.fatal_ex = fatal_ex
         self.last_fe_msg = None
 @mputils.generateid
-class pgworker():
+class pgstmtworker():
     def __init__(self, pool_id, be_addr, max_msg=0):
         self.pool_id = pool_id
         self.be_addr = be_addr
@@ -115,7 +115,7 @@ class pgworker():
         # 最后处理的消息
         self.last_msg = None
     def __repr__(self):
-        return '<pgworker pool_id=%s id=%s be_addr=%s>' % (self.pool_id, self.id, self.be_addr)
+        return '<pgstmtworker pool_id=%s id=%s be_addr=%s>' % (self.pool_id, self.id, self.be_addr)
     def put(self, fecnn, msg):
         self.last_put_time = time.time()
         self.msg_queue.put_nowait((fecnn, msg, self.last_put_time))
@@ -167,7 +167,7 @@ class pgworker():
         try:
             self.becnn = pgnet.pgconn(**kwargs)
         except pgnet.pgfatal as ex:
-            print('<worker %d>: %s' % ex)
+            print('<worker %d>: %s' % (self.id, ex))
             main_queue.put(('fail', None, self, True if ex.cnn else False))
             return
         self.startup_msg = self.becnn.startup_msg
@@ -345,7 +345,7 @@ class pgworker():
 # 记录某个be_addr的所有pgworker，按startup_msg分组。
 # pgworker中记录所属的pool的id。
 @mputils.generateid
-class pgworkerpool():
+class pgstmtworkerpool():
     def __init__(self, be_addr):
         self.be_addr = be_addr
         self.workers_map = collections.defaultdict(list) # startup_msg -> worker_list
@@ -366,12 +366,12 @@ class pgworkerpool():
     # 启动一个新的worker，此时该worker还没有添加到pool里面，
     # 主线程从main_queue接收到auth成功之后才会把worker加到pool。
     def new_worker(self, fecnn, main_queue,):
-        w = pgworker(self.id, self.be_addr)
+        w = pgstmtworker(self.id, self.be_addr)
         thr = threading.Thread(target=w.run, args=(fecnn, main_queue))
         thr.start()
         return w
     def new_worker2(self, kwargs, main_queue):
-        w = pgworker(self.id, self.be_addr)
+        w = pgstmtworker(self.id, self.be_addr)
         thr = threading.Thread(target=w.run2, args=(kwargs, main_queue))
         thr.start()
         return w
@@ -440,11 +440,11 @@ class pgworkerpool():
                 break
             self.dispatch_fe_msg(poll, cnn, msg)
 # 管理一组pool组成的列表
-class pgworkerpools():
+class pgstmtworkerpools():
     def __init__(self, *be_addr_list):
         self.pools = []
         for be_addr in be_addr_list:
-            self.pools.append(pgworkerpool(be_addr))
+            self.pools.append(pgstmtworkerpool(be_addr))
         self.pools_map = collections.defaultdict(list) # startup_msg -> pool_list
         self.nextidx_map = collections.defaultdict(int) # startup_msg -> nextidx for pool_list
     def close_admin_cnn(self):
@@ -461,7 +461,7 @@ class pgworkerpools():
     def __iter__(self):
         yield from self.pools
     def add(self, be_addr):
-        pool = pgworkerpool(be_addr)
+        pool = pgstmtworkerpool(be_addr)
         self.pools.append(pool)
         return pool
     # id参数可以是整数也可以是pool对象
@@ -1133,8 +1133,8 @@ if __name__ == '__main__':
     g_conf['global']['shadows'] = shadows = pghba.pgshadow.from_database(admin_cnn)
     admin_cnn.close()
     
-    g_conf['global']['master_pool'] = master_pool = pgworkerpool(g_conf['master'])
-    g_conf['global']['slaver_pools'] = slaver_pools = pgworkerpools(*g_conf.get('slaver',()))
+    g_conf['global']['master_pool'] = master_pool = pgstmtworkerpool(g_conf['master'])
+    g_conf['global']['slaver_pools'] = slaver_pools = pgstmtworkerpools(*g_conf.get('slaver',()))
     g_conf['global']['fepool'] = fepool = feconnpool()
     g_conf['global']['main_queue'] = main_queue = queue.Queue()
     slaver_workers_to_start = {} # 记录下需要启动的slaver workers

@@ -87,12 +87,12 @@ import subprocess
 
 with open('postmaster.opts', 'rt') as f:
   data_in = f.read()
-  data_in = data_in.strip(' \t\r\n')
+  data_in = data_in.strip()
 
-x_list = data_in.split(maxsplit=3)
-if len(x_list) < 3:
+x_list = data_in.split(maxsplit=1)
+if len(x_list) < 2:
   plpy.error('postmaster.opts error: %s' % (data_in, ))
-pg_ctl_cmd = '%s/pg_ctl restart %s %s -m fast>z_restart_pg.log 2>&1 &' % (os.path.dirname(x_list[0]), x_list[1], x_list[2])
+pg_ctl_cmd = '%s/pg_ctl restart %s -m fast>z_restart_pg.log 2>&1 &' % (os.path.dirname(x_list[0]), x_list[1])
 plpy.notice(pg_ctl_cmd)
 
 pid = os.fork()
