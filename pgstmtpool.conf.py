@@ -21,7 +21,7 @@ all = {
     # worker_min_cnt中第idx个值表示当有idx+1个前端连接时需要的worker数，worker_per_fe_cnt表示每多少个前端连接需要一个后端连接。
     'worker_min_cnt' : [1]*2 + [2]*4 + [3]*4, 
     'worker_per_fe_cnt' : 10, 
-    'idle_timeout' : 60*5, 
+    'idle_timeout' : 60*60*24, 
     'master' : ('127.0.0.1', 5432), 
     'slaver' : [('127.0.0.1', 5433),], 
     # user_pwds包含用户密码，从库worker用这些密码连接到从库。如果用户的auth方法是md5则不需要指定，

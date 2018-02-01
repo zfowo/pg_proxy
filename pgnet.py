@@ -264,6 +264,9 @@ class pgconn(beconn):
         self.async_msgs[m.msg_type].append(m)
         if m.msg_type == p.MsgType.MT_ParameterStatus:
             self.params[bytes(m.name).decode('ascii')] = bytes(m.val).decode('ascii')
+    def clear_async_msgs(self):
+        for k in list(self.async_msgs):
+            self.async_msgs[k] = []
     def _get_async_msg(self, msgtype):
         ret = self.async_msgs[msgtype]
         self.async_msgs[msgtype] = []

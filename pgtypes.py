@@ -9,6 +9,7 @@ import datetime
 import json
 import functools
 import collections
+import re
 
 def null(f):
     def wrapper(p1, *args, **kwargs):
@@ -17,6 +18,12 @@ def null(f):
         return f(p1, *args, **kwargs)
     return wrapper
 # XXX_in函数把串转换为python类型的对象；而XXX_out把python类型的对象转换为串。
+@null
+def general_in(s, fin=str):
+    return fin(s)
+@null
+def general_out(obj, fout=str):
+    return fout(obj)
 @null
 def bytea_in(s):
     if s[:2] != r'\x':
@@ -103,21 +110,22 @@ def range_out(r, fout=str, delim=','):
         res += '%s)' % fout(r[1])
     return res
 # 如果某些in/out函数需要用到pgconn的一些信息的话，可以在构造pgconn的时候deepcopy这个map，然后修改。
+fp = functools.partial
 pg_type_info_map = {
     #typoid : (typin, typout, typname)
-    16 : (bool, str, 'bool'), # bool
-    21 : (int, str, 'int2'),  # int2
-    23 : (int, str, 'int4'),  # int4
-    20 : (int, str, 'int8'),  # int8
-    700 : (float, str, 'float4'), # float4
-    701 : (float, str, 'float8'), # float8
-    1700 : (decimal.Decimal, str, 'numeric'), # numeric
-    18 : (str, str, 'char'),      # char whose length is 1
-    1042 : (str, str, 'bpchar'),  # bpchar
-    1043 : (str, str, 'varchar'), # varchar
-    25 : (str, str, 'text'),      # text
+    16 : (fp(general_in, fin=bool), general_out, 'bool'), # bool
+    21 : (fp(general_in, fin=int), general_out, 'int2'),  # int2
+    23 : (fp(general_in, fin=int), general_out, 'int4'),  # int4
+    20 : (fp(general_in, fin=int), general_out, 'int8'),  # int8
+    26 : (fp(general_in, fin=int), general_out, 'oid'), # oid
+    700 : (fp(general_in, fin=float), general_out, 'float4'), # float4
+    701 : (fp(general_in, fin=float), general_out, 'float8'), # float8
+    1700 : (fp(general_in, fin=decimal.Decimal), general_out, 'numeric'), # numeric
+    18 : (general_in, general_out, 'char'),      # char whose length is 1
+    1042 : (general_in, general_out, 'bpchar'),  # bpchar
+    1043 : (general_in, general_out, 'varchar'), # varchar
+    25 : (general_in, general_out, 'text'),      # text
     17 : (bytea_in, bytea_out, 'bytea'), # bytea
-    26 : (int, str, 'oid'), # oid
     1082 : (date_in, date_out, 'date'), # date
     1083 : (time_in, time_out, 'time'), # time
     1114 : (timestamp_in, timestamp_out, 'timestamp'), # timestamp
@@ -127,12 +135,12 @@ pg_type_info_map = {
     114 : (json_in, json_out, 'json'),   # json
     3802 : (json_in, json_out, 'jsonb'), # jsonb
     # range type
-    3904 : (functools.partial(range_in, fin=int), range_out), # int4range
-    3926 : (functools.partial(range_in, fin=int), range_out), # int8range
-    3906 : (functools.partial(range_in, fin=decimal.Decimal), range_out), # numrange
-    3912 : (functools.partial(range_in, fin=date_in), functools.partial(range_out, fout=date_out)), # daterange
-    3908 : (functools.partial(range_in, fin=timestamp_in), functools.partial(range_out, fout=timestamp_out)), # tsrange
-    3910 : (functools.partial(range_in, fin=timestamptz_in), functools.partial(range_out, fout=timestamptz_out)), # tstzrange
+    3904 : (fp(range_in, fin=int), range_out), # int4range
+    3926 : (fp(range_in, fin=int), range_out), # int8range
+    3906 : (fp(range_in, fin=decimal.Decimal), range_out), # numrange
+    3912 : (fp(range_in, fin=date_in), fp(range_out, fout=date_out)), # daterange
+    3908 : (fp(range_in, fin=timestamp_in), fp(range_out, fout=timestamp_out)), # tsrange
+    3910 : (fp(range_in, fin=timestamptz_in), fp(range_out, fout=timestamptz_out)), # tstzrange
 }
 pg_arrtype_info_map = {
     # typoid : (typelem_oid, typelem_name, typdelim)
@@ -143,7 +151,11 @@ def _init_arrtype_info():
         if len(x) != 4:
             raise RuntimeError('wrong arrtype info:%s' % item)
         pg_arrtype_info_map[int(x[0])] = (int(x[1]), x[2], x[3])
-sql_get_arrtype = r"select t1.oid::text, t1.typelem, t1.typelem::regtype, t1.typdelim from pg_type t1 join pg_type t2 on t1.typelem=t2.oid where t1.typelem <> 0 and t1.typname like '\_%' and t2.typtype in ('b','r')"
+sql_get_arrtype = r"""
+    select t1.oid, t1.typelem, t1.typelem::regtype, t1.typdelim 
+    from pg_type t1 join pg_type t2 on t1.typelem=t2.oid 
+    where t1.typelem <> 0 and t1.typname like '\_%' and t2.typtype in ('b','r')
+"""
 _arrtype_list = r"""
     143|142|xml|,
     199|114|json|,
@@ -220,8 +232,55 @@ _init_arrtype_info()
 def parse(v, typoid):
     if typoid in pg_arrtype_info_map:
         ti = pg_arrtype_info_map[typoid]
-        return _parse_array(v, ti[0], t[2])
-    ti = pg_type_info_map.get(typoid, (str, str, 'unknown'))
+        return _parse_array(v, ti[0], ti[2])
+    ti = pg_type_info_map.get(typoid, (general_in, general_out, 'unknown'))
     return ti[0](v)
 def _parse_array(v, typelem_oid, typdelim):
-    return v
+    ti = pg_type_info_map.get(typelem_oid, (general_in, general_out, 'unknown'))
+    return array_split(v, ti[0], typdelim)
+# 分析数组
+def escape_array_item(s, delim=','):
+    pattern = r'[{} "\\' + delim + r']'
+    if not re.search(pattern, s):
+        return s
+    s = '"' + s + '"'
+    return s.replace('\\', r'\\').replace('"', r'\"')
+def unescape_array_item(s):
+    if s[0] != '"':
+        return s
+    s = s[1:-1]
+    if s == 'NULL':
+        return None
+    return s.replace(r'\\', '\\').replace(r'\"', '"')
+def array_split(s, fin=str, delim=','):
+    if s[0] != '{':
+        return fin(unescape_array_item(s))
+    s = s[1:-1]
+    if not s:
+        return []
+    res = []
+    sidx = idx = 0
+    level = 0
+    quote_open = False
+    while idx < len(s):
+        c = s[idx]
+        if c == '{':
+            if not quote_open:
+                level += 1
+        elif c == '}':
+            if not quote_open:
+                level -= 1
+        elif c == '"':
+            quote_open = not quote_open
+        elif c == '\\':
+            idx += 1
+        elif c == delim:
+            if not quote_open and level <= 0:
+                res.append(array_split(s[sidx:idx], fin, delim))
+                sidx = idx + 1
+        idx += 1
+    res.append(array_split(s[sidx:idx], fin, delim))
+    return res
+# main
+if __name__ == '__main__':
+    pass

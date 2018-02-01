@@ -22,6 +22,7 @@ pgstmtpool.py [args] 语句级别连接池
         'trigger_file' : 'trigger'    从库的recovery.conf配置的触发promote的文件名。
         'worker_min_cnt' : []         用于指定当有n个前端连接时需要的后端worker数。第idx个值表示当有idx+1个前端连接时需要的worker数。
         'worker_per_fe_cnt' : 10      当前端数超过worker_min_cnt的大小时，指定每多少个前端连接需要一个后端连接。
+        'idle_timeout' : 60*60*24     当worker空闲时间超过该值时结束worker。
         'master' : (host, port)       主库地址。
         'slaver' : [(),...]           从库地址列表。同一个从库可以包含多次，也可以包含主库。
         'user_pwds' : {}              包含用户密码，从库worker用这些密码连接到从库。如果用户的auth方法是md5则不需要指定，
@@ -118,7 +119,7 @@ pgnet.pgconn
           执行copy...from stdin语句，data_list是行数据列表，缺省行数据中的列用\t分隔结尾是\n。
           batch指定每次发送多少个消息，根据每行数据的大小设置相应的值。
         copyout(sql, outf)
-          执行copy...to stdout语句，如果给定outf函数，那么对每一行数据都回调用outf，如果outf=None，那么
+          执行copy...to stdout语句，如果给定outf函数，那么对每一行数据都会调用outf，如果outf=None，那么
           返回QueryResult和行数据列表。
         trans()
           返回事务context manager。
@@ -149,7 +150,11 @@ pgnet.pgconn
             ....
             cnn.query('insert into t2 values(100, 100)')
         
-* 异步消息。异步消息有3种：ParameterStatus，NoticeResponse和NotificationResponse。在执行查询后可以调用parameter_status_am/notice_am/notification_am
-来获得相应的异步消息，需要注意的是在调用这些函数后异步消息就丢弃了。另外也可以调用read_async_msgs(timeout=0)来读取异步消息，其返回值表示读取到的
-异步消息个数，参数timeout是等待时间，如果为None或者小于0则一直等待直到有消息为止。
+* 异步消息。异步消息有3种：ParameterStatus，NoticeResponse和NotificationResponse。
+
+        .) 在执行查询后，必须调用parameter_status_am/notice_am/notification_am来获得相应的异步消息，或者调用clear_async_msgs
+           清空异步消息，否则异步消息会越积越多。
+        .) 另外也可以调用read_async_msgs(timeout=0)来读取异步消息，其返回值表示读取到的异步消息个数，参数timeout是等待时间，
+           如果为None或者小于0则一直等待直到有消息为止。调用read_async_msgs之后还需要调用parameter_status_am/notice_am/notification_am
+           来获得相应的异步消息。
 
