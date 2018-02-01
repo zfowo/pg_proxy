@@ -412,24 +412,22 @@ class QueryResult():
             if type(idx) is str:
                 idx = self.qres.field_map[idx]
             field = self.qres.rowdesc[idx]
-            ti = self.qres.pgtypeinfo.get(field.typoid, (str, str, 'unknown'))
-            return ti[0](self.r[idx])
+            return pgtypes.parse(self.r[idx], field.typoid)
         def __getattr__(self, name):
             if name not in self.qres.field_map:
                 raise AttributeError('no attribute %s' % name)
             return self[name]
         def __repr__(self):
             ret = '('
-            for idx, field in enumerate(self.qres.rowdesc):
-                ret += '%s=%s, ' % (field.name, self[idx])
+            for idx, _ in enumerate(self.qres.rowdesc):
+                ret += '%s, ' % (self[idx], )
             ret = ret[:-2] + ')'
             return ret
     
-    def __init__(self, cmdtag, rowdesc, rows, pgtypeinfo=pgtypes.pg_type_info_map):
+    def __init__(self, cmdtag, rowdesc, rows):
         self.cmdtag = cmdtag
         self.rowdesc = rowdesc
         self.rows = rows
-        self.pgtypeinfo = pgtypeinfo
         self._parse_cmdtag()
         self._make_field_map()
     def _parse_cmdtag(self):
@@ -461,8 +459,14 @@ class QueryResult():
             else:
                 return -1
         return len(self)
-    def field_info(self, fname):
-        return self.rowdesc[self.field_map[fname]]
+    def column_info(self, colname):
+        if self.rowdesc is None:
+            return None
+        return self.rowdesc[self.field_map[colname]]
+    def columns(self):
+        if self.rowdesc is None:
+            return ()
+        return list(f.name for f in self.rowdesc)
 # 
 # processer for response msg after sending message
 # 

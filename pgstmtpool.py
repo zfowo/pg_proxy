@@ -1015,7 +1015,7 @@ def process_main_queue():
                 poll.register(x[1], poll.POLLIN)
                 fepool.add(x[1])
             w = x[2]
-            w.idle_timeout = g_conf.get('idle_timeout', 600)
+            w.idle_timeout = g_conf.get('idle_timeout', 60*60*24)
             w.query_cache = query_cache_map[w.startup_msg]
             if w.pool_id == master_pool.id:
                 master_fail_history.clear()

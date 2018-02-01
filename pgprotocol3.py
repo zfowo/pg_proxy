@@ -405,6 +405,17 @@ class EmptyQueryResponse(Msg):
 class ErrorNoticeResponse(Msg):
     _formats = '>X'
     _fields = 'field_list'
+    def __init__(self, *args, **kwargs):
+        self._cached_fields = None
+        super().__init__(*args, **kwargs)
+        self._cached_fields = collections.OrderedDict(self.get())
+    def __getattr__(self, name):
+        if self._cached_fields is None:
+            raise AttributeError("'%s' object has no attribute '%s'" % (type(self).__name__, name))
+        if name not in self._cached_fields:
+            raise AttributeError("'%s' object has no attribute '%s'" % (type(self).__name__, name))
+        return self._cached_fields[name]
+	# 返回(field_name, field_val)列表，其中field_name是str，field_val是bytes。
     def get(self, fields=(), decode=lambda x:x):
         res = []
         if type(fields) == bytes:
