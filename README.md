@@ -53,9 +53,15 @@ psycopg2缺省的autocommit是False，所以它会自动发送begin语句，必须把autocommit设为
 
 查询缓存
 ========
-* 可以在select语句开头的注释里设置缓存，格式为/\*c:nnn t:t1,t2,...,tn\*/，其中c指定缓存的期限单位是秒，t指定表名列表，这些表和缓存相关，
+* 可以在select语句开头的注释里设置缓存，格式为/\*c:n p:n t:t1,t2,...,tn\*/，其中c指定缓存的期限单位是秒，t指定表名列表，这些表和缓存相关，
 如果没指定c但指定了t，那么会清空表相关的所有缓存。比如：/\*c:60 t:t1\*/select count(*) from t1会缓存60秒，但是/\*t:t1\*/delete from t1 
 where id=10会清空缓存。缓存只对执行成功的SELECT有效。
+
+* p[:n]用于分页缓存，指定总共读取多少记录，如果n<=0或者不指定则读取所有记录，sql语句必须以offset <m> limit <n>结尾，
+当offset超出缓存的记录数时则从后端读取，只有当指定c时p才有效。比如：/\*c:60 p:1000 t:t1\*/select * from t1 order by id offset 0 limit 10，
+会缓存1000条记录，当用/\*c:60 p:1000 t:t1\*/select * from t1 order by id offset 10 limit 10读取第二页的时候就会从缓存读取。
+
+* 当前所有缓存都是保存在内存中的，所以注意不要缓存太多查询结果。
 
 HA主库切换
 ==========

@@ -44,7 +44,7 @@ class QueryCache():
         return None
     @mputils.AutoLock
     def put(self, msg, msg_list, decode):
-        sql = decode(msg.query)
+        sql = decode(bytes(msg.query))
         timeout = msg._comment_info.cache + time.time()
         tables = tuple(decode(t) for t in msg._comment_info.tables)
         self.cached_items[sql] = CacheItem(timeout, tables, msg_list)
@@ -66,29 +66,54 @@ class QueryCache():
                     self.t2sqls_map[t].remove(sql)
                 except KeyError:
                     pass
-# comment格式: /*s c:nnn t:t1,t2,...,tn*/。其中s表示从从库读；c指定cache期限；t指定相关的表，表之间用逗号分隔。
+# comment格式: /*s c:n p:n t:t1,t2,...,tn*/。
+# 其中s表示从从库读；c指定cache期限；p指定分页缓存；t指定相关的表，表之间用逗号分隔。
 # tables是表名列表，表名是bytes；sql也是bytes
-# cache指定保存多少秒，必须指定；tables是本查询相关的表列表；
+# c:n指定保存多少秒，n必须指定；t:t1,t2,...,tn是本查询相关的表列表；
+# p[:n]指定分页的时候读取多少条记录，如果n<=0或者不指定则读取所有记录，sql语句的结尾必须是offset nn limit nn。必须指定c才有效。
 # 当没有指定cache但是指定了tables的时候，会清空这些表相关的cache。
-QueryCommentInfo = collections.namedtuple('QueryInfo', 'master cache tables')
+QueryCommentInfo = collections.namedtuple('QueryCommentInfo', 'master cache tables page offsetlimit msg_no_offsetlimit')
+QueryCommentInfo.NoComment = QueryCommentInfo(True, None, (), None, None, None)
 def parse_query_comment(msg):
-    master, cache, tables = True, None, ()
+    master, cache, tables = True, None, () 
+    page, offsetlimit, msg_no_offsetlimit = None, None, None
     sql = bytes(msg.query).strip().strip(b';')
     if msg.msg_type != p.MsgType.MT_Query or sql[:2] != b'/*':
-        msg._comment_info = QueryCommentInfo(master, cache, tables)
+        msg._comment_info = QueryCommentInfo.NoComment
         return msg
     idx = sql.index(b'*/')
     info, sql = sql[2:idx], sql[idx+2:].strip()
     item_list = info.split()
     for item in item_list:
-        if item[:2] == b's':
+        if item == b's':
             master = False
+        elif item == b'p':
+            page = 0
+        elif item[:2] == b'p:':
+            page = int(item[2:])
         elif item[:2] == b'c:':
             cache = int(item[2:])
         elif item[:2] == b't:':
             tables = tuple(t for t in item[2:].split(b',') if t)
+        else:
+            raise RuntimeError('unknown item(%s) in comment' % item)
+    if page is not None:
+        sql_no_offsetlimit, *x = sql.rsplit(maxsplit=4)
+        if len(x) == 4:
+            x = [v.lower() for v in x]
+            it = iter(x)
+            x = dict(zip(it, it))
+            if x.keys() == {b'offset', b'limit'}:
+                offsetlimit = offset, limit = (int(x[b'offset']), int(x[b'limit']))
+                msg_no_offsetlimit = p.Query(query=sql_no_offsetlimit)
+            else:
+                raise RuntimeError('sql should be end with offset/limit while comment contain p')
+        else:
+            raise RuntimeError('sql should be end with offset/limit while comment contain p')
+        if cache is None:
+            raise RuntimeError('comment should contain c while p is provided')
     msg = p.Query(query=sql)
-    msg._comment_info = QueryCommentInfo(master, cache, tables)
+    msg._comment_info = QueryCommentInfo(master, cache, tables, page, offsetlimit, msg_no_offsetlimit)
     return msg
 
 class fepgfatal(Exception):
@@ -97,9 +122,10 @@ class fepgfatal(Exception):
         self.last_fe_msg = None
 @mputils.generateid
 class pgstmtworker():
-    def __init__(self, pool_id, be_addr, max_msg=0):
+    def __init__(self, pool_id, be_addr, main_queue, max_msg=0):
         self.pool_id = pool_id
         self.be_addr = be_addr
+        self.main_queue = main_queue
         self.msg_queue = queue.Queue(maxsize=max_msg)
         self.becnn = None
         self.startup_msg = None
@@ -112,14 +138,14 @@ class pgstmtworker():
         # 当worker启动成功时在主线程里设置
         self.query_cache = None 
         self.idle_timeout = 600
-        # 最后处理的消息
+        # 最后从队列中获得的消息
         self.last_msg = None
     def __repr__(self):
         return '<pgstmtworker pool_id=%s id=%s be_addr=%s>' % (self.pool_id, self.id, self.be_addr)
     def put(self, fecnn, msg):
         self.last_put_time = time.time()
         self.msg_queue.put_nowait((fecnn, msg, self.last_put_time))
-    def _process_auth(self, fecnn, main_queue):
+    def _process_auth(self, fecnn):
         self.becnn = pgnet.beconn(self.be_addr)
         self.becnn.startup_msg = self.startup_msg = fecnn.startup_msg
         self.becnn.write_msgs_until_done((fecnn.startup_msg,))
@@ -131,7 +157,7 @@ class pgstmtworker():
             if msg.msg_type == p.MsgType.MT_ReadyForQuery:
                 break
             elif msg.msg_type == p.MsgType.MT_ErrorResponse:
-                main_queue.put(('fail', fecnn, self, False))
+                self.main_queue.put(('fail', fecnn, self, False))
                 return False
             elif msg.msg_type == p.MsgType.MT_Authentication:
                 if msg.authtype not in (p.AuthType.AT_Ok, p.AuthType.AT_SASLFinal):
@@ -142,41 +168,41 @@ class pgstmtworker():
                 self.auth_ok_msgs = self.auth_ok_msgs[idx:]
                 break
         self.becnn.params, self.becnn.be_keydata = p.parse_auth_ok_msgs(self.auth_ok_msgs)
-        main_queue.put(('ok', fecnn, self))
+        self.main_queue.put(('ok', fecnn, self))
         return True
     # 当由前端负责auth的时候用该函数作为线程的target。
-    def run(self, fecnn, main_queue):
+    def run(self, fecnn):
         try:
-            if not self._process_auth(fecnn, main_queue):
+            if not self._process_auth(fecnn):
                 return
         except pgnet.pgfatal as ex:
             print('<worker %d>: %s (ex.cnn:%s fe:%s be:%s)' % (self.id, ex, ex.cnn, fecnn, self.becnn))
             if self.becnn is None or ex.cnn is self.becnn:
-                main_queue.put(('fail', fecnn, self, True))
+                self.main_queue.put(('fail', fecnn, self, True))
             else:
-                main_queue.put(('fail', fecnn, self, False))
+                self.main_queue.put(('fail', fecnn, self, False))
             self.becnn.close()
             return
         
-        exit_cause = self._process_loop(main_queue)
-        main_queue.put(('exit', exit_cause, self))
+        exit_cause = self._process_loop()
+        self.main_queue.put(('exit', exit_cause, self))
     # 不需要前端参与auth。关键字参数指定auth参数，关键字参数不能指定host/port。
-    def run2(self, kwargs, main_queue):
+    def run2(self, kwargs):
         kwargs['host'] = self.be_addr[0]
         kwargs['port'] = self.be_addr[1]
         try:
             self.becnn = pgnet.pgconn(**kwargs)
         except pgnet.pgfatal as ex:
             print('<worker %d>: %s' % (self.id, ex))
-            main_queue.put(('fail', None, self, True if ex.cnn else False))
+            self.main_queue.put(('fail', None, self, True if ex.cnn else False))
             return
         self.startup_msg = self.becnn.startup_msg
         self.auth_ok_msgs = self.becnn.make_auth_ok_msgs()
-        main_queue.put(('ok', None, self))
+        self.main_queue.put(('ok', None, self))
         
-        exit_cause = self._process_loop(main_queue)
-        main_queue.put(('exit', exit_cause, self))
-    def _process_loop(self, main_queue):
+        exit_cause = self._process_loop()
+        self.main_queue.put(('exit', exit_cause, self))
+    def _process_loop(self):
         # process Query msg from queue
         while True:
             self.fe_fatal = None
@@ -190,8 +216,8 @@ class pgstmtworker():
                     return 'idle'
                 if fecnn is None: # 结束线程
                     return 'normal'
-                elif type(fecnn) is str:
-                    self._process_cmd(fecnn, self.last_msg)
+                elif type(fecnn) is tuple: # self.last_msg is None
+                    self._process_cmd(fecnn)
                 else:
                     self._process_msg(fecnn, self.last_msg)
                 done_time = time.time()
@@ -200,9 +226,29 @@ class pgstmtworker():
                 print('<worker %d>: BE%s: %s' % (self.id, self.becnn.getpeername(), ex))
                 return 'befatal'
             else:
-                main_queue.put(('done', fecnn, self, (put_time, get_time-put_time, done_time-get_time)))
-    def _process_cmd(self, cmd, args):
-        pass
+                self.main_queue.put(('done', fecnn, self, (put_time, get_time-put_time, done_time-get_time)))
+    # cmd : (cmd_name, cmd_arg)。
+    def _process_cmd(self, cmd):
+        name, *args = cmd
+        if name == 'pagecache':
+            self._process_cmd_pagecache(args[0])
+        else:
+            print('<worker %d>: unknown cmd: %s' % name)
+    def _process_cmd_pagecache(self, femsg):
+        be_msg_list = []
+        sql = bytes(femsg._comment_info.msg_no_offsetlimit.query)
+        msg_no_offsetlimit = p.Query.make(sql)
+        if femsg._comment_info.page > 0:
+            sql = sql + b' limit %d' % femsg._comment_info.page
+        msg = p.Query.make(sql)
+        self.becnn.write_msgs_until_done((msg,))
+        while True:
+            msg_list = self.becnn.read_msgs_until_avail()
+            be_msg_list.extend(msg_list)
+            if msg_list[-1].msg_type == p.MsgType.MT_ReadyForQuery:
+                break
+        msg_no_offsetlimit._comment_info = femsg._comment_info
+        self._put_to_cache(be_msg_list, msg_no_offsetlimit)
     def _process_msg(self, fecnn, msg):
         if msg.msg_type == p.MsgType.MT_Terminate:
             print('<worker %d>: recved Terminate from %s' % (self.id, fecnn.getpeername()))
@@ -229,29 +275,58 @@ class pgstmtworker():
         else:
             self._process_query2(fecnn, m)
     def _process_from_cache(self, fecnn, femsg):
+        if femsg._comment_info.page is not None:
+            return self._process_from_cache_page(fecnn, femsg)
         sql = bytes(femsg.query)
         citem = self.query_cache.get(sql, self.becnn.decode)
         if not citem:
             return False
         self._write_msgs_to_fe(fecnn, citem.msg_list)
         return True
+    def _process_from_cache_page(self, fecnn, femsg):
+        sql = bytes(femsg._comment_info.msg_no_offsetlimit.query)
+        citem = self.query_cache.get(sql, self.becnn.decode)
+        if not citem:
+            return False
+        page = femsg._comment_info.page
+        offset, limit = femsg._comment_info.offsetlimit
+        msg_list = citem.msg_list[offset+1:offset+1+limit]
+        if msg_list:
+            idx = len(msg_list) - 1
+            while idx >= 0 and msg_list[idx].msg_type != p.MsgType.MT_DataRow:
+                idx -= 1
+            msg_list = msg_list[:idx+1]
+        if page > 0 and not msg_list:
+            # 如果offset已经超出缓存的范围，那么直接从后端读取，并且不缓存，相当于没有指定注释
+            femsg._comment_info = QueryCommentInfo.NoComment
+            return False
+        msg_list.insert(0, citem.msg_list[0])
+        msg_list.append(p.CommandComplete(tag=b'SELECT %d' % (len(msg_list)-1)))
+        msg_list.append(p.ReadyForQuery.Idle)
+        self._write_msgs_to_fe(fecnn, msg_list)
+        return True
     def _process_query2(self, fecnn, bemsg):
         cache = self.last_msg._comment_info.cache
+        page = self.last_msg._comment_info.page
         be_msg_list = []
         msg_list = [bemsg] + self.becnn.read_msgs()
-        if cache:
+        if cache and page is None:
             be_msg_list.extend(msg_list)
         while True:
             if self._write_msgs_to_fe(fecnn, msg_list)[1]:
                 break
             msg_list = self.becnn.read_msgs_until_avail()
-            if cache:
+            if cache and page is None:
                 be_msg_list.extend(msg_list)
         if cache:
-            self._put_to_cache(be_msg_list)
-        else:
+            if page is None:
+                self._put_to_cache(be_msg_list, self.last_msg)
+            else:
+                sql_no_offsetlimit = self.becnn.decode(bytes(self.last_msg._comment_info.msg_no_offsetlimit.query))
+                self.main_queue.put(('pagecache', self.startup_msg, self.last_msg, sql_no_offsetlimit))
+        elif self.last_msg._comment_info.tables:
             self.query_cache.clear(self.last_msg._comment_info.tables, self.becnn.decode)
-    def _put_to_cache(self, be_msg_list):
+    def _put_to_cache(self, be_msg_list, last_msg):
         if be_msg_list[-1].trans_status != p.TransStatus.TS_Idle:
             return
         for m in reversed(be_msg_list):
@@ -261,7 +336,7 @@ class pgstmtworker():
                 if not bytes(m.tag).startswith(b'SELECT'):
                     return
         be_msg_list = [m for m in be_msg_list if not p.MsgType.is_async_msg(m.msg_type)]
-        self.query_cache.put(self.last_msg, be_msg_list, self.becnn.decode)
+        self.query_cache.put(last_msg, be_msg_list, self.becnn.decode)
     def _process_copyout(self, fecnn, bemsg):
         msg_list = [bemsg] + self.becnn.read_msgs()
         while True:
@@ -366,13 +441,13 @@ class pgstmtworkerpool():
     # 启动一个新的worker，此时该worker还没有添加到pool里面，
     # 主线程从main_queue接收到auth成功之后才会把worker加到pool。
     def new_worker(self, fecnn, main_queue,):
-        w = pgstmtworker(self.id, self.be_addr)
-        thr = threading.Thread(target=w.run, args=(fecnn, main_queue))
+        w = pgstmtworker(self.id, self.be_addr, main_queue)
+        thr = threading.Thread(target=w.run, args=(fecnn,))
         thr.start()
         return w
     def new_worker2(self, kwargs, main_queue):
-        w = pgstmtworker(self.id, self.be_addr)
-        thr = threading.Thread(target=w.run2, args=(kwargs, main_queue))
+        w = pgstmtworker(self.id, self.be_addr, main_queue)
+        thr = threading.Thread(target=w.run2, args=(kwargs,))
         thr.start()
         return w
     def add(self, w):
@@ -431,6 +506,12 @@ class pgstmtworkerpool():
             nextidx = self.nextidx_map[cnn.startup_msg] % len(worker_list)
             worker_list[nextidx].put(cnn, msg)
             self.nextidx_map[cnn.startup_msg] = (nextidx + 1) % len(worker_list)
+    def dispatch_cmd_msg(self, startup_msg, cmd):
+        worker_list = self.workers_map[startup_msg]
+        if worker_list:
+            nextidx = self.nextidx_map[startup_msg] % len(worker_list)
+            worker_list[nextidx].put(cmd, None)
+            self.nextidx_map[startup_msg] = (nextidx + 1) % len(worker_list)
     # 当worker异常退出时需要把剩下的消息分发到其他worker上。在调用之前必须先remove worker。
     def dispatch_worker_remain_msg(self, poll, w):
         while True:
@@ -438,7 +519,10 @@ class pgstmtworkerpool():
                 cnn, msg, put_time = w.msg_queue.get_nowait()
             except queue.Empty:
                 break
-            self.dispatch_fe_msg(poll, cnn, msg)
+            if type(cnn) is tuple:
+                self.dispatch_cmd_msg(w.startup_msg, cnn)
+            else:
+                self.dispatch_fe_msg(poll, cnn, msg)
 # 管理一组pool组成的列表
 class pgstmtworkerpools():
     def __init__(self, *be_addr_list):
@@ -562,6 +646,12 @@ class pgstmtworkerpools():
             nextidx = self.nextidx_map[cnn.startup_msg] % len(pool_list)
             pool_list[nextidx].dispatch_fe_msg(poll, cnn, msg)
             self.nextidx_map[cnn.startup_msg] = (nextidx + 1) % len(pool_list)
+    def dispatch_cmd_msg(self, startup_msg, cmd):
+        pool_list = self.pools_map[startup_msg]
+        if pool_list:
+            nextidx = self.nextidx_map[startup_msg] % len(pool_list)
+            pool_list[nextidx].dispatch_cmd_msg(startup_msg, cmd)
+            self.nextidx_map[startup_msg] = (nextidx + 1) % len(pool_list)
     # 当worker异常退出时需要把剩下的消息分发到其他worker上。在调用之前必须先remove worker。
     def dispatch_worker_remain_msg(self, poll, w):
         while True:
@@ -569,7 +659,10 @@ class pgstmtworkerpools():
                 cnn, msg, put_time = w.msg_queue.get_nowait()
             except queue.Empty:
                 break
-            self.dispatch_fe_msg(poll, cnn, msg)
+            if type(cnn) is tuple:
+                self.dispatch_cmd_msg(w.startup_msg, cnn)
+            else:
+                self.dispatch_fe_msg(poll, cnn, msg)
 # 记录所有auth成功的fe连接，按startup_msg分组。
 # 有2种auth成功的情况: new_worker成功的时候和pgauth成功的时候。
 class feconnpool():
@@ -1052,10 +1145,16 @@ def process_main_queue():
             else:
                 slaver_pools.remove_worker(w)
                 slaver_pools.dispatch_worker_remain_msg(poll, w)
-        elif x[0] == 'done': # ('done', fecnn, self, (put_time, get_time, done_time))
-            poll.register(x[1], poll.POLLIN)
+        elif x[0] == 'done': # ('done', fecnn, worker, (put_time, get_time, done_time))
+            if isinstance(x[1], pgnet.feconn):
+                poll.register(x[1], poll.POLLIN)
             w = x[2]
             w.last_processed_msg_info = x[3]
+        elif x[0] == 'pagecache': # ('pagecache', startup_msg, femsg, sql)
+            _, startup_msg, femsg, sql = x
+            if time.time() > cache_timeout_map[sql]:
+                cache_timeout_map[sql] = time.time() + femsg._comment_info.cache
+                master_pool.dispatch_cmd_msg(startup_msg, ('pagecache', femsg))
         else:
             raise RuntimeError('unknow x from main_queue:%s' % (x,))
 def process_ha():
@@ -1141,6 +1240,9 @@ if __name__ == '__main__':
     master_fail_history = [] # 后端连续出问题的时间记录，如果有连接成功则清空
     g_conf['global']['query_cache_map'] = query_cache_map = collections.defaultdict(QueryCache) # startup_msg -> QueryCache
     
+    # sql -> timeout  (sql is str)
+    cache_timeout_map = collections.defaultdict(int)
+    
     misc_worker = pgmiscworker.start()
     
     listen = netutils.listener(g_conf['listen'], async=True)
@@ -1209,7 +1311,10 @@ if __name__ == '__main__':
                         m = parse_query_comment(m)
                     except Exception as ex:
                         errmsg = p.ErrorResponse.make_error(str(ex).encode('utf8'))
-                        fobj.write_msgs_until_done((errmsg, p.ReadyForQuery.Idle))
+                        if fobj.write_msgs((errmsg, p.ReadyForQuery.Idle)):
+                            poll.register(fobj, poll.POLLOUT)
+                        else:
+                            poll.register(fobj, poll.POLLIN)
                         continue
                     if m._comment_info.master:
                         master_pool.dispatch_fe_msg(poll, fobj, m)
