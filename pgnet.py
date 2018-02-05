@@ -114,10 +114,37 @@ class connbase():
             return
         while self.write_msgs():
             self.pollout()
-    # 写原始的没有parse过的消息
+    # raw消息读写
+    def read_raw_msgs(self, max_msg=0):
+        self._read()
+        if not self.recv_buf:
+            return []
+        idx, raw_msg_list = p.parse_raw_pg_msg(self.recv_buf, max_msg)
+        if raw_msg_list:
+            self.recv_buf = self.recv_buf[idx:]
+        return raw_msg_list
+    def write_raw_msgs(self, raw_msg_list=()):
+        for raw_msg in raw_msg_list:
+            self.send_buf += bytes(raw_msg)
+        self._write()
+        return len(self.send_buf)
+    def read_raw_msgs_until_avail(self, max_msg=0):
+        raw_msg_list = self.read_raw_msgs(max_msg)
+        while not raw_msg_list:
+            self.pollin()
+            raw_msg_list = self.read_raw_msgs(max_msg)
+        return raw_msg_list
+    def write_raw_msgs_until_done(self, raw_msg_list=()):
+        if raw_msg_list:
+            if not self.write_raw_msgs(raw_msg_list):
+                return
+        if not self.send_buf:
+            return
+        while self.write_raw_msgs():
+            self.pollout()
     def write_raw_msg(self, raw_msg):
-        self.send_buf += raw_msg
-        return self.write_msgs()
+        return self.write_raw_msgs((raw_msg,))
+    # context manager
     def __enter__(self):
         return self
     def __exit__(self, exc_type, exc_val, exc_tb):
@@ -739,11 +766,11 @@ if __name__ == '__main__':
                 poll.register(be_c, poll.POLLIN)
                 while True:
                     poll.poll()
-                    if be_c.write_msgs(fe_c.read_msgs()):
+                    if be_c.write_raw_msgs(fe_c.read_raw_msgs()):
                         poll.register(be_c, poll.POLLIN|poll.POLLOUT)
                     else:
                         poll.register(be_c, poll.POLLIN)
-                    if fe_c.write_msgs(be_c.read_msgs()):
+                    if fe_c.write_raw_msgs(be_c.read_raw_msgs()):
                         poll.register(fe_c, poll.POLLIN|poll.POLLOUT)
                     else:
                         poll.register(fe_c, poll.POLLIN)
