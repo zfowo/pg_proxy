@@ -17,6 +17,9 @@ all = {
     'ha_after_fail_cnt' : 10, 
     'lo_oid' : 9999, 
     'trigger_file' : 'trigger', 
+    # cache
+    'cache_threshold_to_file' : 10*1024, 
+    'cache_root_dir' : 'querycache', 
     # 主从库信息
     # worker_min_cnt中第idx个值表示当有idx+1个前端连接时需要的worker数，worker_per_fe_cnt表示每多少个前端连接需要一个后端连接。
     'worker_min_cnt' : [1]*2 + [2]*4 + [3]*4, 

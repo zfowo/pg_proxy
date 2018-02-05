@@ -46,6 +46,7 @@ class connbase():
         self.recv_buf = b''
         self.send_buf = b''
         self.readsz = -1 # _read函数每次最多读取多少字节，<=0表示不限。
+        self.readunit = 32*1024
     def fileno(self):
         return self.s.fileno()
     def close(self):
@@ -59,7 +60,7 @@ class connbase():
     def _read(self):
         while True:
             try:
-                data = netutils.myrecv(self.s, 4096)
+                data = netutils.myrecv(self.s, self.readunit)
             except ConnectionError as ex:
                 raise pgfatal(None, '%s' % ex, self)
             if data is None:
@@ -67,7 +68,7 @@ class connbase():
             elif not data:
                 raise pgfatal(None, 'the peer(%s) closed connection' % (self.s.getpeername(),), self)
             self.recv_buf += data
-            if len(data) < 4096:
+            if len(data) < self.readunit:
                 break
             if self.readsz > 0 and len(self.recv_buf) >= self.readsz:
                 break
@@ -113,6 +114,10 @@ class connbase():
             return
         while self.write_msgs():
             self.pollout()
+    # 写原始的没有parse过的消息
+    def write_raw_msg(self, raw_msg):
+        self.send_buf += raw_msg
+        return self.write_msgs()
     def __enter__(self):
         return self
     def __exit__(self, exc_type, exc_val, exc_tb):

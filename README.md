@@ -20,6 +20,8 @@ pgstmtpool.py [args] 语句级别连接池
         'ha_after_fail_cnt' : 10      当主库连续出现指定次数的连接失败时启动主库切换。
         'lo_oid' : 9999               主库中大对象id，用于在从库中生成trigger文件。
         'trigger_file' : 'trigger'    从库的recovery.conf配置的触发promote的文件名。
+        'cache_threshold_to_file' : n 当查询结果的大小超过此值时写到本地文件，单位是字节。
+        'cache_root_dir' : ''         存放本地缓存文件的根目录。
         'worker_min_cnt' : []         用于指定当有n个前端连接时需要的后端worker数。第idx个值表示当有idx+1个前端连接时需要的worker数。
         'worker_per_fe_cnt' : 10      当前端数超过worker_min_cnt的大小时，指定每多少个前端连接需要一个后端连接。
         'idle_timeout' : 60*60*24     当worker空闲时间超过该值时结束worker。

@@ -16,9 +16,73 @@ import mputils
 import miscutils
 
 # tables列表里的表名以及sql都是str，不是bytes
-CacheItem = collections.namedtuple('CacheItem', 'timeout tables msg_list')
+#CacheItem = collections.namedtuple('CacheItem', 'timeout tables msg_list')
+class CacheItem():
+    threshold_to_file = 10*1024*1024
+    def __init__(self, timeout, tables, msg_list, cfn):
+        self.timeout = timeout
+        self.tables = tables
+        self._msg_list = msg_list
+        self.datarow_sz = 0
+        self.cache_fn = cfn
+        self.msg_idx_table = [] # list of (idx, sz)
+        self.rowdesc_msg = msg_list[0]
+        self._save_to_file_if()
+    def _save_to_file_if(self):
+        self.datarow_sz = 0
+        for m in self._msg_list:
+            if m.msg_type != p.MsgType.MT_DataRow:
+                continue
+            self.datarow_sz += m.get_size()
+        if self.datarow_sz < self.threshold_to_file:
+            return
+        self._save_to_file()
+        self._msg_list = None
+    def _save_to_file(self):
+        with open(self.cache_fn, 'wb') as f:
+            idx = 0
+            for m in self._msg_list:
+                buf = m.tobytes()
+                self.msg_idx_table.append((idx, len(buf)))
+                f.write(buf)
+                idx += len(buf)
+    def msg_count(self):
+        return len(self._msg_list) if self._msg_list else len(self.msg_idx_table)
+    def in_file(self):
+        return self._msg_list is None
+    def drop(self):
+        if self.in_file():
+            os.remove(self.cache_fn)
+    # 获得所有消息，返回值类型如果是bytes那就是消息的字节串。
+    def get_msg_list(self):
+        if self._msg_list:
+            return self._msg_list
+        with open(self.cache_fn, 'rb') as f:
+            return f.read()
+    # 获得指定范围的DataRow
+    def get_datarow(self, offset, limit):
+        if self._msg_list:
+            msg_list = self._get_by_offsetlimit(self._msg_list, offset, limit)
+            return len(msg_list), msg_list
+        msg_idxs = self._get_by_offsetlimit(self.msg_idx_table, offset, limit)
+        if not msg_idxs:
+            return 0, []
+        sz = sum(mi[1] for mi in msg_idxs)
+        with open(self.cache_fn, 'rb') as f:
+            f.seek(msg_idxs[0][0])
+            return len(msg_idxs), f.read(sz)
+    def _get_by_offsetlimit(self, vs, offset, limit):
+        start = offset + 1
+        end = start + limit
+        if end > len(vs) - 2:
+            end = len(vs) - 2
+        return vs[start:end]
 class QueryCache():
-    def __init__(self):
+    root_dir = 'querycache'
+    def __init__(self, cache_dir):
+        self.cache_dir = os.path.abspath(os.path.join(self.root_dir, cache_dir))
+        if not os.path.exists(self.cache_dir):
+            os.makedirs(self.cache_dir)
         self.cached_items = {} # sql -> CacheItem
         self.t2sqls_map = collections.defaultdict(set) # table -> sql set
         self.lock = threading.Lock()
@@ -37,17 +101,23 @@ class QueryCache():
             return None
         if item.timeout > time.time():
             return item
-        # timeout
+        # timeouted
         self.cached_items.pop(sql)
         for t in item.tables:
             self.t2sqls_map[t].remove(sql)
+        item.drop()
         return None
     @mputils.AutoLock
-    def put(self, msg, msg_list, decode):
+    def put(self, msg, msg_list, decode, force=False):
         sql = decode(bytes(msg.query))
+        if not force:
+            item = self.cached_items.get(sql, None)
+            if item and item.timeout > time.time():
+                return
         timeout = msg._comment_info.cache + time.time()
         tables = tuple(decode(t) for t in msg._comment_info.tables)
-        self.cached_items[sql] = CacheItem(timeout, tables, msg_list)
+        cfn = os.path.join(self.cache_dir, p.md5(sql.encode('utf8')).decode('ascii'))
+        self.cached_items[sql] = CacheItem(timeout, tables, msg_list, cfn)
         for t in tables:
             self.t2sqls_map[t].add(sql)
     @mputils.AutoLock
@@ -66,6 +136,7 @@ class QueryCache():
                     self.t2sqls_map[t].remove(sql)
                 except KeyError:
                     pass
+            item.drop()
 # comment格式: /*s c:n p:n t:t1,t2,...,tn*/。
 # 其中s表示从从库读；c指定cache期限；p指定分页缓存；t指定相关的表，表之间用逗号分隔。
 # tables是表名列表，表名是bytes；sql也是bytes
@@ -248,7 +319,7 @@ class pgstmtworker():
             if msg_list[-1].msg_type == p.MsgType.MT_ReadyForQuery:
                 break
         msg_no_offsetlimit._comment_info = femsg._comment_info
-        self._put_to_cache(be_msg_list, msg_no_offsetlimit)
+        self._put_to_cache(be_msg_list, msg_no_offsetlimit, force=True)
     def _process_msg(self, fecnn, msg):
         if msg.msg_type == p.MsgType.MT_Terminate:
             print('<worker %d>: recved Terminate from %s' % (self.id, fecnn.getpeername()))
@@ -281,7 +352,7 @@ class pgstmtworker():
         citem = self.query_cache.get(sql, self.becnn.decode)
         if not citem:
             return False
-        self._write_msgs_to_fe(fecnn, citem.msg_list)
+        self._write_cached_msgs_to_fe(fecnn, citem.get_msg_list())
         return True
     def _process_from_cache_page(self, fecnn, femsg):
         sql = bytes(femsg._comment_info.msg_no_offsetlimit.query)
@@ -290,20 +361,13 @@ class pgstmtworker():
             return False
         page = femsg._comment_info.page
         offset, limit = femsg._comment_info.offsetlimit
-        msg_list = citem.msg_list[offset+1:offset+1+limit]
-        if msg_list:
-            idx = len(msg_list) - 1
-            while idx >= 0 and msg_list[idx].msg_type != p.MsgType.MT_DataRow:
-                idx -= 1
-            msg_list = msg_list[:idx+1]
-        if page > 0 and not msg_list:
+        cnt, datarow_list = citem.get_datarow(offset, limit)
+        if page > 0 and not datarow_list:
             # 如果offset已经超出缓存的范围，那么直接从后端读取，并且不缓存，相当于没有指定注释
             femsg._comment_info = QueryCommentInfo.NoComment
             return False
-        msg_list.insert(0, citem.msg_list[0])
-        msg_list.append(p.CommandComplete(tag=b'SELECT %d' % (len(msg_list)-1)))
-        msg_list.append(p.ReadyForQuery.Idle)
-        self._write_msgs_to_fe(fecnn, msg_list)
+        cc_msg = p.CommandComplete(tag=b'SELECT %d' % cnt)
+        self._write_cached_msgs_to_fe(fecnn, (citem.rowdesc_msg,), datarow_list, (cc_msg, p.ReadyForQuery.Idle))
         return True
     def _process_query2(self, fecnn, bemsg):
         cache = self.last_msg._comment_info.cache
@@ -326,7 +390,7 @@ class pgstmtworker():
                 self.main_queue.put(('pagecache', self.startup_msg, self.last_msg, sql_no_offsetlimit))
         elif self.last_msg._comment_info.tables:
             self.query_cache.clear(self.last_msg._comment_info.tables, self.becnn.decode)
-    def _put_to_cache(self, be_msg_list, last_msg):
+    def _put_to_cache(self, be_msg_list, last_msg, force=False):
         if be_msg_list[-1].trans_status != p.TransStatus.TS_Idle:
             return
         for m in reversed(be_msg_list):
@@ -399,6 +463,18 @@ class pgstmtworker():
             self.fe_fatal = ex
             return False, got_ready
         return True, got_ready
+    def _write_cached_msgs_to_fe(self, fecnn, *msg_lists):
+        try:
+            for msg_list in msg_lists:
+                if type(msg_list) is bytes:
+                    fecnn.write_raw_msg(msg_list)
+                else:
+                    fecnn.write_msgs(msg_list)
+            fecnn.write_msgs_until_done()
+        except pgnet.pgfatal as ex:
+            self.fe_fatal = ex
+            return False
+        return True
     def _skip_be_msgs(self, msg_list=()):
         if not msg_list:
             msg_list = self.becnn.read_msgs_until_avail()
@@ -777,8 +853,8 @@ class pooldb(pseudodb.pseudodb):
             startup_msg = self._make_startup_msg(m)
             for sql, citem in qc.get_all():
                 timeout = datetime.datetime.fromtimestamp(citem.timeout).time()
-                rows.append((m['database'], m['user'], startup_msg, sql, timeout, citem.tables, len(citem.msg_list)))
-        return self._write_result(['database', 'user', 'startup_msg', 'sql', 'timeout', 'tables', 'msg_list'], rows)
+                rows.append((m['database'], m['user'], startup_msg, sql, timeout, citem.tables, citem.msg_count(), citem.datarow_sz, citem.in_file()))
+        return self._write_result(['database', 'user', 'startup_msg', 'sql', 'timeout', 'tables', 'msg_cnt', 'size', 'in_file'], rows)
     # 有子命令的通用入口
     def _common_with_sub_cmd(self, args, sub_cmd_map, default_sub_cmd='list'):
         if not args:
@@ -1109,6 +1185,8 @@ def process_main_queue():
                 fepool.add(x[1])
             w = x[2]
             w.idle_timeout = g_conf.get('idle_timeout', 60*60*24)
+            if not query_cache_map.get(w.startup_msg, None):
+                query_cache_map[w.startup_msg] = QueryCache(w.startup_msg.md5().decode('ascii'))
             w.query_cache = query_cache_map[w.startup_msg]
             if w.pool_id == master_pool.id:
                 master_fail_history.clear()
@@ -1238,7 +1316,9 @@ if __name__ == '__main__':
     g_conf['global']['main_queue'] = main_queue = queue.Queue()
     slaver_workers_to_start = {} # 记录下需要启动的slaver workers
     master_fail_history = [] # 后端连续出问题的时间记录，如果有连接成功则清空
-    g_conf['global']['query_cache_map'] = query_cache_map = collections.defaultdict(QueryCache) # startup_msg -> QueryCache
+    CacheItem.threshold_to_file = g_conf.get('cache_threshold_to_file', 10*1024)
+    QueryCache.root_dir = g_conf.get('cache_root_dir', 'querycache')
+    g_conf['global']['query_cache_map'] = query_cache_map = {} # startup_msg -> QueryCache
     
     # sql -> timeout  (sql is str)
     cache_timeout_map = collections.defaultdict(int)

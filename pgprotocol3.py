@@ -398,6 +398,11 @@ class DataRow(Msg):
     @classmethod
     def make(cls, *vals):
         return cls(col_vals=List2Xval(vals))
+    def get_size(self):
+        sz = 5 + 2
+        for x in self.col_vals:
+            sz += 4 + len(x)
+        return sz
 class EmptyQueryResponse(Msg):
     pass
 # field_list是字节串列表，字节串中第一个字节是fieldtype, 剩下的是fieldval
@@ -415,7 +420,7 @@ class ErrorNoticeResponse(Msg):
         if name not in self._cached_fields:
             raise AttributeError("'%s' object has no attribute '%s'" % (type(self).__name__, name))
         return self._cached_fields[name]
-	# 返回(field_name, field_val)列表，其中field_name是str，field_val是bytes。
+    # 返回(field_name, field_val)列表，其中field_name是str，field_val是bytes。
     def get(self, fields=(), decode=lambda x:x):
         res = []
         if type(fields) == bytes:
@@ -567,6 +572,11 @@ class StartupMessage(Msg):
         m1 = xf(self.get_params())
         m2 = xf(other)
         return m1 == m2
+    def md5(self):
+        data = b''
+        for k, v in self.get_params().items():
+            data += v
+        return md5(data)
     @classmethod
     def make(cls, **kwargs):
         params = []
