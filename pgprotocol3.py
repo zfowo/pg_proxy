@@ -176,6 +176,8 @@ class Msg(struct_base, metaclass=MsgMeta):
             res += ' %s=%s' % (field, fval)
         res += '>'
         return res
+    def to_msg(self, *, fe):
+        return self
     def to_rawmsg(self):
         return RawMsg(self.tobytes())
 # 对于那些不是从Msg派生的消息类，用下面这两个decorator把它们加进来。
@@ -637,7 +639,7 @@ def has_msg(data, idx, *, fe=True):
     data_len = len(data)
     if data_len - idx < 5:
         return 0
-    msg_type = data[idx:idx+1]
+    #msg_type = data[idx:idx+1]
     #MsgMeta.check_msg_type(msg_type, fe=fe)
     msg_len = struct.unpack('>i', data[idx+1:idx+5])[0]
     if data_len -idx < msg_len + 1:
@@ -685,17 +687,25 @@ class RawMsg():
     def to_msg(self, *, fe):
         msg_map = MsgMeta.fe_msg_map if fe else MsgMeta.be_msg_map
         return msg_map[self.msg_type](self.data[5:])
+    def to_rawmsg(self):
+        return self
 # 从data中提取多个raw消息，返回下一个idx和raw消息列表。该函数不能用于parse从FE发给BE的第一个消息。
-def parse_raw_pg_msg(data, max_msg=0):
+def parse_raw_pg_msg(data, max_msg=0, stop=None):
     raw_msg_list = []
     idx, cnt = 0, 0
     while True:
         msg_len = has_msg(data, idx)
         if msg_len <= 0:
             break
-        raw_msg_list.append(RawMsg(data[idx:idx+msg_len]))
+        raw_msg = RawMsg(data[idx:idx+msg_len])
+        raw_msg_list.append(raw_msg)
         idx += msg_len
-        
+
+        if stop:
+            if callable(stop):
+                if stop(raw_msg): break
+            else:
+                if raw_msg.msg_type in stop: break        
         cnt += 1
         if max_msg > 0 and cnt >= max_msg:
             break

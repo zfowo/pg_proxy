@@ -16,61 +16,56 @@ import mputils
 import miscutils
 
 # tables列表里的表名以及sql都是str，不是bytes
-#CacheItem = collections.namedtuple('CacheItem', 'timeout tables msg_list')
 class CacheItem():
     threshold_to_file = 10*1024*1024
-    def __init__(self, timeout, tables, msg_list, cfn):
+    def __init__(self, timeout, tables, raw_msg_list, cfn):
         self.timeout = timeout
         self.tables = tables
-        self._msg_list = msg_list
-        self.datarow_sz = 0
+        self._raw_msg_list = raw_msg_list
+        self.size = 0
         self.cache_fn = cfn
-        self.msg_idx_table = [] # list of (idx, sz)
-        self.rowdesc_msg = msg_list[0]
+        self.raw_msg_idx_table = [] # list of (idx, sz)
+        self.rowdesc_raw_msg = raw_msg_list[0]
         self._save_to_file_if()
     def _save_to_file_if(self):
-        self.datarow_sz = 0
-        for m in self._msg_list:
-            if m.msg_type != p.MsgType.MT_DataRow:
-                continue
-            self.datarow_sz += m.get_size()
-        if self.datarow_sz < self.threshold_to_file:
+        self.size = 0
+        for raw_msg in self._raw_msg_list:
+            sz = len(bytes(raw_msg))
+            self.raw_msg_idx_table.append((self.size, sz))
+            self.size += sz
+        if self.size < self.threshold_to_file:
+            self.raw_msg_idx_table = []
             return
         self._save_to_file()
-        self._msg_list = None
+        self._raw_msg_list = None
     def _save_to_file(self):
         with open(self.cache_fn, 'wb') as f:
-            idx = 0
-            for m in self._msg_list:
-                buf = m.tobytes()
-                self.msg_idx_table.append((idx, len(buf)))
-                f.write(buf)
-                idx += len(buf)
+            f.write(b''.join(bytes(raw_msg) for raw_msg in self._raw_msg_list))
     def msg_count(self):
-        return len(self._msg_list) if self._msg_list else len(self.msg_idx_table)
+        return len(self._raw_msg_list) if self._raw_msg_list else len(self.raw_msg_idx_table)
     def in_file(self):
-        return self._msg_list is None
+        return self._raw_msg_list is None
     def drop(self):
         if self.in_file():
             os.remove(self.cache_fn)
     # 获得所有消息，返回值类型如果是bytes那就是消息的字节串。
-    def get_msg_list(self):
-        if self._msg_list:
-            return self._msg_list
+    def get_raw_msg_list(self):
+        if self._raw_msg_list:
+            return self._raw_msg_list
         with open(self.cache_fn, 'rb') as f:
             return f.read()
     # 获得指定范围的DataRow
     def get_datarow(self, offset, limit):
-        if self._msg_list:
-            msg_list = self._get_by_offsetlimit(self._msg_list, offset, limit)
-            return len(msg_list), msg_list
-        msg_idxs = self._get_by_offsetlimit(self.msg_idx_table, offset, limit)
-        if not msg_idxs:
+        if self._raw_msg_list:
+            raw_msg_list = self._get_by_offsetlimit(self._raw_msg_list, offset, limit)
+            return len(raw_msg_list), raw_msg_list
+        raw_msg_idxs = self._get_by_offsetlimit(self.raw_msg_idx_table, offset, limit)
+        if not raw_msg_idxs:
             return 0, []
-        sz = sum(mi[1] for mi in msg_idxs)
+        sz = sum(mi[1] for mi in raw_msg_idxs)
         with open(self.cache_fn, 'rb') as f:
-            f.seek(msg_idxs[0][0])
-            return len(msg_idxs), f.read(sz)
+            f.seek(raw_msg_idxs[0][0])
+            return len(raw_msg_idxs), f.read(sz)
     def _get_by_offsetlimit(self, vs, offset, limit):
         start = offset + 1
         end = start + limit
@@ -108,7 +103,7 @@ class QueryCache():
         item.drop()
         return None
     @mputils.AutoLock
-    def put(self, msg, msg_list, decode, force=False):
+    def put(self, msg, raw_msg_list, decode, force=False):
         sql = decode(bytes(msg.query))
         if not force:
             item = self.cached_items.get(sql, None)
@@ -117,7 +112,7 @@ class QueryCache():
         timeout = msg._comment_info.cache + time.time()
         tables = tuple(decode(t) for t in msg._comment_info.tables)
         cfn = os.path.join(self.cache_dir, p.md5(sql.encode('utf8')).decode('ascii'))
-        self.cached_items[sql] = CacheItem(timeout, tables, msg_list, cfn)
+        self.cached_items[sql] = CacheItem(timeout, tables, raw_msg_list, cfn)
         for t in tables:
             self.t2sqls_map[t].add(sql)
     @mputils.AutoLock
@@ -306,7 +301,7 @@ class pgstmtworker():
         else:
             print('<worker %d>: unknown cmd: %s' % name)
     def _process_cmd_pagecache(self, femsg):
-        be_msg_list = []
+        be_raw_msg_list = []
         sql = bytes(femsg._comment_info.msg_no_offsetlimit.query)
         msg_no_offsetlimit = p.Query.make(sql)
         if femsg._comment_info.page > 0:
@@ -314,12 +309,12 @@ class pgstmtworker():
         msg = p.Query.make(sql)
         self.becnn.write_msgs_until_done((msg,))
         while True:
-            msg_list = self.becnn.read_msgs_until_avail()
-            be_msg_list.extend(msg_list)
-            if msg_list[-1].msg_type == p.MsgType.MT_ReadyForQuery:
+            raw_msg_list = self.becnn.read_raw_msgs_until_avail()
+            be_raw_msg_list.extend(raw_msg_list)
+            if raw_msg_list[-1].msg_type == p.MsgType.MT_ReadyForQuery:
                 break
         msg_no_offsetlimit._comment_info = femsg._comment_info
-        self._put_to_cache(be_msg_list, msg_no_offsetlimit, force=True)
+        self._put_to_cache(be_raw_msg_list, msg_no_offsetlimit, force=True)
     def _process_msg(self, fecnn, msg):
         if msg.msg_type == p.MsgType.MT_Terminate:
             print('<worker %d>: recved Terminate from %s' % (self.id, fecnn.getpeername()))
@@ -336,7 +331,7 @@ class pgstmtworker():
             if self._process_from_cache(fecnn, femsg):
                 return
         self.becnn.write_msgs_until_done((femsg,))
-        m = self.becnn.read_msgs_until_avail(max_msg=1)[0]
+        m = self.becnn.read_raw_msgs_until_avail(max_msg=1)[0]
         if m.msg_type == p.MsgType.MT_CopyInResponse:
             self._process_copyin(fecnn, m)
         elif m.msg_type == p.MsgType.MT_CopyOutResponse:
@@ -352,7 +347,7 @@ class pgstmtworker():
         citem = self.query_cache.get(sql, self.becnn.decode)
         if not citem:
             return False
-        self._write_cached_msgs_to_fe(fecnn, citem.get_msg_list())
+        self._write_cached_msgs_to_fe(fecnn, citem.get_raw_msg_list())
         return True
     def _process_from_cache_page(self, fecnn, femsg):
         sql = bytes(femsg._comment_info.msg_no_offsetlimit.query)
@@ -366,49 +361,50 @@ class pgstmtworker():
             # 如果offset已经超出缓存的范围，那么直接从后端读取，并且不缓存，相当于没有指定注释
             femsg._comment_info = QueryCommentInfo.NoComment
             return False
-        cc_msg = p.CommandComplete(tag=b'SELECT %d' % cnt)
-        self._write_cached_msgs_to_fe(fecnn, (citem.rowdesc_msg,), datarow_list, (cc_msg, p.ReadyForQuery.Idle))
+        cc_raw_msg = p.CommandComplete(tag=b'SELECT %d' % cnt).to_rawmsg()
+        self._write_cached_msgs_to_fe(fecnn, (citem.rowdesc_raw_msg,), datarow_list, (cc_raw_msg, p.ReadyForQuery.Idle.to_rawmsg()))
         return True
-    def _process_query2(self, fecnn, bemsg):
+    def _process_query2(self, fecnn, berawmsg):
         cache = self.last_msg._comment_info.cache
         page = self.last_msg._comment_info.page
-        be_msg_list = []
-        msg_list = [bemsg] + self.becnn.read_msgs()
+        be_raw_msg_list = []
+        raw_msg_list = [berawmsg] + self.becnn.read_raw_msgs()
         if cache and page is None:
-            be_msg_list.extend(msg_list)
+            be_raw_msg_list.extend(raw_msg_list)
         while True:
-            if self._write_msgs_to_fe(fecnn, msg_list)[1]:
+            if self._write_msgs_to_fe(fecnn, raw_msg_list)[1]:
                 break
-            msg_list = self.becnn.read_msgs_until_avail()
+            raw_msg_list = self.becnn.read_raw_msgs_until_avail()
             if cache and page is None:
-                be_msg_list.extend(msg_list)
+                be_raw_msg_list.extend(raw_msg_list)
         if cache:
             if page is None:
-                self._put_to_cache(be_msg_list, self.last_msg)
+                self._put_to_cache(be_raw_msg_list, self.last_msg)
             else:
                 sql_no_offsetlimit = self.becnn.decode(bytes(self.last_msg._comment_info.msg_no_offsetlimit.query))
                 self.main_queue.put(('pagecache', self.startup_msg, self.last_msg, sql_no_offsetlimit))
         elif self.last_msg._comment_info.tables:
             self.query_cache.clear(self.last_msg._comment_info.tables, self.becnn.decode)
-    def _put_to_cache(self, be_msg_list, last_msg, force=False):
-        if be_msg_list[-1].trans_status != p.TransStatus.TS_Idle:
+    def _put_to_cache(self, be_raw_msg_list, last_msg, force=False):
+        m = be_raw_msg_list[-1].to_msg(fe=False)
+        if m.trans_status != p.TransStatus.TS_Idle:
             return
-        for m in reversed(be_msg_list):
+        for m in reversed(be_raw_msg_list):
             if m.msg_type == p.MsgType.MT_ErrorResponse:
                 return
             if m.msg_type == p.MsgType.MT_CommandComplete:
-                if not bytes(m.tag).startswith(b'SELECT'):
+                if not bytes(m.to_msg(fe=False).tag).startswith(b'SELECT'):
                     return
-        be_msg_list = [m for m in be_msg_list if not p.MsgType.is_async_msg(m.msg_type)]
-        self.query_cache.put(last_msg, be_msg_list, self.becnn.decode)
-    def _process_copyout(self, fecnn, bemsg):
-        msg_list = [bemsg] + self.becnn.read_msgs()
+        be_raw_msg_list = [m for m in be_raw_msg_list if not p.MsgType.is_async_msg(m.msg_type)]
+        self.query_cache.put(last_msg, be_raw_msg_list, self.becnn.decode)
+    def _process_copyout(self, fecnn, berawmsg):
+        raw_msg_list = [berawmsg] + self.becnn.read_raw_msgs()
         while True:
-            if self._write_msgs_to_fe(fecnn, msg_list)[1]:
+            if self._write_msgs_to_fe(fecnn, raw_msg_list)[1]:
                 break
-            msg_list = self.becnn.read_msgs_until_avail()
-    def _process_copyin(self, fecnn, bemsg):
-        self._write_msgs_to_fe(fecnn, (bemsg,))
+            raw_msg_list = self.becnn.read_raw_msgs_until_avail()
+    def _process_copyin(self, fecnn, berawmsg):
+        self._write_msgs_to_fe(fecnn, (berawmsg,))
         try:
             self._process_both(fecnn)
         except fepgfatal as ex:
@@ -431,14 +427,14 @@ class pgstmtworker():
         while True:
             netutils.poll2in(fecnn, self.becnn)
             try:
-                msg_list = fecnn.read_msgs()
-                if msg_list:
-                    last_fe_msg = msg_list[-1]
+                raw_msg_list = fecnn.read_raw_msgs()
+                if raw_msg_list:
+                    last_fe_msg = raw_msg_list[-1]
             except pgnet.pgfatal as ex:
-                raise fepgfatal(ex, last_fe_msg_type)
-            self.becnn.write_msgs_until_done(msg_list)
-            msg_list = self.becnn.read_msgs()
-            if self._write_msgs_to_fe(fecnn, msg_list)[1]:
+                raise fepgfatal(ex, last_fe_msg)
+            self.becnn.write_raw_msgs_until_done(raw_msg_list)
+            raw_msg_list = self.becnn.read_raw_msgs()
+            if self._write_msgs_to_fe(fecnn, raw_msg_list)[1]:
                 break
     def _process_unsupported(self, fecnn, femsg):
         errmsg = p.ErrorResponse.make_error(b'unsupported msg type:%s' % femsg.msg_type)
@@ -447,51 +443,52 @@ class pgstmtworker():
         except pgnet.pgfatal as ex:
             pass # 不需要处理，主线程在下次read的时候会报错
     # 返回(是否写成功, 是否有ReadyForQuery消息)
-    def _write_msgs_to_fe(self, fecnn, msg_list):
+    def _write_msgs_to_fe(self, fecnn, raw_msg_list):
         got_ready = False
-        if  msg_list and msg_list[-1].msg_type == p.MsgType.MT_ReadyForQuery:
+        if  raw_msg_list and raw_msg_list[-1].msg_type == p.MsgType.MT_ReadyForQuery:
             got_ready = True
-            if msg_list[-1].trans_status != p.TransStatus.TS_Idle:
+            m = raw_msg_list[-1].to_msg(fe=False)
+            if m.trans_status != p.TransStatus.TS_Idle:
                 self.becnn.write_msgs_until_done((p.Query(query=b'abort'),))
                 self._skip_be_msgs()
-                self._change_msgs_to_idle(msg_list)
+                self._change_msgs_to_idle(raw_msg_list)
         if self.fe_fatal:
             return False, got_ready
         try:
-            fecnn.write_msgs_until_done(msg_list)
+            fecnn.write_raw_msgs_until_done(raw_msg_list)
         except pgnet.pgfatal as ex:
             self.fe_fatal = ex
             return False, got_ready
         return True, got_ready
-    def _write_cached_msgs_to_fe(self, fecnn, *msg_lists):
+    def _write_cached_msgs_to_fe(self, fecnn, *raw_msg_lists):
         try:
-            for msg_list in msg_lists:
-                if type(msg_list) is bytes:
-                    fecnn.write_raw_msg(msg_list)
+            for raw_msg_list in raw_msg_lists:
+                if type(raw_msg_list) is bytes:
+                    fecnn.write_raw_msgs((raw_msg_list,))
                 else:
-                    fecnn.write_msgs(msg_list)
-            fecnn.write_msgs_until_done()
+                    fecnn.write_raw_msgs(raw_msg_list)
+            fecnn.write_raw_msgs_until_done()
         except pgnet.pgfatal as ex:
             self.fe_fatal = ex
             return False
         return True
-    def _skip_be_msgs(self, msg_list=()):
-        if not msg_list:
-            msg_list = self.becnn.read_msgs_until_avail()
+    def _skip_be_msgs(self, raw_msg_list=()):
+        if not raw_msg_list:
+            raw_msg_list = self.becnn.read_raw_msgs_until_avail()
         while True:
-            if msg_list[-1].msg_type == p.MsgType.MT_ReadyForQuery:
+            if raw_msg_list[-1].msg_type == p.MsgType.MT_ReadyForQuery:
                 return
-            msg_list = self.becnn.read_msgs_until_avail()
-    def _change_msgs_to_idle(self, msg_list):
-        m = msg_list[-1]
-        msg_list[-1] = p.ReadyForQuery.Idle
+            raw_msg_list = self.becnn.read_raw_msgs_until_avail()
+    def _change_msgs_to_idle(self, raw_msg_list):
+        m = raw_msg_list[-1].to_msg(fe=False)
+        raw_msg_list[-1] = p.ReadyForQuery.Idle.to_rawmsg()
         if m.trans_status == p.TransStatus.TS_InBlock:
-            msg_list.insert(-1, p.ErrorResponse.make_error(b'do not supoort transaction statement. abort it'))
+            raw_msg_list.insert(-1, p.ErrorResponse.make_error(b'do not supoort transaction statement. abort it').to_rawmsg())
             return
         # TS_Fail
-        for m in reversed(msg_list):
+        for m in reversed(raw_msg_list):
             if m.msg_type == p.MsgType.MT_ErrorResponse:
-                msg_list[i] = p.ErrorResponse.make_error(b'do not supoort transaction statement. abort it')
+                raw_msg_list[i] = p.ErrorResponse.make_error(b'do not supoort transaction statement. abort it').to_rawmsg()
                 return
 # 记录某个be_addr的所有pgworker，按startup_msg分组。
 # pgworker中记录所属的pool的id。
@@ -853,7 +850,7 @@ class pooldb(pseudodb.pseudodb):
             startup_msg = self._make_startup_msg(m)
             for sql, citem in qc.get_all():
                 timeout = datetime.datetime.fromtimestamp(citem.timeout).time()
-                rows.append((m['database'], m['user'], startup_msg, sql, timeout, citem.tables, citem.msg_count(), citem.datarow_sz, citem.in_file()))
+                rows.append((m['database'], m['user'], startup_msg, sql, timeout, citem.tables, citem.msg_count(), citem.size, citem.in_file()))
         return self._write_result(['database', 'user', 'startup_msg', 'sql', 'timeout', 'tables', 'msg_cnt', 'size', 'in_file'], rows)
     # 有子命令的通用入口
     def _common_with_sub_cmd(self, args, sub_cmd_map, default_sub_cmd='list'):

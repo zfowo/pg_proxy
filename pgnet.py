@@ -47,6 +47,8 @@ class connbase():
         self.send_buf = b''
         self.readsz = -1 # _read函数每次最多读取多少字节，<=0表示不限。
         self.readunit = 32*1024
+    def is_fe(self):
+        raise RuntimeError('should not call connbase.is_fe()')
     def fileno(self):
         return self.s.fileno()
     def close(self):
@@ -82,20 +84,22 @@ class connbase():
                 return
             self.send_buf = self.send_buf[sz:]
     # 返回解析后的消息列表。max_msg指定最多返回多少个消息。
-    def read_msgs(self, max_msg=0, stop=None, *, fe):
+    def read_msgs(self, max_msg=0, stop=None):
         self._read()
         if not self.recv_buf:
             return []
-        idx, msg_list = p.parse_pg_msg(self.recv_buf, max_msg, stop, fe=fe)
+        idx, msg_list = p.parse_pg_msg(self.recv_buf, max_msg, stop, fe=self.is_fe())
         if msg_list:
             self.recv_buf = self.recv_buf[idx:]
         return msg_list
     # 返回还剩多少个字节没有发送。msg_list为空则会发送上次剩下的数据。
-    def write_msgs(self, msg_list=(), *, fe):
-        prefix_str = 'BE' if fe else 'FE'
-        for msg in msg_list:
-            if self.log_msg: print('%s: %s' % (prefix_str, msg))
-            self.send_buf += msg.tobytes()
+    def write_msgs(self, msg_list=()):
+        if self.log_msg:
+            prefix_str = 'BE' if self.is_fe() else 'FE'
+            for msg in msg_list:
+                print('%s: %s' % (prefix_str, msg))
+        if msg_list:
+            self.send_buf += b''.join(msg.tobytes() for msg in msg_list)
         self._write()
         return len(self.send_buf)
     # 一直读直到有消息为止
@@ -114,25 +118,34 @@ class connbase():
             return
         while self.write_msgs():
             self.pollout()
+    def write_msg(self, msg):
+        return self.write_msgs((msg,))
     # raw消息读写
-    def read_raw_msgs(self, max_msg=0):
+    # raw_msg_list中的元素可以是RawMsg，也可以是字节串，字节串可能包含多个消息。
+    def read_raw_msgs(self, max_msg=0, stop=None):
         self._read()
         if not self.recv_buf:
             return []
-        idx, raw_msg_list = p.parse_raw_pg_msg(self.recv_buf, max_msg)
+        idx, raw_msg_list = p.parse_raw_pg_msg(self.recv_buf, max_msg, stop)
         if raw_msg_list:
             self.recv_buf = self.recv_buf[idx:]
         return raw_msg_list
     def write_raw_msgs(self, raw_msg_list=()):
-        for raw_msg in raw_msg_list:
-            self.send_buf += bytes(raw_msg)
+        if self.log_msg:
+            prefix_str = 'BE' if self.is_fe() else 'FE'
+            v2smap = (p.BeMsgType.v2smap if self.is_fe() else p.FeMsgType.v2smap)
+            for raw_msg in raw_msg_list:
+                msg_type_name = v2smap[raw_msg.msg_type]
+                print('%s: %s' % (prefix_str, msg_type_name))
+        if raw_msg_list:
+            self.send_buf += b''.join(bytes(raw_msg) for raw_msg in raw_msg_list)
         self._write()
         return len(self.send_buf)
-    def read_raw_msgs_until_avail(self, max_msg=0):
-        raw_msg_list = self.read_raw_msgs(max_msg)
+    def read_raw_msgs_until_avail(self, max_msg=0, stop=None):
+        raw_msg_list = self.read_raw_msgs(max_msg, stop)
         while not raw_msg_list:
             self.pollin()
-            raw_msg_list = self.read_raw_msgs(max_msg)
+            raw_msg_list = self.read_raw_msgs(max_msg, stop)
         return raw_msg_list
     def write_raw_msgs_until_done(self, raw_msg_list=()):
         if raw_msg_list:
@@ -154,6 +167,8 @@ class feconn(connbase):
         self.status = 'connected'
         super().__init__(s)
         self.startup_msg = None
+    def is_fe(self):
+        return True
     # 读取第一个消息，如果第1个是SSLRequest，那么会有第2个startup_msg。
     def read_startup_msg(self):
         self._read()
@@ -170,12 +185,6 @@ class feconn(connbase):
     def write_no_ssl(self):
         self.send_buf = b'N'
         self.write_msgs_until_done()
-    def read_msgs(self, max_msg=0, stop=None):
-        return super().read_msgs(max_msg, stop, fe=True)
-    def write_msgs(self, msg_list=()):
-        return super().write_msgs(msg_list, fe=True)
-    def write_msg(self, msg):
-        return self.write_msgs((msg,))
 # 用于读取statup message
 class feconn4startup():
     def __init__(self, cnn):
@@ -200,12 +209,8 @@ class beconn(connbase):
         except OSError as ex:
             raise pgfatal(None, 'connect fail for %s: %s' % (addr, ex))
         super().__init__(s)
-    def read_msgs(self, max_msg=0, stop=None):
-        return super().read_msgs(max_msg, stop, fe=False)
-    def write_msgs(self, msg_list=()):
-        return super().write_msgs(msg_list, fe=False)
-    def write_msg(self, msg):
-        return self.write_msgs((msg,))
+    def is_fe(self):
+        return False
     # 只有在登陆成功后，并且分析消息包设置self.params和self.be_keydata之后才可以调用。
     # str <-> bytes
     def encode(self, data):
