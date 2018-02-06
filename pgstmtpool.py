@@ -62,7 +62,8 @@ class CacheItem():
         raw_msg_idxs = self._get_by_offsetlimit(self.raw_msg_idx_table, offset, limit)
         if not raw_msg_idxs:
             return 0, []
-        sz = sum(mi[1] for mi in raw_msg_idxs)
+        #sz = sum(mi[1] for mi in raw_msg_idxs)
+        sz = raw_msg_idxs[-1][0] - raw_msg_idxs[0][0] + raw_msg_idxs[-1][1]
         with open(self.cache_fn, 'rb') as f:
             f.seek(raw_msg_idxs[0][0])
             return len(raw_msg_idxs), f.read(sz)
@@ -331,15 +332,16 @@ class pgstmtworker():
             if self._process_from_cache(fecnn, femsg):
                 return
         self.becnn.write_msgs_until_done((femsg,))
-        m = self.becnn.read_raw_msgs_until_avail(max_msg=1)[0]
+        raw_msg_list = self.becnn.read_raw_msgs_until_avail()
+        m = raw_msg_list[0]
         if m.msg_type == p.MsgType.MT_CopyInResponse:
-            self._process_copyin(fecnn, m)
+            self._process_copyin(fecnn, raw_msg_list)
         elif m.msg_type == p.MsgType.MT_CopyOutResponse:
-            self._process_copyout(fecnn, m)
+            self._process_copyout(fecnn, raw_msg_list)
         elif m.msg_type == p.MsgType.MT_CopyBothResponse:
             raise pgnet.pgfatal(None, 'do not support CopyBothResponse')
         else:
-            self._process_query2(fecnn, m)
+            self._process_query2(fecnn, raw_msg_list)
     def _process_from_cache(self, fecnn, femsg):
         if femsg._comment_info.page is not None:
             return self._process_from_cache_page(fecnn, femsg)
@@ -364,11 +366,10 @@ class pgstmtworker():
         cc_raw_msg = p.CommandComplete(tag=b'SELECT %d' % cnt).to_rawmsg()
         self._write_cached_msgs_to_fe(fecnn, (citem.rowdesc_raw_msg,), datarow_list, (cc_raw_msg, p.ReadyForQuery.Idle.to_rawmsg()))
         return True
-    def _process_query2(self, fecnn, berawmsg):
+    def _process_query2(self, fecnn, raw_msg_list):
         cache = self.last_msg._comment_info.cache
         page = self.last_msg._comment_info.page
         be_raw_msg_list = []
-        raw_msg_list = [berawmsg] + self.becnn.read_raw_msgs()
         if cache and page is None:
             be_raw_msg_list.extend(raw_msg_list)
         while True:
@@ -397,14 +398,13 @@ class pgstmtworker():
                     return
         be_raw_msg_list = [m for m in be_raw_msg_list if not p.MsgType.is_async_msg(m.msg_type)]
         self.query_cache.put(last_msg, be_raw_msg_list, self.becnn.decode)
-    def _process_copyout(self, fecnn, berawmsg):
-        raw_msg_list = [berawmsg] + self.becnn.read_raw_msgs()
+    def _process_copyout(self, fecnn, raw_msg_list):
         while True:
             if self._write_msgs_to_fe(fecnn, raw_msg_list)[1]:
                 break
             raw_msg_list = self.becnn.read_raw_msgs_until_avail()
-    def _process_copyin(self, fecnn, berawmsg):
-        self._write_msgs_to_fe(fecnn, (berawmsg,))
+    def _process_copyin(self, fecnn, raw_msg_list):
+        self._write_msgs_to_fe(fecnn, raw_msg_list)
         try:
             self._process_both(fecnn)
         except fepgfatal as ex:

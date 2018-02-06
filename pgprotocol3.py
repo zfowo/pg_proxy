@@ -677,18 +677,81 @@ def parse_pg_msg(data, max_msg=0, stop=None, *, fe=True):
     return (idx, msg_list)
 # 没有parse过的raw消息
 class RawMsg():
-    def __init__(self, data):
+    def __init__(self, data, sidx=0, eidx=None):
         self.data = data
+        self.sidx, self.eidx = sidx, eidx
     @property
     def msg_type(self):
-        return self.data[0:1]
+        return self.data[self.sidx:self.sidx+1]
     def __bytes__(self):
-        return self.data
+        return self.data[self.sidx:self.eidx]
     def to_msg(self, *, fe):
         msg_map = MsgMeta.fe_msg_map if fe else MsgMeta.be_msg_map
-        return msg_map[self.msg_type](self.data[5:])
+        return msg_map[self.msg_type](self.data[self.sidx+5:self.eidx])
     def to_rawmsg(self):
         return self
+# 多个不同的RawMsgChunk之间不共享data，但是RawMsgChunk和从它获得的RawMsg共享data。
+class RawMsgChunk():
+    def __init__(self, data, msg_idxs):
+        self.data = data
+        self.msg_idxs = msg_idxs # list of (sidx, msg_len)
+        if self.msg_idxs:
+            eidx = self.msg_idxs[-1][0] + self.msg_idxs[-1][1]
+            if eidx != len(self.data):
+                raise ValueError('data len(%s) != eidx(%s)' % (len(self.data), eidx))
+    def __len__(self):
+        return len(self.msg_idxs)
+    def __getitem__(self, idx):
+        if type(idx) is slice:
+            if idx.step is not None:
+                raise ValueError('RawMsgChunk do not support extended slice')
+            if (idx.start is None or idx.start == 0) and (idx.stop is None or idx.stop >= len(self.msg_idxs)):
+                return self
+            x_list = self.msg_idxs[idx]
+            if not x_list:
+                return RawMsgChunk.Empty
+            total_sz = x_list[-1][0] + x_list[-1][1] - x_list[0][0]
+            sidx = x_list[0][0]
+            x_list = [(idx-sidx, sz) for idx, sz in x_list]
+            return RawMsgChunk(self.data[sidx:sidx+total_sz], x_list)
+        else:
+            x = self.msg_idxs[idx]
+            return RawMsg(self.data, x[0], x[0]+x[1])
+    def __iter__(self):
+        for x in self.msg_idxs:
+            yield RawMsg(self.data, x[0], x[0]+x[1])
+    def __bytes__(self):
+        return self.data
+    def __add__(self, other):
+        if type(other) is not RawMsgChunk:
+            raise TypeError("unsupported operand type for +: 'RawMsgChunk' and '%s'" % type(other).__name__)
+        if not self:
+            return other
+        if not other:
+            return self
+        other_sidx = len(self.data)
+        res_msg_idxs = copy.copy(self.msg_idxs)
+        res_msg_idxs.extend((other_sidx+idx, sz) for idx, sz in other.msg_idxs)
+        return RawMsgChunk(self.data+other.data, res_msg_idxs)
+    def remove_async_msg(self):
+        if not self:
+            return self
+        chunk_list = []
+        sidx = 0
+        for idx, mi in enumerate(self.msg_idxs):
+            msg_type = self.data[mi[0]:mi[0]+1]
+            if not MsgType.is_async_msg(msg_type):
+                continue
+            chun_list.append(self[sidx:idx])
+            sidx += 1
+        chunk_list.append(self[sidx:])
+        if len(chunk_list) == 1:
+            return chunk_list[0]
+        chunk = RawMsgChunk.Empty
+        for c in chunk_list:
+            chunk = chunk + c
+        return chunk
+RawMsgChunk.Empty = RawMsgChunk(b'', [])
 # 从data中提取多个raw消息，返回下一个idx和raw消息列表。该函数不能用于parse从FE发给BE的第一个消息。
 def parse_raw_pg_msg(data, max_msg=0, stop=None):
     raw_msg_list = []
