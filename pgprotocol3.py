@@ -683,6 +683,10 @@ class RawMsg():
     @property
     def msg_type(self):
         return self.data[self.sidx:self.sidx+1]
+    def __len__(self):
+        s = 0 if self.sidx is None else self.sidx
+        e = len(self.data) if self.eidx is None else self.eidx
+        return e - s
     def __bytes__(self):
         return self.data[self.sidx:self.eidx]
     def to_msg(self, *, fe):
@@ -690,6 +694,9 @@ class RawMsg():
         return msg_map[self.msg_type](self.data[self.sidx+5:self.eidx])
     def to_rawmsg(self):
         return self
+    # 返回的消息对象是独立的，不和任何RawMsgChunk共享data。
+    def copy(self):
+        return RawMsg(bytes(self))
 # 多个不同的RawMsgChunk之间不共享data，但是RawMsgChunk和从它获得的RawMsg共享data。
 class RawMsgChunk():
     def __init__(self, data, msg_idxs):
@@ -733,6 +740,7 @@ class RawMsgChunk():
         res_msg_idxs = copy.copy(self.msg_idxs)
         res_msg_idxs.extend((other_sidx+idx, sz) for idx, sz in other.msg_idxs)
         return RawMsgChunk(self.data+other.data, res_msg_idxs)
+    # 返回一个不包含异步消息的chunk，如果没有异步消息则返回self。
     def remove_async_msg(self):
         if not self:
             return self
@@ -751,20 +759,32 @@ class RawMsgChunk():
         for c in chunk_list:
             chunk = chunk + c
         return chunk
+    # raw_msg_list是RawMsg列表
+    @classmethod
+    def join(cls, raw_msg_list):
+        data = b''.join(bytes(m) for m in raw_msg_list)
+        msg_idxs = []
+        sidx = 0
+        for m in raw_msg_list:
+            sz = len(m)
+            msg_idxs.append((sidx, sz))
+            sidx += sz
+        return cls(data, msg_idxs)
 RawMsgChunk.Empty = RawMsgChunk(b'', [])
-# 从data中提取多个raw消息，返回下一个idx和raw消息列表。该函数不能用于parse从FE发给BE的第一个消息。
+# 从data中提取多个raw消息，返回下一个idx和RawMsgChunk。该函数不能用于parse从FE发给BE的第一个消息。
 def parse_raw_pg_msg(data, max_msg=0, stop=None):
-    raw_msg_list = []
+    msg_idxs = []
     idx, cnt = 0, 0
     while True:
         msg_len = has_msg(data, idx)
         if msg_len <= 0:
             break
-        raw_msg = RawMsg(data[idx:idx+msg_len])
-        raw_msg_list.append(raw_msg)
+        msg_idxs.append((idx, msg_len))
         idx += msg_len
 
         if stop:
+            x = msg_idxs[-1]
+            raw_msg = RawMsg(data, x[0], x[0]+x[1])
             if callable(stop):
                 if stop(raw_msg): break
             else:
@@ -772,7 +792,10 @@ def parse_raw_pg_msg(data, max_msg=0, stop=None):
         cnt += 1
         if max_msg > 0 and cnt >= max_msg:
             break
-    return (idx, raw_msg_list)
+    if not msg_idxs:
+        return idx, RawMsgChunk.Empty
+    else:
+        return idx, RawMsgChunk(data[:idx], msg_idxs)
 # other utility
 def make_auth_ok_msgs(params, be_keydata):
     msg_list = []

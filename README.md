@@ -63,8 +63,6 @@ where id=10会清空缓存。缓存只对执行成功的SELECT有效。
 当offset超出缓存的记录数时则从后端读取，只有当指定c时p才有效。比如：/\*c:60 p:1000 t:t1\*/select * from t1 order by id offset 0 limit 10，
 会缓存1000条记录，当用/\*c:60 p:1000 t:t1\*/select * from t1 order by id offset 10 limit 10读取第二页的时候就会从缓存读取。
 
-* 当前所有缓存都是保存在内存中的，所以注意不要缓存太多查询结果。
-
 HA主库切换
 ==========
 * 当主库连续出现ha_after_fail_cnt次连接失败并且enable_ha为True，则会开始切换操作，切换过程如下：

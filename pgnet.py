@@ -121,7 +121,8 @@ class connbase():
     def write_msg(self, msg):
         return self.write_msgs((msg,))
     # raw消息读写
-    # raw_msg_list中的元素可以是RawMsg，也可以是字节串，字节串可能包含多个消息。
+    # 对于read，返回值raw_msg_list是RawMsgChunk。
+    # 对于write，raw_msg_list是RawMsgChunk或者RawMsg列表。
     def read_raw_msgs(self, max_msg=0, stop=None):
         self._read()
         if not self.recv_buf:
@@ -131,14 +132,15 @@ class connbase():
             self.recv_buf = self.recv_buf[idx:]
         return raw_msg_list
     def write_raw_msgs(self, raw_msg_list=()):
-        if self.log_msg:
+        if self.log_msg and raw_msg_list:
             prefix_str = 'BE' if self.is_fe() else 'FE'
-            v2smap = (p.BeMsgType.v2smap if self.is_fe() else p.FeMsgType.v2smap)
             for raw_msg in raw_msg_list:
-                msg_type_name = v2smap[raw_msg.msg_type]
-                print('%s: %s' % (prefix_str, msg_type_name))
+                print('%s: %s' % (prefix_str, raw_msg.to_msg(fe=not self.is_fe())))
         if raw_msg_list:
-            self.send_buf += b''.join(bytes(raw_msg) for raw_msg in raw_msg_list)
+            if type(raw_msg_list) is p.RawMsgChunk:
+                self.send_buf += bytes(raw_msg_list)
+            else:
+                self.send_buf += b''.join(bytes(raw_msg) for raw_msg in raw_msg_list)
         self._write()
         return len(self.send_buf)
     def read_raw_msgs_until_avail(self, max_msg=0, stop=None):

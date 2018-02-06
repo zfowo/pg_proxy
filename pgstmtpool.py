@@ -16,23 +16,19 @@ import mputils
 import miscutils
 
 # tables列表里的表名以及sql都是str，不是bytes
+# raw_msg_list is RawMsgChunk
 class CacheItem():
     threshold_to_file = 10*1024*1024
     def __init__(self, timeout, tables, raw_msg_list, cfn):
         self.timeout = timeout
         self.tables = tables
         self._raw_msg_list = raw_msg_list
-        self.size = 0
         self.cache_fn = cfn
-        self.raw_msg_idx_table = [] # list of (idx, sz)
-        self.rowdesc_raw_msg = raw_msg_list[0]
+        self.size = len(bytes(raw_msg_list))
+        self.raw_msg_idx_table = raw_msg_list.msg_idxs # list of (idx, sz)
+        self.rowdesc_raw_msg = raw_msg_list[0].copy()
         self._save_to_file_if()
     def _save_to_file_if(self):
-        self.size = 0
-        for raw_msg in self._raw_msg_list:
-            sz = len(bytes(raw_msg))
-            self.raw_msg_idx_table.append((self.size, sz))
-            self.size += sz
         if self.size < self.threshold_to_file:
             self.raw_msg_idx_table = []
             return
@@ -40,7 +36,7 @@ class CacheItem():
         self._raw_msg_list = None
     def _save_to_file(self):
         with open(self.cache_fn, 'wb') as f:
-            f.write(b''.join(bytes(raw_msg) for raw_msg in self._raw_msg_list))
+            f.write(bytes(self._raw_msg_list))
     def msg_count(self):
         return len(self._raw_msg_list) if self._raw_msg_list else len(self.raw_msg_idx_table)
     def in_file(self):
@@ -48,25 +44,26 @@ class CacheItem():
     def drop(self):
         if self.in_file():
             os.remove(self.cache_fn)
-    # 获得所有消息，返回值类型如果是bytes那就是消息的字节串。
+    # 获得所有消息
     def get_raw_msg_list(self):
         if self._raw_msg_list:
             return self._raw_msg_list
         with open(self.cache_fn, 'rb') as f:
-            return f.read()
+            return p.RawMsgChunk(f.read(), self.raw_msg_idx_table)
     # 获得指定范围的DataRow
     def get_datarow(self, offset, limit):
         if self._raw_msg_list:
             raw_msg_list = self._get_by_offsetlimit(self._raw_msg_list, offset, limit)
-            return len(raw_msg_list), raw_msg_list
+            return raw_msg_list
         raw_msg_idxs = self._get_by_offsetlimit(self.raw_msg_idx_table, offset, limit)
         if not raw_msg_idxs:
-            return 0, []
-        #sz = sum(mi[1] for mi in raw_msg_idxs)
-        sz = raw_msg_idxs[-1][0] - raw_msg_idxs[0][0] + raw_msg_idxs[-1][1]
+            return p.RawMsgChunk.Empty
+        sidx = raw_msg_idxs[0][0]
+        total_sz = raw_msg_idxs[-1][0] + raw_msg_idxs[-1][1] - raw_msg_idxs[0][0]
+        raw_msg_idxs = [(idx-sidx, sz) for idx, sz in raw_msg_idxs]
         with open(self.cache_fn, 'rb') as f:
-            f.seek(raw_msg_idxs[0][0])
-            return len(raw_msg_idxs), f.read(sz)
+            f.seek(sidx)
+            return p.RawMsgChunk(f.read(total_sz), raw_msg_idxs)
     def _get_by_offsetlimit(self, vs, offset, limit):
         start = offset + 1
         end = start + limit
@@ -103,6 +100,7 @@ class QueryCache():
             self.t2sqls_map[t].remove(sql)
         item.drop()
         return None
+    # raw_msg_list is RawMsgChunk
     @mputils.AutoLock
     def put(self, msg, raw_msg_list, decode, force=False):
         sql = decode(bytes(msg.query))
@@ -302,7 +300,7 @@ class pgstmtworker():
         else:
             print('<worker %d>: unknown cmd: %s' % name)
     def _process_cmd_pagecache(self, femsg):
-        be_raw_msg_list = []
+        be_raw_msg_list = p.RawMsgChunk.Empty
         sql = bytes(femsg._comment_info.msg_no_offsetlimit.query)
         msg_no_offsetlimit = p.Query.make(sql)
         if femsg._comment_info.page > 0:
@@ -311,7 +309,7 @@ class pgstmtworker():
         self.becnn.write_msgs_until_done((msg,))
         while True:
             raw_msg_list = self.becnn.read_raw_msgs_until_avail()
-            be_raw_msg_list.extend(raw_msg_list)
+            be_raw_msg_list += raw_msg_list
             if raw_msg_list[-1].msg_type == p.MsgType.MT_ReadyForQuery:
                 break
         msg_no_offsetlimit._comment_info = femsg._comment_info
@@ -319,7 +317,7 @@ class pgstmtworker():
     def _process_msg(self, fecnn, msg):
         if msg.msg_type == p.MsgType.MT_Terminate:
             print('<worker %d>: recved Terminate from %s' % (self.id, fecnn.getpeername()))
-            self.num_processed_msg -= 1
+            return
         elif msg.msg_type == p.MsgType.MT_Query:
             self._process_query(fecnn, msg)
         elif msg.msg_type == p.MsgType.MT_Parse:
@@ -358,26 +356,26 @@ class pgstmtworker():
             return False
         page = femsg._comment_info.page
         offset, limit = femsg._comment_info.offsetlimit
-        cnt, datarow_list = citem.get_datarow(offset, limit)
+        datarow_list = citem.get_datarow(offset, limit)
         if page > 0 and not datarow_list:
             # 如果offset已经超出缓存的范围，那么直接从后端读取，并且不缓存，相当于没有指定注释
             femsg._comment_info = QueryCommentInfo.NoComment
             return False
-        cc_raw_msg = p.CommandComplete(tag=b'SELECT %d' % cnt).to_rawmsg()
+        cc_raw_msg = p.CommandComplete(tag=b'SELECT %d' % len(datarow_list)).to_rawmsg()
         self._write_cached_msgs_to_fe(fecnn, (citem.rowdesc_raw_msg,), datarow_list, (cc_raw_msg, p.ReadyForQuery.Idle.to_rawmsg()))
         return True
     def _process_query2(self, fecnn, raw_msg_list):
         cache = self.last_msg._comment_info.cache
         page = self.last_msg._comment_info.page
-        be_raw_msg_list = []
+        be_raw_msg_list = p.RawMsgChunk.Empty
         if cache and page is None:
-            be_raw_msg_list.extend(raw_msg_list)
+            be_raw_msg_list += raw_msg_list
         while True:
             if self._write_msgs_to_fe(fecnn, raw_msg_list)[1]:
                 break
             raw_msg_list = self.becnn.read_raw_msgs_until_avail()
             if cache and page is None:
-                be_raw_msg_list.extend(raw_msg_list)
+                be_raw_msg_list += raw_msg_list
         if cache:
             if page is None:
                 self._put_to_cache(be_raw_msg_list, self.last_msg)
@@ -390,13 +388,18 @@ class pgstmtworker():
         m = be_raw_msg_list[-1].to_msg(fe=False)
         if m.trans_status != p.TransStatus.TS_Idle:
             return
+        got_async_msg = False
         for m in reversed(be_raw_msg_list):
-            if m.msg_type == p.MsgType.MT_ErrorResponse:
+            msg_type = m.msg_type
+            if msg_type == p.MsgType.MT_ErrorResponse:
                 return
-            if m.msg_type == p.MsgType.MT_CommandComplete:
+            if msg_type == p.MsgType.MT_CommandComplete:
                 if not bytes(m.to_msg(fe=False).tag).startswith(b'SELECT'):
                     return
-        be_raw_msg_list = [m for m in be_raw_msg_list if not p.MsgType.is_async_msg(m.msg_type)]
+            if p.MsgType.is_async_msg(msg_type):
+                got_async_msg = True
+        if got_async_msg:
+            be_raw_msg_list = be_raw_msg_list.remove_async_msg()
         self.query_cache.put(last_msg, be_raw_msg_list, self.becnn.decode)
     def _process_copyout(self, fecnn, raw_msg_list):
         while True:
@@ -451,7 +454,7 @@ class pgstmtworker():
             if m.trans_status != p.TransStatus.TS_Idle:
                 self.becnn.write_msgs_until_done((p.Query(query=b'abort'),))
                 self._skip_be_msgs()
-                self._change_msgs_to_idle(raw_msg_list)
+                raw_msg_list = self._change_msgs_to_idle(raw_msg_list)
         if self.fe_fatal:
             return False, got_ready
         try:
@@ -463,10 +466,7 @@ class pgstmtworker():
     def _write_cached_msgs_to_fe(self, fecnn, *raw_msg_lists):
         try:
             for raw_msg_list in raw_msg_lists:
-                if type(raw_msg_list) is bytes:
-                    fecnn.write_raw_msgs((raw_msg_list,))
-                else:
-                    fecnn.write_raw_msgs(raw_msg_list)
+                fecnn.write_raw_msgs(raw_msg_list)
             fecnn.write_raw_msgs_until_done()
         except pgnet.pgfatal as ex:
             self.fe_fatal = ex
@@ -479,17 +479,12 @@ class pgstmtworker():
             if raw_msg_list[-1].msg_type == p.MsgType.MT_ReadyForQuery:
                 return
             raw_msg_list = self.becnn.read_raw_msgs_until_avail()
+    # raw_msg_list[-1]是ReadyForQuery，它的trans_status不是TS_Idle
+    # 这里仅仅把最后的ReadyForQuery消息替换成ErrorResponse+ReadyForQuery
     def _change_msgs_to_idle(self, raw_msg_list):
-        m = raw_msg_list[-1].to_msg(fe=False)
-        raw_msg_list[-1] = p.ReadyForQuery.Idle.to_rawmsg()
-        if m.trans_status == p.TransStatus.TS_InBlock:
-            raw_msg_list.insert(-1, p.ErrorResponse.make_error(b'do not supoort transaction statement. abort it').to_rawmsg())
-            return
-        # TS_Fail
-        for m in reversed(raw_msg_list):
-            if m.msg_type == p.MsgType.MT_ErrorResponse:
-                raw_msg_list[i] = p.ErrorResponse.make_error(b'do not supoort transaction statement. abort it').to_rawmsg()
-                return
+        errstr = b'do not supoort transaction statement. abort it'
+        add_raw_msg_list = p.RawMsgChunk.join((p.ErrorResponse.make_error(errstr).to_rawmsg(), p.ReadyForQuery.Idle.to_rawmsg()))
+        return raw_msg_list[:-1] + add_raw_msg_list
 # 记录某个be_addr的所有pgworker，按startup_msg分组。
 # pgworker中记录所属的pool的id。
 @mputils.generateid
