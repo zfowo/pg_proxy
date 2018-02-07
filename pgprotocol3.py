@@ -19,6 +19,10 @@ import copy
 import mputils
 from structview import *
 import scram
+try:
+    import cutils
+except ImportError:
+    cutils = None
 
 # 输入输出都是bytes类型
 def md5(bs):
@@ -776,7 +780,10 @@ def parse_raw_pg_msg(data, max_msg=0, stop=None):
     msg_idxs = []
     idx, cnt = 0, 0
     while True:
-        msg_len = has_msg(data, idx)
+        if cutils:
+            msg_len = cutils.lib.has_msg(data, len(data), idx)
+        else:
+            msg_len = has_msg(data, idx)
         if msg_len <= 0:
             break
         msg_idxs.append((idx, msg_len))
