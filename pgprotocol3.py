@@ -661,7 +661,10 @@ def parse_pg_msg(data, max_msg=0, stop=None, *, fe=True):
     idx, cnt = 0, 0
     msg_map = MsgMeta.fe_msg_map if fe else MsgMeta.be_msg_map
     while True:
-        msg_len = has_msg(data, idx, fe=fe)
+        if cutils:
+            msg_len = cutils.lib.has_msg(data, len(data), idx)
+        else:
+            msg_len = has_msg(data, idx, fe=fe)
         if msg_len <= 0:
             break
         msg_type = data[idx:idx+1]

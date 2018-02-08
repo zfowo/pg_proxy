@@ -110,6 +110,18 @@ class SizedList():
         if self.end >= self.start:
             return self.end - self.start
         return self.modsz + (self.end - self.start)
+# 获得\x00结尾的字节串，返回字节串和下一个sidx。
+# nullbyte表示返回值是否保留结尾的\x00字节。
+def get_cstr(buf, sidx, nullbyte=False):
+    idx = sidx
+    while buf[sidx] != 0:
+        sidx += 1
+    sidx += 1
+    if nullbyte:
+        d = buf[idx:sidx]
+    else:
+        d = buf[idx:sidx-1]
+    return d, sidx
 # main
 if __name__ == '__main__':
     pass

@@ -9,6 +9,7 @@ import sys, os, re
 import struct
 import itertools
 import collections
+from miscutils import get_cstr
 
 __all__ = ['mvfrombuf', 'structview']
 
@@ -130,18 +131,6 @@ class structview(object):
 
 # struct_base etc.
 __all__ += ['struct_meta', 'struct_base', 'xval', 'Xval', 'def_struct']
-# 获得\x00结尾的字节串，返回字节串和下一个sidx。
-# nullbyte表示返回值是否保留结尾的\x00字节。
-def get_cstr(buf, sidx, nullbyte=False):
-    idx = sidx
-    while buf[sidx] != 0:
-        sidx += 1
-    sidx += 1
-    if nullbyte:
-        d = buf[idx:sidx]
-    else:
-        d = buf[idx:sidx-1]
-    return d, sidx
 # xval表示单个字节串。在创建xval对象后不要修改它的属性值。
 # c=0表示字节串以\x00结尾，这时字节串中不能包含\x00。
 # c>0表示字节串前面有c个字节表示字节串的大小，这时字节串可以包含\x00。
