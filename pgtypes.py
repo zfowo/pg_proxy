@@ -17,15 +17,27 @@ def null(f):
             return None
         return f(p1, *args, **kwargs)
     return wrapper
-# XXX_in函数把串转换为python类型的对象；而XXX_out把python类型的对象转换为串。
+# XXX_in函数把字节串转换为python类型的对象；而XXX_out把python类型的对象转换为串(不是字节串)。
 @null
-def general_in(s, fin=str):
+def general_in(s, client_encoding, *, fin=str, need_decode=True):
+    if need_decode:
+        s = s.decode(client_encoding)
     return fin(s)
 @null
 def general_out(obj, fout=str):
     return fout(obj)
 @null
-def bytea_in(s):
+def bool_in(s, client_encoding):
+    if s in (b't', b'true', b'on', b'1'):
+        return True
+    else:
+        return False
+@null
+def bool_out(b):
+    return 't' if b else 'f'
+@null
+def bytea_in(s, client_encoding):
+    s = s.decode(client_encoding)
     if s[:2] != r'\x':
         return s
     b = s[2:].encode('ascii')
@@ -36,54 +48,54 @@ def bytea_out(b):
     return (rb'\x' + b).decode('ascii')
 
 @null
-def date_in(s):
-    y, m, d = s.split('-')
+def date_in(s, client_encoding):
+    y, m, d = s.split(b'-')
     return datetime.date(int(y), int(m), int(d))
 @null
 def date_out(d):
     return str(d)
 
 @null
-def time_in(s):
-    x, ms = s.split('.')
-    h, m, s = x.split(':')
+def time_in(s, client_encoding):
+    x, ms = s.split(b'.')
+    h, m, s = x.split(b':')
     return datetime.time(int(h), int(m), int(s), int(ms))
 @null
 def time_out(t):
     return str(t)
 
 @null
-def timestamp_in(s):
+def timestamp_in(s, client_encoding):
     ds, ts = s.split()
-    return datetime.datetime.combine(date_in(ds), time_in(ts))
+    return datetime.datetime.combine(date_in(ds, client_encoding), time_in(ts, client_encoding))
 @null
 def timestamp_out(dt):
     return str(dt)
 
 @null
-def timetz_in(s):
-    return s
+def timetz_in(s, client_encoding):
+    return s.decode(client_encoding)
 @null
 def timetz_out(t):
     return t
 
 @null
-def timestamptz_in(s):
-    return s
+def timestamptz_in(s, client_encoding):
+    return s.decode(client_encoding)
 @null
 def timestamptz_out(dt):
     return dt
 
 @null
-def interval_in(s):
-    return s
+def interval_in(s, client_encoding):
+    return s.decode(client_encoding)
 @null
 def interval_out(iv):
     return iv
 
 @null
-def json_in(s):
-    return json.loads(s)
+def json_in(s, client_encoding):
+    return json.loads(s.decode(client_encoding))
 @null
 def json_out(js):
     return json.dumps(js)
@@ -91,35 +103,38 @@ def json_out(js):
 # range type
 # 目前pg自带的range类型都是用逗号分隔start/end的。
 @null
-def range_in(s, fin=str, delim=','):
-    s = s.strip('()[]')
+def range_in(s, client_encoding, *, fin=str, delim=b',', need_decode=False):
+    s = s.strip(b'()[]')
     start, end = s.split(delim)
-    start = None if start == '' else fin(start)
-    end = None if end == '' else fin(end)
+    if need_decode:
+        start, end = start.decode(client_encoding), end.decode(client_encoding)
+    start = None if not start else fin(start)
+    end = None if not end else fin(end)
     return (start, end)
 @null
-def range_out(r, fout=str, delim=','):
+def range_out(r, *, fout=str, delim=','):
     res = ''
     if r[0] is None:
         res += '(%s' % delim
     else:
-        res += '[%s%s' % (fout(r[0], delim))
+        res += '[%s%s' % (fout(r[0]), delim)
     if r[1] is None:
         res += ')'
     else:
         res += '%s)' % fout(r[1])
     return res
-# 如果某些in/out函数需要用到pgconn的一些信息的话，可以在构造pgconn的时候deepcopy这个map，然后修改。
+# typin函数接收2个参数，第一个是字节串数据，第二个是client_encoding。根据类型可能需要进行decode。
+# timetz/timestamptz/interval目前还没有实现，它们其实是不需要把字节串decode成串的。
 fp = functools.partial
 pg_type_info_map = {
     #typoid : (typin, typout, typname)
-    16 : (fp(general_in, fin=bool), general_out, 'bool'), # bool
-    21 : (fp(general_in, fin=int), general_out, 'int2'),  # int2
-    23 : (fp(general_in, fin=int), general_out, 'int4'),  # int4
-    20 : (fp(general_in, fin=int), general_out, 'int8'),  # int8
-    26 : (fp(general_in, fin=int), general_out, 'oid'), # oid
-    700 : (fp(general_in, fin=float), general_out, 'float4'), # float4
-    701 : (fp(general_in, fin=float), general_out, 'float8'), # float8
+    16 : (bool_in, bool_out, 'bool'), # bool
+    21 : (fp(general_in, fin=int, need_decode=False),    general_out, 'int2'),  # int2
+    23 : (fp(general_in, fin=int, need_decode=False),    general_out, 'int4'),  # int4
+    20 : (fp(general_in, fin=int, need_decode=False),    general_out, 'int8'),  # int8
+    26 : (fp(general_in, fin=int, need_decode=False),    general_out, 'oid'), # oid
+    700 : (fp(general_in, fin=float, need_decode=False), general_out, 'float4'), # float4
+    701 : (fp(general_in, fin=float, need_decode=False), general_out, 'float8'), # float8
     1700 : (fp(general_in, fin=decimal.Decimal), general_out, 'numeric'), # numeric
     18 : (general_in, general_out, 'char'),      # char whose length is 1
     1042 : (general_in, general_out, 'bpchar'),  # bpchar
@@ -137,7 +152,7 @@ pg_type_info_map = {
     # range type
     3904 : (fp(range_in, fin=int), range_out), # int4range
     3926 : (fp(range_in, fin=int), range_out), # int8range
-    3906 : (fp(range_in, fin=decimal.Decimal), range_out), # numrange
+    3906 : (fp(range_in, fin=decimal.Decimal, need_decode=True), range_out), # numrange
     3912 : (fp(range_in, fin=date_in), fp(range_out, fout=date_out)), # daterange
     3908 : (fp(range_in, fin=timestamp_in), fp(range_out, fout=timestamp_out)), # tsrange
     3910 : (fp(range_in, fin=timestamptz_in), fp(range_out, fout=timestamptz_out)), # tstzrange
@@ -156,6 +171,7 @@ sql_get_arrtype = r"""
     from pg_type t1 join pg_type t2 on t1.typelem=t2.oid 
     where t1.typelem <> 0 and t1.typname like '\_%' and t2.typtype in ('b','r')
 """
+# typoid, typelem, typname, typdelim
 _arrtype_list = r"""
     143|142|xml|,
     199|114|json|,
@@ -229,15 +245,15 @@ _arrtype_list = r"""
 """
 _init_arrtype_info()
 # 
-def parse(v, typoid):
+def parse(v, typoid, client_encoding):
     if typoid in pg_arrtype_info_map:
         ti = pg_arrtype_info_map[typoid]
-        return _parse_array(v, ti[0], ti[2])
+        return _parse_array(v, ti[0], ti[2], client_encoding)
     ti = pg_type_info_map.get(typoid, (general_in, general_out, 'unknown'))
-    return ti[0](v)
-def _parse_array(v, typelem_oid, typdelim):
+    return ti[0](v, client_encoding)
+def _parse_array(v, typelem_oid, typdelim, client_encoding):
     ti = pg_type_info_map.get(typelem_oid, (general_in, general_out, 'unknown'))
-    return array_split(v, ti[0], typdelim)
+    return array_split(v, ti[0], typdelim, client_encoding)
 # 分析数组
 def escape_array_item(s, delim=','):
     pattern = r'[{} "\\' + delim + r']'
@@ -252,9 +268,9 @@ def unescape_array_item(s):
     if s == 'NULL':
         return None
     return s.replace(r'\\', '\\').replace(r'\"', '"')
-def array_split(s, fin=str, delim=','):
+def array_split(s, fin, delim, client_encoding):
     if s[0] != '{':
-        return fin(unescape_array_item(s))
+        return fin(unescape_array_item(s), client_encoding)
     s = s[1:-1]
     if not s:
         return []
@@ -276,10 +292,10 @@ def array_split(s, fin=str, delim=','):
             idx += 1
         elif c == delim:
             if not quote_open and level <= 0:
-                res.append(array_split(s[sidx:idx], fin, delim))
+                res.append(array_split(s[sidx:idx], fin, delim, client_encoding))
                 sidx = idx + 1
         idx += 1
-    res.append(array_split(s[sidx:idx], fin, delim))
+    res.append(array_split(s[sidx:idx], fin, delim, client_encoding))
     return res
 # main
 if __name__ == '__main__':

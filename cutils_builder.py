@@ -21,24 +21,18 @@ ffibuilder.set_source('cutils',
 '''
 #include <stdlib.h>
 #include <string.h>
-#define GET_SHORT(n, data, sidx) do {char * pc=(char *)&n; pc[0]=data[sidx+1]; pc[1]=data[sidx];} while (0)
-#define GET_INT(n, data, sidx) do {char * pc=(char *)&n; pc[0]=data[sidx+3]; pc[1]=data[sidx+2]; pc[2]=data[sidx+1]; pc[3]=data[sidx];} while (0)
+#define GET_SHORT(n, data, sidx) do {char * pc=(char *)&(n); pc[0]=(data)[(sidx)+1]; pc[1]=(data)[(sidx)];} while (0)
+#define GET_INT(n, data, sidx) do {char * pc=(char *)&(n); pc[0]=(data)[(sidx)+3]; pc[1]=(data)[(sidx)+2]; pc[2]=(data)[(sidx)+1]; pc[3]=(data)[(sidx)];} while (0)
 int get_short(const char * data, int sidx)
 {
     short n = 0;
-    char * pc = (char *)&n;
-    pc[0] = data[sidx+1];
-    pc[1] = data[sidx];
+    GET_SHORT(n, data, sidx);
     return n;
 }
 int get_int(const char * data, int sidx)
 {
     int n = 0;
-    char * pc = (char *)&n;
-    pc[0] = data[sidx+3];
-    pc[1] = data[sidx+2];
-    pc[2] = data[sidx+1];
-    pc[3] = data[sidx];
+    GET_INT(n, data, sidx);
     return n;
 }
 void get_nshort(const char * data, int sidx, int num, short * res)
@@ -67,11 +61,7 @@ int has_msg(const char * data, int data_len, int sidx)
     if (data_len - sidx < 5)
         return 0;
     int msg_len = 0;
-    char * p = (char *)&msg_len;
-    p[0] = data[sidx+1+3];
-    p[1] = data[sidx+1+2];
-    p[2] = data[sidx+1+1];
-    p[3] = data[sidx+1];
+    GET_INT(msg_len, data, sidx+1);
     if (data_len - sidx < msg_len + 1)
         return 0;
     return msg_len + 1;

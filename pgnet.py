@@ -176,7 +176,7 @@ class feconn(connbase):
         self._read()
         if p.startup_msg_is_complete(self.recv_buf):
             try:
-                self.startup_msg = p.parse_startup_msg(self.recv_buf[4:])
+                self.startup_msg = p.parse_startup_msg(self.recv_buf)
             except RuntimeError as ex:
                 raise pgfatal(None, 'RuntimeError: %s' % ex)
             self.recv_buf = b''
@@ -331,7 +331,7 @@ class pgconn(beconn):
     # 简单查询，如果返回值是CopyResponse则需要调用process继续进行copy操作。
     def query(self, sql):
         sql = self.encode(sql)
-        return self.write_msg(p.Query(query=sql)).process()
+        return self.write_msg(p.Query.make(sql)).process()
     # 扩展查询，不支持copy语句。
     # sql语句中的参数用$1..$n表示。
     # 当进行大量insert/update/delete的时候，可以把discard_qr设为True，这样就不会返回大量的QueryResult。
@@ -454,7 +454,7 @@ class QueryResult():
             if type(idx) is str:
                 idx = self.qres.field_map[idx]
             field = self.qres.rowdesc[idx]
-            return pgtypes.parse(self.r[idx], field.typoid)
+            return pgtypes.parse(self.r[idx], field.typoid, self.qres.client_encoding)
         def __getattr__(self, name):
             if name not in self.qres.field_map:
                 raise AttributeError('no attribute %s' % name)
@@ -466,10 +466,11 @@ class QueryResult():
             ret = ret[:-2] + ')'
             return ret
     
-    def __init__(self, cmdtag, rowdesc, rows):
+    def __init__(self, cmdtag, rowdesc, rows, client_encoding):
         self.cmdtag = cmdtag
         self.rowdesc = rowdesc
         self.rows = rows
+        self.client_encoding = client_encoding
         self._parse_cmdtag()
         self._make_field_map()
     def _parse_cmdtag(self):
@@ -615,23 +616,24 @@ class QueryProcesser(MsgProcesser):
     def _process_msg_list(self, msg_list):
         got_ready = False
         for idx, m in enumerate(msg_list):
-            if m.msg_type == p.MsgType.MT_EmptyQueryResponse:
-                self.ex = pgerror(m)
-            elif m.msg_type == p.MsgType.MT_ErrorResponse:
-                self.ex = pgerror(m)
+            if m.msg_type == p.MsgType.MT_DataRow:
+                self.rows.append(m.col_vals)
+                #self.rows.append(tuple(c if c is None else self.cnn.decode(c) for c in m))
             elif m.msg_type == p.MsgType.MT_RowDescription:
                 self.rowdesc = list(c._replace(name=self.cnn.decode(c.name)) for c in m)
                 self.rows = []
-            elif m.msg_type == p.MsgType.MT_DataRow:
-                self.rows.append(list(c if c is None else self.cnn.decode(c) for c in m))
             elif m.msg_type == p.MsgType.MT_CommandComplete:
                 self.cmdtag = self.cnn.decode(m.tag)
                 if not self.discard_qr:
-                    self.qres_list.append(QueryResult(self.cmdtag, self.rowdesc, self.rows))
+                    self.qres_list.append(QueryResult(self.cmdtag, self.rowdesc, self.rows, self.cnn.params['client_encoding']))
                 self.cmdtag = self.rowdesc = self.rows = None
             elif m.msg_type == p.MsgType.MT_ReadyForQuery:
                 got_ready = True
                 break
+            elif m.msg_type == p.MsgType.MT_ErrorResponse:
+                self.ex = pgerror(m)
+            elif m.msg_type == p.MsgType.MT_EmptyQueryResponse:
+                self.ex = pgerror(m)
             elif m.msg_type in self.cnn.async_msgs: # async msg
                 self.cnn._got_async_msg(m)
             elif m.msg_type == p.MsgType.MT_CopyInResponse:
@@ -767,7 +769,7 @@ if __name__ == '__main__':
                     if m.code == p.PG_SSLREQUEST_CODE:
                         fe_c.write_no_ssl()
                         continue
-                    be_c.write_msgs_until_done([m])
+                    be_c.write_msgs_until_done((m,))
                     break
                 poll.register(fe_c, poll.POLLIN)
                 poll.register(be_c, poll.POLLIN)

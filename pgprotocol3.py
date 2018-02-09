@@ -4,7 +4,7 @@
 # 解析postgresql c/s version 3协议，不包括复制相关的协议。
 # postgresql消息格式: type + len + data。type是一个字节，len是4个字节表示大小，包括len本身的4个字节。
 # FE的第一个消息不包含type部分。
-# 传给Msg派生类的buf不包含开头的5个字节(或者4个字节)。
+# 传给Msg派生类的buf包含开头的5个字节(或者4个字节)。
 # 
 # ** 所有消息类的对象在创建之后都不要修改已经赋值的属性 **
 # 
@@ -17,8 +17,8 @@ import hashlib
 import collections
 import copy
 import mputils
-from structview import *
 import scram
+from miscutils import *
 try:
     import cutils
 except ImportError:
@@ -137,42 +137,75 @@ class AuthType(metaclass=mputils.V2SMapMeta, strip=3):
     AT_SASLFinal = 12
     _HasData = (AT_MD5Password, AT_GSSContinue, AT_SASL, AT_SASLContinue, AT_SASLFinal)
 
-class MsgMeta(struct_meta):
-    fe_msg_map = mputils.NoRepeatAssignMap()
-    be_msg_map = mputils.NoRepeatAssignMap()
+class MsgMeta(type):
+    _fe_msg_map = mputils.NoRepeatAssignMap()
+    fe_msg_map = [None] * (ord('z') + 1)
+    _be_msg_map = mputils.NoRepeatAssignMap()
+    be_msg_map = [None] * (ord('z') + 1)
     def __init__(self, name, bases, ns):
         if self.msg_type: # 跳过msg_type=b''
             mt_symbol = 'MT_' + name
             if hasattr(FeMsgType, mt_symbol):
-                type(self).fe_msg_map[self.msg_type] = self
+                type(self)._fe_msg_map[self.msg_type] = self
+                type(self).fe_msg_map[self.msg_type[0]] = self
             if hasattr(BeMsgType, mt_symbol):
-                type(self).be_msg_map[self.msg_type] = self
+                type(self)._be_msg_map[self.msg_type] = self
+                type(self).be_msg_map[self.msg_type[0]] = self
         super().__init__(name, bases, ns)
     def __new__(cls, name, bases, ns):
         if 'msg_type' in ns:
             raise ValueError('class %s should not define msg_type' % name)
         ns['msg_type'] = getattr(MsgType, 'MT_' + name)
+        if '_fields' in ns:
+            _fields = ns['_fields']
+            if type(_fields) == str:
+                _fields = _fields.split()
+            if set(_fields) & set(ns):
+                raise ValueError('_fields can not contain class attribute')
+            for fn in _fields:
+                if fn[0] == '_':
+                    raise ValueError('fieldname in _fields can not starts with undercore')
+            ns['_fields'] = tuple(_fields)
         return super().__new__(cls, name, bases, ns)
     @classmethod
     def check_msg_type(cls, msg_type, *, fe):
         if fe:
-            if msg_type not in cls.fe_msg_map:
+            if msg_type not in cls._fe_msg_map:
                 raise ValueError('unknown fe msg type:[%s]' % msg_type)
         else:
-            if msg_type not in cls.be_msg_map:
+            if msg_type not in cls._be_msg_map:
                 raise ValueError('unknown be msg type:[%s]' % msg_type)
 # 消息基类。
-class Msg(struct_base, metaclass=MsgMeta):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self._cached_data = None
+# 派生类需要实现_parse和_tobytes函数。
+class Msg(metaclass=MsgMeta):
+    _fields = ''
+    def __init__(self, buf=None, **kwargs):
+        if buf is not None and kwargs:
+            raise ValueError('buf and kwargs can not be given meanwhile')
+        if buf:
+            self.buf = buf
+            self._parse()
+        else:
+            self.buf = None
+            self._init_from_kwargs(kwargs)
+    def _init_from_kwargs(self, kwargs):
+        for k, v in kwargs.items():
+            if k not in self._fields:
+                raise ValueError('unknown kwarg(%s), valid kwargs is %s' % (k, self._fields))
+            setattr(self, k, v)
     def tobytes(self):
-        if self._cached_data:
-            return self._cached_data
-        data = super().tobytes()
+        if self.buf:
+            return self.buf
+        data = self._tobytes()
         header = self.msg_type + struct.pack('>i', len(data)+4)
-        self._cached_data = header + data
-        return self._cached_data
+        self.buf = header + data
+        return self.buf
+    def __bytes__(self):
+        return self.tobytes()
+    def _parse(self):
+        pass
+    def _tobytes(self):
+        return b''
     def __repr__(self):
         res = '<%s' % type(self).__name__
         for field in self._fields:
@@ -184,14 +217,6 @@ class Msg(struct_base, metaclass=MsgMeta):
         return self
     def to_rawmsg(self):
         return RawMsg(self.tobytes())
-# 对于那些不是从Msg派生的消息类，用下面这两个decorator把它们加进来。
-def FE(cls):
-    MsgMeta.fe_msg_map[cls.msg_type] = cls
-    return cls
-def BE(cls):
-    MsgMeta.be_msg_map[cls.msg_type] = cls
-    return cls
-
 # 
 # FE msg
 # 
@@ -202,6 +227,10 @@ def BE(cls):
 class Query(Msg):
     _formats = '>x'
     _fields = 'query'
+    def _parse(self):
+        self.query, _ = get_cstr(self.buf, 5)
+    def _tobytes(self):
+        return self.query + b'\x00'
     @classmethod
     def make(cls, sql):
         return cls(query=sql)
@@ -216,36 +245,60 @@ class Query(Msg):
 class Parse(Msg):
     _formats = '>x >x >h -0>i'
     _fields = 'stmt query param_cnt param_oids'
+    def _parse(self):
+        sidx = 5
+        self.stmt, sidx = get_cstr(self.buf, sidx)
+        self.query, sidx = get_cstr(self.buf, sidx)
+        self.param_cnt = get_short(self.buf, sidx); sidx += 2
+        self.params = get_nint(self.buf, sidx, self.param_cnt)
+    def _tobytes(self):
+        return b''.join((self.stmt, b'\x00', self.query, b'\x00', put_short(self.param_cnt), put_nint(self.param_oids)))
     # query/stmt必须是格式为client_encoding的字节串。其他地方也一样。
     # query是sql语句，其中参数用$n表示；stmt是prepared statement名字。
     @classmethod
     def make(cls, query, stmt=b'', param_oids=()):
         return cls(stmt=stmt, query=query, param_cnt=len(param_oids), param_oids=param_oids)
-@mputils.SeqAccess(attname='params', f=lambda x:(None if x.sz < 0 else x.data))
+@mputils.SeqAccess(attname='params')
 class Bind(Msg):
     _check_assign = False
     _formats = '>x >x >h -0>h >24X >h -0>h'
     _fields = 'portal stmt fc_cnt fc_list params res_fc_cnt res_fc_list'
+    def _parse(self):
+        sidx = 5
+        self.portal, sidx = get_cstr(self.buf, sidx)
+        self.stmt, sidx = get_cstr(self.buf, sidx)
+        self.fc_cnt = get_short(self.buf, sidx); sidx += 2
+        self.fc_list = get_nshort(self.buf, sidx, self.fc_cnt); sidx += 2*self.fc_cnt
+        self.params, sz = get_24X(self.buf, sidx); sidx += sz
+        self.res_fc_cnt = get_short(self.buf, sidx); sidx += 2
+        self.res_fc_list = get_nshort(self.buf, sidx)
+    def _tobytes(self):
+        return b''.join((self.portal, b'\x00', self.stmt, b'\x00', put_short(self.fc_cnt), put_nshort(self.fc_list), 
+                        put_24X(self.params), put_short(self.res_fc_cnt), put_nshort(self.res_fc_list)))
     # fc_list指定params中参数值的格式代码(fc)，0是文本格式1是二进制格式。如果为空则表示都是文本格式，
     # 如果只有一个fc则指定所有参数的格式为fc，否则fc_list的大小和params的大小一样，指定每个参数的fc。
     # res_fc_list指定返回结果中各列的格式代码，意义和fc_list一样。
     @classmethod
     def make(cls, params, portal=b'', stmt=b'', fc_list=(), res_fc_list=()):
-        params = List2Xval(params)
         return cls(portal=portal, stmt=stmt, fc_cnt=len(fc_list), fc_list=fc_list, 
                    params=params, res_fc_cnt=len(res_fc_list), res_fc_list=res_fc_list)
 # 当需要创建大量Bind消息然后发送出去的话，用该类可以提高性能。
 class SimpleBind():
     def __init__(self, params):
-        xlist = (xval(b'', sz=-1) if v is None else v for v in params)
-        self.X = Xval(xlist, 2, 4)
+        self.params = params
     def tobytes(self):
-        data = b'\x00\x00\x00\x00' + self.X.tobuf() + b'\x00\x00'
+        data = b'\x00\x00\x00\x00' + put_24X(self.params) + b'\x00\x00'
         header = MsgType.MT_Bind + struct.pack('>i', len(data)+4)
         return header + data
 class Execute(Msg):
     _formats = '>x >i'
     _fields = 'portal max_num'
+    def _parse(self):
+        sidx = 5
+        self.portal, sidx = get_cstr(self.buf, sidx)
+        self.max_num = get_int(self.buf, sidx)
+    def _tobytes(self):
+        return b''.join((self.portal, b'\x00', put_nint(self.max_num)))
     @classmethod
     def make(cls, portal=b'', max_num=0):
         return cls(portal=portal, max_num=max_num)
@@ -254,6 +307,12 @@ Execute.Default = Execute.make()
 class DescribeClose(Msg):
     _formats = '>s >x'
     _fields = 'obj_type obj_name'
+    def _parse(self):
+        sidx = 5
+        self.obj_type = self.buf[sidx:sidx+1]; sidx += 1
+        self.obj_name, _ = get_cstr(self.buf, sidx)
+    def _tobytes(self):
+        return b''.join((self.obj_type, self.obj_name, b'\x00'))
     # 注意:不能通过DescribeClose调用下面这2个方法，应该通过Describe和Close调用。
     @classmethod
     def stmt(cls, name=b''):
@@ -275,14 +334,27 @@ class Flush(Msg):
 class CopyFail(Msg):
     _formats = '>x'
     _fields = 'err_msg'
-@mputils.SeqAccess(attname='args', f=lambda x:(None if x.sz < 0 else x.data))
+    def _parse(self):
+        self.err_msg, _ = get_cstr(self.buf, 5)
+    def _tobytes(self):
+        return self.err_msg + b'\x00'
+@mputils.SeqAccess(attname='args')
 class FunctionCall(Msg):
     _formats = '>i >h -0>h >24X >h'
     _fields = 'foid fc_cnt fc_list args res_fc'
+    def _parse(self):
+        sidx = 5
+        self.foid = get_int(self.buf, sidx); sidx += 4
+        self.fc_cnt = get_short(self.buf, sidx); sidx += 2
+        self.fc_list = get_nshort(self.buf, sidx, self.fc_cnt); sidx += 2*self.fc_cnt
+        self.args, sz = get_24X(self.buf, sidx); sidx += sz
+        self.res_fc = get_short(self.buf, sidx)
+    def _tobytes(self):
+        return b''.join((put_int(self.foid), put_short(self.fc_cnt), put_nshort(self.fc_list), 
+                        put_24X(self.args), put_short(self.res_fc)))
     # fc_list的意思和Bind.make一样。
     @classmethod
     def make(cls, foid, args, fc_list=(), res_fc=0):
-        args = List2Xval(args)
         return cls(foid=foid, fc_cnt=len(fc_list), fc_list=fc_list, args=args, res_fc=res_fc)
 class Terminate(Msg):
     pass
@@ -290,14 +362,28 @@ class Terminate(Msg):
 # AuthResponse包含data，这data由具体的类型解析；反过来具体类型的tobytes结果要赋值给AuthResponse的data。
 # 比如：
 #     r = SASLInitialResponse(name=b'xxxx', response=xval(b'yyyy'))
-#     ar = AuthResponse(data=bytes(r))  or  ar = AuthResponse(r)
+#     ar = AuthResponse(data=bytes(r))
 #     r2 = SASLInitialResponse(ar.data)   不能用ar.tobytes()或者bytes(ar)
 class AuthResponse(Msg):
     _formats = '>a'
     _fields = 'data'
-class PasswordMessage(struct_base):
+    def _parse(self):
+        self.data = self.buf[5:]
+    def _tobytes(self):
+        return self.data
+# 具体AuthResponse类型的buf不包括开头的5个字节。
+class PasswordMessage():
     _formats = '>x'
     _fields = 'password'
+    def __init__(self, buf=None, *, password=None):
+        if buf:
+            self.password, _ = get_cstr(buf, 0)
+        else:
+            self.password = password
+    def tobytes(self):
+        return self.password + b'\x00'
+    def __bytes__(self):
+        return self.tobytes()
     # 参数必须是字节串。如果password是md5开头那说明已经经过一次md5了.
     @classmethod
     def make(cls, password, user=None, md5salt=None):
@@ -309,16 +395,39 @@ class PasswordMessage(struct_base):
             else:
                 password = b'md5' + md5(md5(password + user) + md5salt)
         return cls(password=password)
-class SASLInitialResponse(struct_base):
+class SASLInitialResponse():
     _formats = '>x >4x'
     _fields = 'name response'
-class SASLResponse(struct_base):
+    def __init__(self, buf=None, *, name=None, response=None):
+        if buf:
+            sidx = 0
+            self.name, sidx = get_cstr(buf, sidx)
+            n = get_int(buf, sidx); sidx += 4
+            if n < 0:
+                self.response = None
+            else:
+                self.response = buf[sidx:sidx+n]
+        else:
+            self.name = name
+            self.response = response
+    def tobytes(self):
+        return b''.join((self.name, b'\x00', put_int(len(self.response)), self.response))
+    def __bytes__(self):
+        return self.tobytes()
+class SASLResponse():
     _formats = '>a'
     _fields = 'msgdata'
-class GSSResponse(struct_base):
-    _formats = '>a'
-    _fields = 'msgdata'
-
+    def __init__(self, buf=None, *, msgdata=None):
+        if buf:
+            self.msgdata = buf
+        else:
+            self.msgdata = msgdata
+    def tobytes(self):
+        return self.msgdata
+    def __bytes__(self):
+        return self.tobytes()
+class GSSResponse(SASLResponse):
+    pass
 # 
 # BE msg
 # 
@@ -327,31 +436,40 @@ class GSSResponse(struct_base):
 class Authentication(Msg):
     _formats = '>i >a'
     _fields = 'authtype data'
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._check()
+    def _parse(self):
+        sidx = 5
+        self.authtype = get_int(self.buf, sidx); sidx += 4
+        self.data = self.buf[sidx:]
+    def _tobytes(self):
+        return put_int(self.authtype) + self.data
     # 检查val是否是有效的data，在给data赋值前必须先给authtype赋值。
-    def _check_data(self, val):
-        if not self.field_assigned('authtype'):
-            raise ValueError('authtype should be assigned before data')
-        if self.authtype not in AuthType._HasData and val:
-            raise ValueError('authtype(%s) should has empty data(%s)' % (AuthType.v2smap[self.authtype], val))
-        if self.authtype in AuthType._HasData and not val:
+    def _check(self):
+        if not hasattr(self, 'authtype') or not hasattr(self, 'data'):
+            raise ValueError('authtype or data is not set')
+        if self.authtype not in AuthType._HasData and self.data:
+            raise ValueError('authtype(%s) should has empty data(%s)' % (AuthType.v2smap[self.authtype], self.data))
+        if self.authtype in AuthType._HasData and not self.data:
             raise ValueError('authtype(%s) should has data which is not empty' % (AuthType.v2smap[self.authtype],))
         # 检查具体auth类型的data的有效性
-        if self.authtype == AuthType.AT_MD5Password and len(val) != 4:
-            raise ValueError('the data size for authtype(MD5Password) should be 4:%s' % val)
+        if self.authtype == AuthType.AT_MD5Password and len(self.data) != 4:
+            raise ValueError('the data size for authtype(MD5Password) should be 4:%s' % self.data)
     def __repr__(self):
         return '<%s authtype=%s data=%s>' % (type(self).__name__, AuthType.v2smap[self.authtype], self.data)
     # 根据本消息的类型创建相应的AuthResponse消息
     def make_ar(self, **kwargs):
         if self.authtype in (AuthType.AT_CleartextPassword, AuthType.AT_MD5Password):
-            return AuthResponse(PasswordMessage.make(md5salt=self.data, **kwargs))
+            return AuthResponse(data=PasswordMessage.make(md5salt=self.data, **kwargs).tobytes())
         elif self.authtype == AuthType.AT_SASL:
             sasl = SASL(self.data)
             mechs = list(sasl)
             if 'SCRAM-SHA-256' not in mechs:
                 raise RuntimeError('only support SCRAM-SHA-256. server support %s' % mechs)
-            return AuthResponse(kwargs['sasl_init_resp_msg'])
+            return AuthResponse(data=kwargs['sasl_init_resp_msg'].tobytes())
         elif self.authtype == AuthType.AT_SASLContinue:
-            return AuthResponse(kwargs['sasl_resp_msg'])
+            return AuthResponse(data=kwargs['sasl_resp_msg'].tobytes())
         else:
             raise ValueError('do not support authentication:%s' % AuthType.v2smap[self.authtype])
 Authentication.Ok = Authentication(authtype=AuthType.AT_Ok, data=b'')
@@ -360,18 +478,30 @@ Authentication.Ok = Authentication(authtype=AuthType.AT_Ok, data=b'')
 # 要想支持scram，在设置用户密码的时候必须把password_encryption设为'scram-sha-256'
 # SASL: Simple Authentication and Security Layer
 @mputils.SeqAccess(attname='mech_name_list', f=lambda x:bytes(x).decode('ascii'))
-class SASL(struct_base):
+class SASL():
     _formats = '>X'
     _fields = 'mech_name_list'
+    def __init__(self, buf=None, *, mech_name_list=None):
+        if buf:
+            self.mech_name_list = get_X(buf, 0)
+        else:
+            self.mech_name_list = mech_name_list
+    def tobytes(self):
+        return put_X(self.mech_name_list)
+    def __bytes__(self):
+        return self.tobytes()
     @classmethod
     def make(cls, *names):
-        names = (name.encode('ascii') if type(name)==str else name for name in names)
-        mech_name_list = Xval(names)
+        mech_name_list = [name.encode('ascii') if type(name)==str else name for name in names]
         return cls(mech_name_list=mech_name_list)
 
 class BackendKeyData(Msg):
     _formats = '>i >i'
     _fields = 'pid skey'
+    def _parse(self):
+        self.pid, self.skey = get_nint(self.buf, 5, 2)
+    def _tobytes(self):
+        return put_nint((self.pid, self.skey))
 class BindComplete(Msg):
     pass
 class CloseComplete(Msg):
@@ -379,16 +509,30 @@ class CloseComplete(Msg):
 class CommandComplete(Msg):
     _formats = '>x'
     _fields = 'tag'
+    def _parse(self):
+        self.tag, _ = get_cstr(self.buf, 5)
+    def _tobytes(self):
+        return self.tag + b'\x00'
 class CopyData(Msg):
-    _check_assign = False
     _formats = '>a'
     _fields = 'data'
+    def _parse(self):
+        self.data = self.buf[5:]
+    def _tobytes(self):
+        return self.data
 class CopyDone(Msg):
     pass
 # just base class for Copy In/Out/Both Response
 class CopyResponse(Msg):
     _formats = '>b >h -0>h'
     _fields = 'overall_fmt col_cnt col_fc_list'
+    def _parse(self):
+        sidx = 5
+        self.overall_fmt = get_byte(self.buf, sidx); sidx += 1
+        self.col_cnt = get_short(self.buf, sidx); sidx += 2
+        self.col_fc_list = get_nshort(self.buf, sidx, self.col_cnt)
+    def _tobytes(self):
+        return b''.join((put_byte(self.overall_fmt), put_short(self.col_cnt), put_nshort(self.col_fc_list)))
     @classmethod
     def make(cls, overall_fmt, col_fc_list):
         return cls(overall_fmt=overall_fmt, col_cnt=len(col_fc_list), col_fc_list=col_fc_list)
@@ -398,19 +542,20 @@ class CopyOutResponse(CopyResponse):
     pass
 class CopyBothResponse(CopyResponse):
     pass
-@mputils.SeqAccess(attname='col_vals', f=lambda x:(None if x.sz < 0 else x.data))
+@mputils.SeqAccess(attname='col_vals')
 class DataRow(Msg):
     _formats = '>24X'
     _fields = 'col_vals'
+    def _parse(self):
+        self.col_vals, sz = get_24X(self.buf, 5)
+    def _tobytes(self):
+        return put_24X(self.col_vals)
     # 参数必须是字节串或者None
     @classmethod
     def make(cls, *vals):
-        return cls(col_vals=List2Xval(vals))
+        return cls(col_vals=vals)
     def get_size(self):
-        sz = 5 + 2
-        for x in self.col_vals:
-            sz += 4 + len(x)
-        return sz
+        return len(bytes(self))
 class EmptyQueryResponse(Msg):
     pass
 # field_list是字节串列表，字节串中第一个字节是fieldtype, 剩下的是fieldval
@@ -422,6 +567,10 @@ class ErrorNoticeResponse(Msg):
         self._cached_fields = None
         super().__init__(*args, **kwargs)
         self._cached_fields = collections.OrderedDict(self.get())
+    def _parse(self):
+        self.field_list = get_X(self.buf, 5)
+    def _tobytes(self):
+        return put_X(self.field_list)
     def __getattr__(self, name):
         if self._cached_fields is None:
             raise AttributeError("'%s' object has no attribute '%s'" % (type(self).__name__, name))
@@ -453,7 +602,7 @@ class ErrorNoticeResponse(Msg):
             if t not in FieldType.v2smap:
                 raise ValueError('unknown field type:%s' % t)
             field_list.append(t + v)
-        return cls(field_list=Xval(field_list))
+        return cls(field_list=field_list)
     @classmethod
     def make_error(cls, message, detail=None, hint=None):
         fields = []
@@ -472,19 +621,48 @@ class NoticeResponse(ErrorNoticeResponse):
 class FunctionCallResponse(Msg):
     _formats = '>4x'
     _fields = 'res_val'
-    def value(self):
-        return (None if self.res_val.sz < 0 else bytes(self.res_val))
+    def _parse(self):
+        sidx = 5
+        n = get_int(self.buf, sidx); sidx += 4
+        if n < 0:
+            self.res_val = None
+        else:
+            self.res_val = self.buf[sidx:sidx+n]
+    def _tobytes(self):
+        if self.res_val is None:
+            return struct.pack('>i', -1)
+        else:
+            return struct.pack('>i', len(self.res_val)) + self.res_val
 class NoData(Msg):
     pass
 class NotificationResponse(Msg):
     _formats = '>i >x >x'
     _fields = 'pid channel payload'
+    def _parse(self):
+        sidx = 5
+        self.pid = get_int(self.buf, sidx); sidx += 5
+        self.channel, sidx = get_cstr(self.buf, sidx)
+        self.payload, sidx = get_cstr(self.buf, sidx)
+    def _tobytes(self):
+        return b''.join((put_int(self.pid), self.channel, b'\x00', self.payload, b'\x00'))
 class ParameterDescription(Msg):
     _formats = '>h -0>i'
     _fields = 'count oid_list'
+    def _parse(self):
+        sidx = 5
+        self.count = get_short(self.buf, sidx); sidx += 2
+        self.oid_list = get_nint(self.buf, sidx, self.count)
+    def _tobytes(self):
+        return put_short(self.count) + put_nint(self.oid_list)
 class ParameterStatus(Msg):
     _formats = '>x >x'
     _fields = 'name val'
+    def _parse(self):
+        sidx = 5
+        self.name, sidx = get_cstr(self.buf, sidx)
+        self.val, sidx = get_cstr(self.buf, sidx)
+    def _tobytes(self):
+        return b''.join((self.name, b'\x00', self.val, b'\x00'))
     @classmethod
     def make(cls, name, val):
         name = name.encode('ascii') if type(name) is str else name
@@ -498,6 +676,10 @@ class PortalSuspended(Msg):
 class ReadyForQuery(Msg):
     _formats = '>s'
     _fields = 'trans_status'
+    def _parse(self):
+        self.trans_status = self.buf[5:6]
+    def _tobytes(self):
+        return self.trans_status
 ReadyForQuery.Idle = ReadyForQuery(trans_status=TransStatus.TS_Idle)
 ReadyForQuery.InBlock = ReadyForQuery(trans_status=TransStatus.TS_InBlock)
 ReadyForQuery.Fail = ReadyForQuery(trans_status=TransStatus.TS_Fail)
@@ -506,6 +688,19 @@ ReadyForQuery.Fail = ReadyForQuery(trans_status=TransStatus.TS_Fail)
 class RowDescription(Msg):
     _formats = '>h -0>xihihih'
     _fields = 'field_cnt field_list'
+    def _parse(self):
+        sidx = 5
+        self.field_cnt = get_short(self.buf, sidx); sidx += 2
+        self.field_list = []
+        for i in range(self.field_cnt):
+            name, sidx = get_cstr(self.buf, sidx)
+            tableoid, attnum, typoid, typlen, typmod, fmtcode = struct.unpack('>ihihih', self.buf[sidx:sidx+18]); sidx += 18
+            self.field_list.append((name, tableoid, attnum, typoid, typlen, typmod, fmtcode))
+    def _tobytes(self):
+        data = put_short(self.field_cnt)
+        for f in self.field_list:
+            data += f.name + b'\x00' + struct.pack('>ihihih', f.tableoid, f.attnum, f.typoid, f.typlen, f.typmod, f.fmtcode)
+        return data
     # 参数可以是序列也可以是字典
     @classmethod
     def make(cls, *fields):
@@ -553,11 +748,17 @@ class StartupMessage(Msg):
         # cached value
         self._params_dict = None
         self._hv = None
+    def _parse(self):
+        sidx = 4
+        self.code = get_int(self.buf, sidx); sidx += 4
+        self.params = get_X(self.buf, sidx)
+    def _tobytes(self):
+        return put_int(self.code) + put_X(self.params)
     def get_params(self):
         # 把params转成dict，dict的key转成str，value是字节串
         if not self._params_dict:
-            it = iter(self.params)
             f = lambda x: (bytes(x[0]).decode('ascii'), bytes(x[1]))
+            it = iter(self.params)
             self._params_dict = dict(map(f, zip(it, it)))
         return self._params_dict
     def __getitem__(self, key):
@@ -571,6 +772,7 @@ class StartupMessage(Msg):
         for k, v in self.get_params().items():
             self._hv += hash(k) + hash(v)
         return self._hv
+    # other是字典
     def match(self, other, skip=('host','port','password')):
         def xf(x):
             x = copy.copy(x)
@@ -582,8 +784,10 @@ class StartupMessage(Msg):
         return m1 == m2
     def md5(self):
         data = b''
-        for k, v in self.get_params().items():
-            data += v
+        keys = list(self.get_params().keys())
+        keys.sort()
+        for k in keys:
+            data += self.get_params()[k]
         return md5(data)
     @classmethod
     def make(cls, **kwargs):
@@ -593,25 +797,27 @@ class StartupMessage(Msg):
             if type(v) is str:
                 v = v.encode('ascii')
             params.append(v)
-        return cls(params = Xval(params))
+        return cls(params = params)
 class CancelRequest(Msg):
     _formats = '>i >i >i'
     _fields = 'code pid skey'
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.code = PG_CANCELREQUEST_CODE
+    def _parse(self):
+        self.code, self.pid, self.skey = get_nint(self.buf, 4, 3)
+    def _tobytes(self):
+        return put_nint((self.code, self.pid, self.skey))
 class SSLRequest(Msg):
     _formats = '>i'
     _fields = 'code'
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.code = PG_SSLREQUEST_CODE
-# 用于处理nnX(非00X/X)，负值串和None相互转换。
-def Xval2List(v):
-    return [None if x.sz < 0 else x.data for x in v]
-def List2Xval(vlist):
-    xlist = (xval(b'', sz=-1) if v is None else v for v in vlist)
-    return Xval(xlist)
+    def _parse(self):
+        self.code = get_int(self.buf, 4)
+    def _tobytes(self):
+        return put_int(self.code)
 
 #============================================================================================
 # 和协议解析不直接相关的
@@ -623,11 +829,11 @@ def startup_msg_is_complete(data):
         return False
     msg_len = struct.unpack('>i', data[:4])[0]
     if data_len > msg_len:
-        raise RuntimeError('startup msg is invalid. msg_len:%s data_len:%s' % (msg_len, data_len))
+        raise RuntimeError('startup msg is invalid. msg_len:%s data_len:%s data:%s' % (msg_len, data_len, data))
     return data_len == msg_len
-# 分析FE的第一个消息，返回相应的消息类的对象或者抛出异常。data不包括开头表示大小的4个字节。
+# 分析FE的第一个消息，返回相应的消息类的对象或者抛出异常。data包括开头表示大小的4个字节。
 def parse_startup_msg(data):
-    code = struct.unpack('>i', data[:4])[0]
+    code = struct.unpack('>i', data[4:8])[0]
     if code == PG_PROTO_VERSION2_NUM:
         raise RuntimeError('do not support version 2 protocol')
     elif code == PG_PROTO_VERSION3_NUM:
@@ -637,7 +843,7 @@ def parse_startup_msg(data):
     elif code == PG_SSLREQUEST_CODE:
         return SSLRequest(data)
     else:
-        raise RuntimeError('unknown code(%s) in startup msg' % code)
+        raise RuntimeError('unknown code(%s) in startup msg:%s' % (code, data))
 # 判断data中从idx开始是否有完整的消息，返回消息包的长度(包括开头5个字节)。如果没有完整消息则返回0。
 def has_msg(data, idx, *, fe=True):
     data_len = len(data)
@@ -668,10 +874,10 @@ def parse_pg_msg(data, max_msg=0, stop=None, *, fe=True):
         if msg_len <= 0:
             break
         msg_type = data[idx:idx+1]
-        msg_data = data[idx+5:idx+msg_len]
+        msg_data = data[idx:idx+msg_len]
         idx += msg_len
         
-        msg = msg_map[msg_type](msg_data)
+        msg = msg_map[msg_type[0]](msg_data)
         msg_list.append(msg)
         if stop:
             if callable(stop):
@@ -687,18 +893,20 @@ class RawMsg():
     def __init__(self, data, sidx=0, eidx=None):
         self.data = data
         self.sidx, self.eidx = sidx, eidx
+        if self.sidx is None:
+            self.sidx = 0
+        if self.eidx is None:
+            self.eidx = len(self.data)
     @property
     def msg_type(self):
         return self.data[self.sidx:self.sidx+1]
     def __len__(self):
-        s = 0 if self.sidx is None else self.sidx
-        e = len(self.data) if self.eidx is None else self.eidx
-        return e - s
+        return self.eidx - self.sidx
     def __bytes__(self):
         return self.data[self.sidx:self.eidx]
     def to_msg(self, *, fe):
         msg_map = MsgMeta.fe_msg_map if fe else MsgMeta.be_msg_map
-        return msg_map[self.msg_type](self.data[self.sidx+5:self.eidx])
+        return msg_map[self.msg_type[0]](self.data[self.sidx:self.eidx])
     def to_rawmsg(self):
         return self
     # 返回的消息对象是独立的，不和任何RawMsgChunk共享data。
