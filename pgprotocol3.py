@@ -17,12 +17,7 @@ import hashlib
 import collections
 import copy
 import mputils
-import scram
-from miscutils import *
-try:
-    import cutils
-except ImportError:
-    cutils = None
+from pgparse import *
 
 # 输入输出都是bytes类型
 def md5(bs):
@@ -855,6 +850,9 @@ def has_msg(data, idx, *, fe=True):
     if data_len -idx < msg_len + 1:
         return 0
     return msg_len + 1
+class MsgChunk():
+    def __init__(self, data, msg_idxs):
+        pass
 # 
 # 从data中提取多个消息包，返回下一个idx和消息对象列表。该函数不能用于parse从FE发给BE的第一个消息。
 #   data : 原始数据。

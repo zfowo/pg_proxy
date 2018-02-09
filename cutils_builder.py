@@ -10,6 +10,7 @@ import cffi
 
 ffibuilder = cffi.FFI()
 ffibuilder.cdef('''
+int get_byte(const char * data, int sidx);
 int get_short(const char * data, int sidx);
 int get_int(const char * data, int sidx);
 void get_nshort(const char * data, int sidx, int num, short * res);
@@ -21,8 +22,14 @@ ffibuilder.set_source('cutils',
 '''
 #include <stdlib.h>
 #include <string.h>
+
 #define GET_SHORT(n, data, sidx) do {char * pc=(char *)&(n); pc[0]=(data)[(sidx)+1]; pc[1]=(data)[(sidx)];} while (0)
 #define GET_INT(n, data, sidx) do {char * pc=(char *)&(n); pc[0]=(data)[(sidx)+3]; pc[1]=(data)[(sidx)+2]; pc[2]=(data)[(sidx)+1]; pc[3]=(data)[(sidx)];} while (0)
+
+int get_byte(const char * data, int sidx)
+{
+    return data[sidx];
+}
 int get_short(const char * data, int sidx)
 {
     short n = 0;
