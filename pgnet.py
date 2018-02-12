@@ -1,7 +1,7 @@
 #!/bin/env python3
 # -*- coding: GBK -*-
 # 
-# 
+# 使用pgconn的单线程程序可以用pypy来执行，可以提高性能。
 # 
 import sys, os, socket, time
 import traceback
@@ -83,80 +83,69 @@ class connbase():
             except BlockingIOError:
                 return
             self.send_buf = self.send_buf[sz:]
-    # 返回解析后的消息列表。max_msg指定最多返回多少个消息。
-    def read_msgs(self, max_msg=0, stop=None):
+    # 通用读写消息函数
+    # 返回消息列表。max_msg指定最多返回多少个消息。
+    def _read_x_msgs(self, parsefunc, max_msg=0, stop=None):
         self._read()
         if not self.recv_buf:
             return []
-        idx, msg_list = p.parse_pg_msg(self.recv_buf, max_msg, stop, fe=self.is_fe())
+        idx, msg_list = parsefunc(self.recv_buf, max_msg, stop)
         if msg_list:
             self.recv_buf = self.recv_buf[idx:]
         return msg_list
     # 返回还剩多少个字节没有发送。msg_list为空则会发送上次剩下的数据。
-    def write_msgs(self, msg_list=()):
-        if self.log_msg:
-            prefix_str = 'BE' if self.is_fe() else 'FE'
+    def _write_x_msgs(self, msgs_type, msg_list=()):
+        if self.log_msg and msg_list:
+            fe = self.is_fe()
+            prefix_str = 'BE' if fe else 'FE'
             for msg in msg_list:
-                print('%s: %s' % (prefix_str, msg))
+                print('%s: %s' % (prefix_str, msg.to_msg(fe=not fe)))
         if msg_list:
-            self.send_buf += b''.join(msg.tobytes() for msg in msg_list)
+            if type(msg_list) is msgs_type:
+                self.send_buf += bytes(msg_list)
+            else:
+                self.send_buf += b''.join(bytes(msg) for msg in msg_list)
         self._write()
         return len(self.send_buf)
     # 一直读直到有消息为止
-    def read_msgs_until_avail(self, max_msg=0, stop=None):
-        msg_list = self.read_msgs(max_msg, stop)
+    def _read_x_msgs_until_avail(self, read_msgs_func, max_msg=0, stop=None):
+        msg_list = read_msgs_func(max_msg, stop)
         while not msg_list:
             self.pollin()
-            msg_list = self.read_msgs(max_msg, stop)
+            msg_list = read_msgs_func(max_msg, stop)
         return msg_list
     # 一直写直到写完为止
-    def write_msgs_until_done(self, msg_list=()):
+    def _write_x_msgs_until_done(self, write_msgs_func, msg_list=()):
         if msg_list:
-            if not self.write_msgs(msg_list):
+            if not write_msgs_func(msg_list):
                 return
         if not self.send_buf:
             return
-        while self.write_msgs():
+        while write_msgs_func():
             self.pollout()
+    # 对于read，返回值是MsgChunk。
+    # 对于write，msg_list是MsgChunk或者Msg列表。
+    def read_msgs(self, max_msg=0, stop=None):
+        return self._read_x_msgs(functools.partial(p.parse_pg_msg, fe=self.is_fe()), max_msg, stop)
+    def write_msgs(self, msg_list=()):
+        return self._write_x_msgs(p.MsgChunk, msg_list)
+    def read_msgs_until_avail(self, max_msg=0, stop=None):
+        return self._read_x_msgs_until_avail(self.read_msgs, max_msg, stop)
+    def write_msgs_until_done(self, msg_list=()):
+        return self._write_x_msgs_until_done(self.write_msgs, msg_list)
     def write_msg(self, msg):
         return self.write_msgs((msg,))
     # raw消息读写
-    # 对于read，返回值raw_msg_list是RawMsgChunk。
+    # 对于read，返回值是RawMsgChunk。
     # 对于write，raw_msg_list是RawMsgChunk或者RawMsg列表。
     def read_raw_msgs(self, max_msg=0, stop=None):
-        self._read()
-        if not self.recv_buf:
-            return []
-        idx, raw_msg_list = p.parse_raw_pg_msg(self.recv_buf, max_msg, stop)
-        if raw_msg_list:
-            self.recv_buf = self.recv_buf[idx:]
-        return raw_msg_list
+        return self._read_x_msgs(p.parse_raw_pg_msg, max_msg, stop)
     def write_raw_msgs(self, raw_msg_list=()):
-        if self.log_msg and raw_msg_list:
-            prefix_str = 'BE' if self.is_fe() else 'FE'
-            for raw_msg in raw_msg_list:
-                print('%s: %s' % (prefix_str, raw_msg.to_msg(fe=not self.is_fe())))
-        if raw_msg_list:
-            if type(raw_msg_list) is p.RawMsgChunk:
-                self.send_buf += bytes(raw_msg_list)
-            else:
-                self.send_buf += b''.join(bytes(raw_msg) for raw_msg in raw_msg_list)
-        self._write()
-        return len(self.send_buf)
+        return self._write_x_msgs(p.RawMsgChunk, raw_msg_list)
     def read_raw_msgs_until_avail(self, max_msg=0, stop=None):
-        raw_msg_list = self.read_raw_msgs(max_msg, stop)
-        while not raw_msg_list:
-            self.pollin()
-            raw_msg_list = self.read_raw_msgs(max_msg, stop)
-        return raw_msg_list
+        return self._read_x_msgs_until_avail(self.read_raw_msgs, max_msg, stop)
     def write_raw_msgs_until_done(self, raw_msg_list=()):
-        if raw_msg_list:
-            if not self.write_raw_msgs(raw_msg_list):
-                return
-        if not self.send_buf:
-            return
-        while self.write_raw_msgs():
-            self.pollout()
+        return self._write_x_msgs_until_done(self.write_raw_msgs, raw_msg_list)
     def write_raw_msg(self, raw_msg):
         return self.write_raw_msgs((raw_msg,))
     # context manager
@@ -326,7 +315,7 @@ class pgconn(beconn):
             return 0
         msg_list = self.read_msgs()
         for m in msg_list:
-            self._got_async_msg(m)
+            self._got_async_msg(m.copy())
         return len(msg_list)
     # 简单查询，如果返回值是CopyResponse则需要调用process继续进行copy操作。
     def query(self, sql):
@@ -569,11 +558,11 @@ class StartupMessageProcesser(MsgProcesser):
                 got_ready = True
                 break
             elif m.msg_type == p.MsgType.MT_NoticeResponse:
-                self.cnn._got_async_msg(m)
+                self.cnn._got_async_msg(m.copy())
             elif m.msg_type == p.MsgType.MT_ErrorResponse:
-                raise pgfatal(m)
+                raise pgfatal(m.copy())
             else:
-                raise pgfatal(m, self.UnknownMsgErr)
+                raise pgfatal(m.copy(), self.UnknownMsgErr)
         if got_ready:
             return
         msg_list = self.cnn.read_msgs_until_avail()
@@ -631,17 +620,17 @@ class QueryProcesser(MsgProcesser):
                 got_ready = True
                 break
             elif m.msg_type == p.MsgType.MT_ErrorResponse:
-                self.ex = pgerror(m)
+                self.ex = pgerror(m.copy())
             elif m.msg_type == p.MsgType.MT_EmptyQueryResponse:
-                self.ex = pgerror(m)
+                self.ex = pgerror(m.copy())
             elif m.msg_type in self.cnn.async_msgs: # async msg
-                self.cnn._got_async_msg(m)
+                self.cnn._got_async_msg(m.copy())
             elif m.msg_type == p.MsgType.MT_CopyInResponse:
                 self.cnn.processer = CopyInResponseProcesser(self.cnn, msg_list[idx:])
-                return m
+                return m.copy()
             elif m.msg_type == p.MsgType.MT_CopyOutResponse:
                 self.cnn.processer = CopyOutResponseProcesser(self.cnn, msg_list[idx:])
-                return m
+                return m.copy()
             # 扩展查询相关的消息
             elif m.msg_type == p.MsgType.MT_ParseComplete:
                 pass
@@ -653,7 +642,7 @@ class QueryProcesser(MsgProcesser):
                 pass
             else:
                 # 这里不直接抛出异常，需要处理到ReadyForQuery之后才能把它抛出。
-                self.ex = pgerror(m, self.UnknownMsgErr)
+                self.ex = pgerror(m.copy(), self.UnknownMsgErr)
         return got_ready
 class Query2Processer(QueryProcesser):
     def __init__(self, cnn, discard_qr=False):
@@ -677,7 +666,7 @@ class CopyResponseProcesser(MsgProcesser):
     # msg_list[0] is CopyInResponse or CopyOutResponse msg
     def __init__(self, cnn, msg_list):
         super().__init__(cnn, cnn.processer)
-        self.cr_msg = msg_list[0]
+        self.cr_msg = msg_list[0].copy()
         self.msg_list = msg_list[1:]
     def _get_msg_list(self):
         if self.msg_list:
@@ -705,9 +694,9 @@ class CopyInResponseProcesser(CopyResponseProcesser):
             msg_list = self._get_msg_list()
             for m in msg_list:
                 if m.msg_type in self.cnn.async_msgs:
-                    self.cnn._got_async_msg(m)
+                    self.cnn._got_async_msg(m.copy())
                 else: # 异常消息(包括ErrorResponse)则退出CopyIn模式。不需要发送CopyFail。
-                    self.prev_processer.msgs_from_copy.append(m)
+                    self.prev_processer.msgs_from_copy.append(m.copy())
             if self.prev_processer.msgs_from_copy:
                 return False
         msgs.append(p.CopyDone())
@@ -729,7 +718,7 @@ class CopyOutResponseProcesser(CopyResponseProcesser):
                     self.prev_processer.msgs_from_copy.extend(msg_list[idx+1:])
                     return
                 elif m.msg_type in self.cnn.async_msgs:
-                    self.cnn._got_async_msg(m)
+                    self.cnn._got_async_msg(m.copy())
                 else: # 异常消息(包括ErrorResponse)则退出CopyOut模式。
                     self.prev_processer.msgs_from_copy.extend(msg_list[idx:])
                     return

@@ -3,6 +3,7 @@
 # 
 # 语句级别的连接池。
 # 使用有名字的Parse/Bind的时候，如果前端在发送Close之前就异常断开了，那么语句/portal不会被close。
+# 不要用pypy运行本程序，因为pypy的多线程好像不稳定，时快时慢。
 # 
 import sys, os, time, datetime
 import collections, socket, copy
@@ -232,6 +233,7 @@ class pgstmtworker():
             if msg.msg_type == p.MsgType.MT_Authentication and msg.authtype == p.AuthType.AT_Ok:
                 self.auth_ok_msgs = self.auth_ok_msgs[idx:]
                 break
+        self.auth_ok_msgs = [m.copy() for m in self.auth_ok_msgs]
         self.becnn.params, self.becnn.be_keydata = p.parse_auth_ok_msgs(self.auth_ok_msgs)
         self.main_queue.put(('ok', fecnn, self))
         return True

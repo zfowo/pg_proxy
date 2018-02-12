@@ -7,6 +7,7 @@
 # 传给Msg派生类的buf包含开头的5个字节(或者4个字节)。
 # 
 # ** 所有消息类的对象在创建之后都不要修改已经赋值的属性 **
+# ** 如果要保留从MsgChunk/RawMsgChunk获得的单个消息留作以后用，则需要保存copy的返回值，而不是直接保存消息 **
 # 
 # 现在对于不能识别的消息类型直接抛出异常，这样做可能不是很合适，因为pg新版本可能增加新的消息类型。
 # TODO: 有些消息类型的所有对象其实都是相同的，所以可以预先创建这些对象及其bytes。类似于NoneType类型只有None这一个对象。
@@ -157,6 +158,8 @@ class MsgMeta(type):
                 _fields = _fields.split()
             if set(_fields) & set(ns):
                 raise ValueError('_fields can not contain class attribute')
+            if set(_fields) & {'buf', 'sidx', 'eidx'}:
+                raise ValueError('_fields can not contain buf/sidx/eidx')
             for fn in _fields:
                 if fn[0] == '_':
                     raise ValueError('fieldname in _fields can not starts with undercore')
@@ -174,14 +177,16 @@ class MsgMeta(type):
 # 派生类需要实现_parse和_tobytes函数。
 class Msg(metaclass=MsgMeta):
     _fields = ''
-    def __init__(self, buf=None, **kwargs):
+    def __init__(self, buf=None, sidx=0, eidx=None, **kwargs):
         if buf is not None and kwargs:
             raise ValueError('buf and kwargs can not be given meanwhile')
         if buf:
             self.buf = buf
+            self.sidx, self.eidx = sidx, eidx
             self._parse()
         else:
             self.buf = None
+            self.sidx, self.eidx = 0, None
             self._init_from_kwargs(kwargs)
     def _init_from_kwargs(self, kwargs):
         for k, v in kwargs.items():
@@ -190,7 +195,7 @@ class Msg(metaclass=MsgMeta):
             setattr(self, k, v)
     def tobytes(self):
         if self.buf:
-            return self.buf
+            return self.buf[self.sidx:self.eidx]
         data = self._tobytes()
         header = self.msg_type + struct.pack('>i', len(data)+4)
         self.buf = header + data
@@ -212,6 +217,18 @@ class Msg(metaclass=MsgMeta):
         return self
     def to_rawmsg(self):
         return RawMsg(self.tobytes())
+    def copy(self, nobuf=False):
+        m = object.__new__(type(self))
+        if nobuf:
+            m.buf = None
+        elif self.buf:
+            m.buf = bytes(self)
+        else:
+            m.buf = None
+        m.sidx, m.eidx = 0, None
+        for f in m._fields:
+            setattr(m, f, getattr(self, f))
+        return m
 # 
 # FE msg
 # 
@@ -223,7 +240,7 @@ class Query(Msg):
     _formats = '>x'
     _fields = 'query'
     def _parse(self):
-        self.query, _ = get_cstr(self.buf, 5)
+        self.query, _ = get_cstr(self.buf, self.sidx + 5)
     def _tobytes(self):
         return self.query + b'\x00'
     @classmethod
@@ -241,7 +258,7 @@ class Parse(Msg):
     _formats = '>x >x >h -0>i'
     _fields = 'stmt query param_cnt param_oids'
     def _parse(self):
-        sidx = 5
+        sidx = self.sidx + 5
         self.stmt, sidx = get_cstr(self.buf, sidx)
         self.query, sidx = get_cstr(self.buf, sidx)
         self.param_cnt = get_short(self.buf, sidx); sidx += 2
@@ -259,7 +276,7 @@ class Bind(Msg):
     _formats = '>x >x >h -0>h >24X >h -0>h'
     _fields = 'portal stmt fc_cnt fc_list params res_fc_cnt res_fc_list'
     def _parse(self):
-        sidx = 5
+        sidx = self.sidx + 5
         self.portal, sidx = get_cstr(self.buf, sidx)
         self.stmt, sidx = get_cstr(self.buf, sidx)
         self.fc_cnt = get_short(self.buf, sidx); sidx += 2
@@ -289,7 +306,7 @@ class Execute(Msg):
     _formats = '>x >i'
     _fields = 'portal max_num'
     def _parse(self):
-        sidx = 5
+        sidx = self.sidx + 5
         self.portal, sidx = get_cstr(self.buf, sidx)
         self.max_num = get_int(self.buf, sidx)
     def _tobytes(self):
@@ -303,7 +320,7 @@ class DescribeClose(Msg):
     _formats = '>s >x'
     _fields = 'obj_type obj_name'
     def _parse(self):
-        sidx = 5
+        sidx = self.sidx + 5
         self.obj_type = self.buf[sidx:sidx+1]; sidx += 1
         self.obj_name, _ = get_cstr(self.buf, sidx)
     def _tobytes(self):
@@ -330,7 +347,7 @@ class CopyFail(Msg):
     _formats = '>x'
     _fields = 'err_msg'
     def _parse(self):
-        self.err_msg, _ = get_cstr(self.buf, 5)
+        self.err_msg, _ = get_cstr(self.buf, self.sidx + 5)
     def _tobytes(self):
         return self.err_msg + b'\x00'
 @mputils.SeqAccess(attname='args')
@@ -338,7 +355,7 @@ class FunctionCall(Msg):
     _formats = '>i >h -0>h >24X >h'
     _fields = 'foid fc_cnt fc_list args res_fc'
     def _parse(self):
-        sidx = 5
+        sidx = self.sidx + 5
         self.foid = get_int(self.buf, sidx); sidx += 4
         self.fc_cnt = get_short(self.buf, sidx); sidx += 2
         self.fc_list = get_nshort(self.buf, sidx, self.fc_cnt); sidx += 2*self.fc_cnt
@@ -363,7 +380,7 @@ class AuthResponse(Msg):
     _formats = '>a'
     _fields = 'data'
     def _parse(self):
-        self.data = self.buf[5:]
+        self.data = self.buf[self.sidx+5:self.eidx]
     def _tobytes(self):
         return self.data
 # 具体AuthResponse类型的buf不包括开头的5个字节。
@@ -435,9 +452,9 @@ class Authentication(Msg):
         super().__init__(*args, **kwargs)
         self._check()
     def _parse(self):
-        sidx = 5
+        sidx = self.sidx + 5
         self.authtype = get_int(self.buf, sidx); sidx += 4
-        self.data = self.buf[sidx:]
+        self.data = self.buf[sidx:self.eidx]
     def _tobytes(self):
         return put_int(self.authtype) + self.data
     # 检查val是否是有效的data，在给data赋值前必须先给authtype赋值。
@@ -494,7 +511,7 @@ class BackendKeyData(Msg):
     _formats = '>i >i'
     _fields = 'pid skey'
     def _parse(self):
-        self.pid, self.skey = get_nint(self.buf, 5, 2)
+        self.pid, self.skey = get_nint(self.buf, self.sidx + 5, 2)
     def _tobytes(self):
         return put_nint((self.pid, self.skey))
 class BindComplete(Msg):
@@ -505,14 +522,14 @@ class CommandComplete(Msg):
     _formats = '>x'
     _fields = 'tag'
     def _parse(self):
-        self.tag, _ = get_cstr(self.buf, 5)
+        self.tag, _ = get_cstr(self.buf, self.sidx + 5)
     def _tobytes(self):
         return self.tag + b'\x00'
 class CopyData(Msg):
     _formats = '>a'
     _fields = 'data'
     def _parse(self):
-        self.data = self.buf[5:]
+        self.data = self.buf[self.sidx+5:self.eidx]
     def _tobytes(self):
         return self.data
 class CopyDone(Msg):
@@ -522,7 +539,7 @@ class CopyResponse(Msg):
     _formats = '>b >h -0>h'
     _fields = 'overall_fmt col_cnt col_fc_list'
     def _parse(self):
-        sidx = 5
+        sidx = self.sidx + 5
         self.overall_fmt = get_byte(self.buf, sidx); sidx += 1
         self.col_cnt = get_short(self.buf, sidx); sidx += 2
         self.col_fc_list = get_nshort(self.buf, sidx, self.col_cnt)
@@ -542,15 +559,13 @@ class DataRow(Msg):
     _formats = '>24X'
     _fields = 'col_vals'
     def _parse(self):
-        self.col_vals, sz = get_24X(self.buf, 5)
+        self.col_vals, sz = get_24X(self.buf, self.sidx + 5)
     def _tobytes(self):
         return put_24X(self.col_vals)
     # 参数必须是字节串或者None
     @classmethod
     def make(cls, *vals):
         return cls(col_vals=vals)
-    def get_size(self):
-        return len(bytes(self))
 class EmptyQueryResponse(Msg):
     pass
 # field_list是字节串列表，字节串中第一个字节是fieldtype, 剩下的是fieldval
@@ -563,7 +578,7 @@ class ErrorNoticeResponse(Msg):
         super().__init__(*args, **kwargs)
         self._cached_fields = collections.OrderedDict(self.get())
     def _parse(self):
-        self.field_list = get_X(self.buf, 5)
+        self.field_list = get_X(self.buf, self.sidx + 5)
     def _tobytes(self):
         return put_X(self.field_list)
     def __getattr__(self, name):
@@ -589,6 +604,10 @@ class ErrorNoticeResponse(Msg):
         for t, v in self:
             res += ' %s:%s' % (t, v)
         return res + '>'
+    def copy(self, nobuf=False):
+        m = super().copy(nobuf)
+        m._cached_fields = self._cached_fields
+        return m
     # fields是(t,v)或者Field列表
     @classmethod
     def make(cls, *fields):
@@ -617,7 +636,7 @@ class FunctionCallResponse(Msg):
     _formats = '>4x'
     _fields = 'res_val'
     def _parse(self):
-        sidx = 5
+        sidx = self.sidx + 5
         n = get_int(self.buf, sidx); sidx += 4
         if n < 0:
             self.res_val = None
@@ -634,7 +653,7 @@ class NotificationResponse(Msg):
     _formats = '>i >x >x'
     _fields = 'pid channel payload'
     def _parse(self):
-        sidx = 5
+        sidx = self.sidx + 5
         self.pid = get_int(self.buf, sidx); sidx += 5
         self.channel, sidx = get_cstr(self.buf, sidx)
         self.payload, sidx = get_cstr(self.buf, sidx)
@@ -644,7 +663,7 @@ class ParameterDescription(Msg):
     _formats = '>h -0>i'
     _fields = 'count oid_list'
     def _parse(self):
-        sidx = 5
+        sidx = self.sidx + 5
         self.count = get_short(self.buf, sidx); sidx += 2
         self.oid_list = get_nint(self.buf, sidx, self.count)
     def _tobytes(self):
@@ -653,7 +672,7 @@ class ParameterStatus(Msg):
     _formats = '>x >x'
     _fields = 'name val'
     def _parse(self):
-        sidx = 5
+        sidx = self.sidx + 5
         self.name, sidx = get_cstr(self.buf, sidx)
         self.val, sidx = get_cstr(self.buf, sidx)
     def _tobytes(self):
@@ -672,7 +691,7 @@ class ReadyForQuery(Msg):
     _formats = '>s'
     _fields = 'trans_status'
     def _parse(self):
-        self.trans_status = self.buf[5:6]
+        self.trans_status = self.buf[self.sidx+5:self.sidx+6]
     def _tobytes(self):
         return self.trans_status
 ReadyForQuery.Idle = ReadyForQuery(trans_status=TransStatus.TS_Idle)
@@ -684,7 +703,7 @@ class RowDescription(Msg):
     _formats = '>h -0>xihihih'
     _fields = 'field_cnt field_list'
     def _parse(self):
-        sidx = 5
+        sidx = self.sidx + 5
         self.field_cnt = get_short(self.buf, sidx); sidx += 2
         self.field_list = []
         for i in range(self.field_cnt):
@@ -744,7 +763,7 @@ class StartupMessage(Msg):
         self._params_dict = None
         self._hv = None
     def _parse(self):
-        sidx = 4
+        sidx = self.sidx + 4
         self.code = get_int(self.buf, sidx); sidx += 4
         self.params = get_X(self.buf, sidx)
     def _tobytes(self):
@@ -800,7 +819,7 @@ class CancelRequest(Msg):
         super().__init__(*args, **kwargs)
         self.code = PG_CANCELREQUEST_CODE
     def _parse(self):
-        self.code, self.pid, self.skey = get_nint(self.buf, 4, 3)
+        self.code, self.pid, self.skey = get_nint(self.buf, self.sidx + 4, 3)
     def _tobytes(self):
         return put_nint((self.code, self.pid, self.skey))
 class SSLRequest(Msg):
@@ -810,7 +829,7 @@ class SSLRequest(Msg):
         super().__init__(*args, **kwargs)
         self.code = PG_SSLREQUEST_CODE
     def _parse(self):
-        self.code = get_int(self.buf, 4)
+        self.code = get_int(self.buf, self.sidx + 4)
     def _tobytes(self):
         return put_int(self.code)
 
@@ -850,9 +869,86 @@ def has_msg(data, idx, *, fe=True):
     if data_len -idx < msg_len + 1:
         return 0
     return msg_len + 1
+# 返回下一个idx和msg_idxs((idx,sz)的列表)
+def _parse_pg_msg(data, max_msg=0, stop=None):
+    msg_idxs = []
+    idx, cnt = 0, 0
+    while True:
+        if cutils:
+            msg_len = cutils.lib.has_msg(data, len(data), idx)
+        else:
+            msg_len = has_msg(data, idx)
+        if msg_len <= 0:
+            break
+        msg_idxs.append((idx, msg_len))
+        idx += msg_len
+
+        if stop:
+            x = msg_idxs[-1]
+            raw_msg = RawMsg(data, x[0], x[0]+x[1])
+            if callable(stop):
+                if stop(raw_msg): break
+            else:
+                if raw_msg.msg_type in stop: break        
+        cnt += 1
+        if max_msg > 0 and cnt >= max_msg:
+            break
+    return idx, msg_idxs
+# 多个不同的MsgChunk之间不共享data，但是MsgChunk和从它获得的Msg共享data。
+# 调用Msg.copy返回的msg将脱离MsgChunk。
 class MsgChunk():
-    def __init__(self, data, msg_idxs):
-        pass
+    def __init__(self, data, msg_idxs, msg_map):
+        self.data = data
+        self.msg_list = tuple(msg_map[self.data[mi[0]]](self.data, mi[0], mi[0] + mi[1]) for mi in msg_idxs)
+    @classmethod
+    def make(cls, data, msg_list):
+        chunk = object.__new__(cls)
+        chunk.data = data
+        chunk.msg_list = tuple(msg_list)
+        return chunk
+    def __len__(self):
+        return len(self.msg_list)
+    def __getitem__(self, idx):
+        if type(idx) is slice:
+            if idx.step is not None:
+                raise ValueError('MsgChunk do not support extended slice')
+            if (idx.start is None or idx.start == 0) and (idx.stop is None or idx.stop >= len(self)):
+                return self
+            x_list = self.msg_list[idx]
+            if not x_list:
+                return MsgChunk.Empty
+            data = self.data[x_list[0].sidx:x_list[-1].eidx]
+            idx_offset = -(x_list[0].sidx)
+            msg_list = self._copy_msg_list(x_list, data, idx_offset)
+            return self.make(data, msg_list)
+        else:
+            return self.msg_list[idx]
+    def __iter__(self):
+        yield from self.msg_list
+    def __bytes__(self):
+        return self.data
+    def __add__(self, other):
+        if type(other) is not MsgChunk:
+            raise TypeError("unsupported operand type for +: 'MsgChunk' and '%s'" % type(other).__name__)
+        if not self:
+            return other
+        if not other:
+            return self
+        data = self.data + other.data
+        msg_list = self._copy_msg_list(self.msg_list, data, 0)
+        idx_offset = self[-1].eidx
+        msg_list.extend(self._copy_msg_list(other.msg_list, data, idx_offset))
+        return self.make(data, msg_list)
+    def _copy_msg_list(self, msg_list, data, idx_offset):
+        res = []
+        for x in msg_list:
+            m = x.copy(nobuf=True)
+            m.buf = data
+            m.sidx = x.sidx + idx_offset
+            m.eidx = x.eidx + idx_offset
+            res.append(m)
+        return res
+MsgChunk.Empty = MsgChunk.make(b'', ())
 # 
 # 从data中提取多个消息包，返回下一个idx和消息对象列表。该函数不能用于parse从FE发给BE的第一个消息。
 #   data : 原始数据。
@@ -861,31 +957,12 @@ class MsgChunk():
 #   fe : 是否是来自FE的消息。
 # 
 def parse_pg_msg(data, max_msg=0, stop=None, *, fe=True):
-    msg_list = []
-    idx, cnt = 0, 0
     msg_map = MsgMeta.fe_msg_map if fe else MsgMeta.be_msg_map
-    while True:
-        if cutils:
-            msg_len = cutils.lib.has_msg(data, len(data), idx)
-        else:
-            msg_len = has_msg(data, idx, fe=fe)
-        if msg_len <= 0:
-            break
-        msg_type = data[idx:idx+1]
-        msg_data = data[idx:idx+msg_len]
-        idx += msg_len
-        
-        msg = msg_map[msg_type[0]](msg_data)
-        msg_list.append(msg)
-        if stop:
-            if callable(stop):
-                if stop(msg): break
-            else:
-                if msg_type in stop: break
-        cnt += 1
-        if max_msg > 0 and cnt >= max_msg:
-            break
-    return (idx, msg_list)
+    idx, msg_idxs = _parse_pg_msg(data, max_msg, stop)
+    if not msg_idxs:
+        return idx, MsgChunk.Empty
+    else:
+        return idx, MsgChunk(data[:idx], msg_idxs, msg_map)
 # 没有parse过的raw消息
 class RawMsg():
     def __init__(self, data, sidx=0, eidx=None):
@@ -986,28 +1063,7 @@ class RawMsgChunk():
 RawMsgChunk.Empty = RawMsgChunk(b'', [])
 # 从data中提取多个raw消息，返回下一个idx和RawMsgChunk。该函数不能用于parse从FE发给BE的第一个消息。
 def parse_raw_pg_msg(data, max_msg=0, stop=None):
-    msg_idxs = []
-    idx, cnt = 0, 0
-    while True:
-        if cutils:
-            msg_len = cutils.lib.has_msg(data, len(data), idx)
-        else:
-            msg_len = has_msg(data, idx)
-        if msg_len <= 0:
-            break
-        msg_idxs.append((idx, msg_len))
-        idx += msg_len
-
-        if stop:
-            x = msg_idxs[-1]
-            raw_msg = RawMsg(data, x[0], x[0]+x[1])
-            if callable(stop):
-                if stop(raw_msg): break
-            else:
-                if raw_msg.msg_type in stop: break        
-        cnt += 1
-        if max_msg > 0 and cnt >= max_msg:
-            break
+    idx, msg_idxs = _parse_pg_msg(data, max_msg, stop)
     if not msg_idxs:
         return idx, RawMsgChunk.Empty
     else:
