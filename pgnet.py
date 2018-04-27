@@ -198,7 +198,7 @@ class beconn(connbase):
                 s.connect(addr)
                 self.status = 'connected'
         except OSError as ex:
-            raise pgfatal(None, 'connect fail for %s: %s' % (addr, ex))
+            raise pgfatal(None, 'connect fail for %s: %s' % (addr, ex), self)
         super().__init__(s)
     def is_fe(self):
         return False

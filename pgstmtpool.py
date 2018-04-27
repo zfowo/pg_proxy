@@ -15,6 +15,7 @@ import netutils
 import pseudodb
 import mputils
 import miscutils
+from pgmonitor import pgmonitor
 
 # tables列表里的表名以及sql都是str，不是bytes
 # raw_msg_list is RawMsgChunk
@@ -637,7 +638,13 @@ class pgstmtworkerpools():
             self.pools_map.pop(msg)
         if clear:
             pool.clear()
+            pool.close_admin_cnn()
         return pool
+    def remove_byaddr(self, addr, clear=True):
+        pools = self.get_byaddr(addr)
+        for pool in pools:
+            self.remove(pool, clear)
+        return pools
     def get(self, id):
         for pool in self.pools:
             if pool.id == id:
@@ -817,10 +824,13 @@ class pooldb(pseudodb.pseudodb):
         pool_list = self.slaver_pools.get_byaddr(new_master_addr)
         if not pool_list:
             self._write_error('no pool for %s' % (new_master_addr,))
+        
         self.slaver_pools.remove(pool_list[0], clear=False)
+        self.slaver_pools.remove_byaddr(self.master_pool.be_addr, clear=True)
+        miscutils.remove_all(self.g_conf['slaver'], self.master_pool.be_addr)
         self.master_pool.clear()
         globals()['master_pool'] = pool_list[0]
-        self.master_pool = globals()['master_pool']
+        self.g_conf['global']['master_pool'] = self.master_pool = globals()['master_pool']
         self.g_conf['master'] = self.master_pool.be_addr
         self.g_conf['slaver'].remove(self.master_pool.be_addr)
         return self._write_result(['change_master'], [('ok',)])
@@ -1111,7 +1121,7 @@ def modify_recovery_conf():
             cnn = pool.get_admin_cnn(g_conf['admin_cnn'])
             res = cnn.query("select z_change_recovery_conf('%s', %s)" % (m_host, m_port))
         except pgnet.pgexception as ex:
-            print('z_change_recovery_conf fail for pool %s: %s' % (pool.id, ex))
+            print('z_change_recovery_conf fail for pool %s: %s' % (pool.be_addr, ex))
             continue
         slot_name_list.append(res[0][0])
     return slot_name_list
@@ -1127,7 +1137,9 @@ def create_slot_for_slaver(slot_name_list):
             continue
         ret.append(name)
     return ret
+# 返回重启成功的从库addr
 def restart_slaver():
+    ret = []
     addrs_processed = set()
     addrs_processed.add(master_pool.be_addr)
     for pool in slaver_pools:
@@ -1137,8 +1149,10 @@ def restart_slaver():
         try:
             cnn = pool.get_admin_cnn(g_conf['admin_cnn'])
             cnn.query("select z_restart_pg()")
+            ret.append(pool.be_addr)
         except pgnet.pgexception as ex:
-            pass
+            print('z_restart_pg fail for %s: %s' % (pool.be_addr, ex))
+    return ret
 # 通知从连接池主库切换结果
 def notify_spool():
     if g_conf['mode'] == 'slaver' or not g_conf['spool']:
@@ -1167,6 +1181,7 @@ def register_to_mpool(addr):
 # in event loop
 def process_main_queue():
     # process main_queue
+    need_ha = False
     while True:
         try:
             x = main_queue.get_nowait()
@@ -1183,7 +1198,6 @@ def process_main_queue():
                 query_cache_map[w.startup_msg] = QueryCache(w.startup_msg.md5().decode('ascii'))
             w.query_cache = query_cache_map[w.startup_msg]
             if w.pool_id == master_pool.id:
-                master_fail_history.clear()
                 master_pool.add(w)
             else:
                 slaver_pools.add_worker(w)
@@ -1197,11 +1211,6 @@ def process_main_queue():
                 x[1].close()
             w = x[2]
             slaver_workers_to_start.pop(w.id, None)
-            if w.pool_id == master_pool.id:
-                if x[3]: # is_be_problem==True表示后端出问题了
-                    master_fail_history.append(time.time())
-                else:
-                    master_fail_history.clear()
         elif x[0] == 'exit': # ('exit', exit_cause, worker)
             # exit_cause='normal' 表示worker已经被删除，正常退出，此时队列里应该没有东西
             # exit_cause='idle' 表示空闲超时，此时队列里可能有东西
@@ -1210,8 +1219,6 @@ def process_main_queue():
             if exit_cause == 'normal':
                 continue
             if w.pool_id == master_pool.id:
-                if exit_cause == 'befatal':
-                    master_fail_history.append(time.time())
                 master_pool.remove(w)
                 master_pool.dispatch_worker_remain_msg(poll, w)
             else:
@@ -1227,40 +1234,44 @@ def process_main_queue():
             if time.time() > cache_timeout_map[sql]:
                 cache_timeout_map[sql] = time.time() + femsg._comment_info.cache
                 master_pool.dispatch_cmd_msg(startup_msg, ('pagecache', femsg))
+        elif x[0] == 'pgdown': # ('pgdown', host, port)
+            need_ha = True
         else:
             raise RuntimeError('unknow x from main_queue:%s' % (x,))
+    if need_ha:
+        process_ha()
 def process_ha():
     global master_pool
-    if not g_conf.get('enable_ha', False):
-        if len(master_fail_history) >= g_conf.get('ha_after_fail_cnt', 10):
-            print('master_fail_history: %s' % master_fail_history)
-            master_fail_history.clear()
-        return
-    if len(master_fail_history) < g_conf.get('ha_after_fail_cnt', 10):
-        return
     print('start process_ha')
-    master_fail_history.clear()
-    pool, max_lsn = get_newest_slaver()
-    if not pool:
+    new_master_pool, max_lsn = get_newest_slaver()
+    if not new_master_pool:
         print('no newest slaver')
         slaver_pools.close_admin_cnn()
         return
-    if not promote_slaver(pool):
+    print('got newest slaver:%s' % (new_master_pool.be_addr,))
+    if not promote_slaver(new_master_pool):
         slaver_pools.close_admin_cnn()
         return
-    slaver_pools.remove(pool, clear=False)
+    print('promote success')
+    slaver_pools.remove(new_master_pool, clear=False)
+    slaver_pools.remove_byaddr(master_pool.be_addr, clear=True)
+    miscutils.remove_all(g_conf['slaver'], master_pool.be_addr)
     master_pool.clear()
-    master_pool = pool
+    g_conf['global']['master_pool'] = master_pool = new_master_pool
     g_conf['master'] = master_pool.be_addr
-    g_conf['slaver'].remove(master_pool.be_addr)
+    g_conf['slaver'].remove(master_pool.be_addr) # 这里只删除一个
     # 把剩下的从库指向新的主库
     slot_name_list = modify_recovery_conf()
-    create_slot_for_slaver([s for s in slot_name_list if s])
-    restart_slaver()
+    print('modify_recovery_conf: %s' % (slot_name_list,))
+    slot_name_list = create_slot_for_slaver([s for s in slot_name_list if s])
+    print('create_slot_for_slaver: %s' % (slot_name_list,))
+    addr_list = restart_slaver()
+    print('restart_slaver: %s' % (addr_list,))
     master_pool.close_admin_cnn()
     slaver_pools.close_admin_cnn()
     print('process_ha done. master changed to %s. notify spool to change master' % (master_pool.be_addr,))
     notify_spool()
+    mon_worker.start(host=g_conf['master'][0], port=g_conf['master'][1], **g_conf['admin_cnn'])
 # 处理命令行参数以及读取配置文件，返回g_conf。
 def process_args():
     xargs = miscutils.parse_args(sys.argv[1:])
@@ -1309,7 +1320,6 @@ if __name__ == '__main__':
     g_conf['global']['fepool'] = fepool = feconnpool()
     g_conf['global']['main_queue'] = main_queue = queue.Queue()
     slaver_workers_to_start = {} # 记录下需要启动的slaver workers
-    master_fail_history = [] # 后端连续出问题的时间记录，如果有连接成功则清空
     CacheItem.threshold_to_file = g_conf.get('cache_threshold_to_file', 10*1024)
     QueryCache.root_dir = g_conf.get('cache_root_dir', 'querycache')
     g_conf['global']['query_cache_map'] = query_cache_map = {} # startup_msg -> QueryCache
@@ -1318,6 +1328,9 @@ if __name__ == '__main__':
     cache_timeout_map = collections.defaultdict(int)
     
     misc_worker = pgmiscworker.start()
+    if g_conf.get('enable_ha', False):
+        mon_worker = pgmonitor(main_queue, g_conf.get('ha_after_fail_cnt', 10), g_conf.get('ha_check_interval', 3))
+        mon_worker.start(**cnn_param)
     
     listen = netutils.listener(g_conf['listen'], async=True)
     register_to_mpool(listen.getsockname())
@@ -1412,4 +1425,3 @@ if __name__ == '__main__':
                     fepool.remove(fobj)
                 fobj.close()
         process_main_queue()
-        process_ha()

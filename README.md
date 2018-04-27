@@ -18,6 +18,7 @@ pgstmtpool.py [args] 语句级别连接池
                                       需要指定密码，如果auth方法是md5则可以指定md5后的密码，否则指定明文密码。
         'enable_ha' : False           是否支持HA。
         'ha_after_fail_cnt' : 10      当主库连续出现指定次数的连接失败时启动主库切换。
+        'ha_check_interval' : 3       在开始下一次检查主库之前休眠多少秒。
         'lo_oid' : 9999               主库中大对象id，用于在从库中生成trigger文件。
         'trigger_file' : 'trigger'    从库的recovery.conf配置的触发promote的文件名。
         'cache_threshold_to_file' : n 当查询结果的大小超过此值时写到本地文件，单位是字节。

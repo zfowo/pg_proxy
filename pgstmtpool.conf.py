@@ -15,6 +15,7 @@ all = {
     'admin_cnn' : {'user':'zhb', 'password':''}, 
     'enable_ha' : True, 
     'ha_after_fail_cnt' : 10, 
+    'ha_check_interval' : 3, 
     'lo_oid' : 9999, 
     'trigger_file' : 'trigger', 
     # cache

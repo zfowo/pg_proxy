@@ -110,6 +110,12 @@ class SizedList():
         if self.end >= self.start:
             return self.end - self.start
         return self.modsz + (self.end - self.start)
+def remove_all(xl, v, exc=ValueError):
+    while True:
+        try:
+            xl.remove(v)
+        except exc:
+            return
 # main
 if __name__ == '__main__':
     pass
