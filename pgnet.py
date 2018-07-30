@@ -606,8 +606,9 @@ class QueryProcesser(MsgProcesser):
         got_ready = False
         for idx, m in enumerate(msg_list):
             if m.msg_type == p.MsgType.MT_DataRow:
-                self.rows.append(m.col_vals)
-                #self.rows.append(tuple(c if c is None else self.cnn.decode(c) for c in m))
+                if not self.discard_qr:
+                    self.rows.append(m.col_vals)
+                    #self.rows.append(tuple(c if c is None else self.cnn.decode(c) for c in m))
             elif m.msg_type == p.MsgType.MT_RowDescription:
                 self.rowdesc = list(c._replace(name=self.cnn.decode(c.name)) for c in m)
                 self.rows = []

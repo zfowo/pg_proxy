@@ -252,6 +252,25 @@ class Query(Msg):
 # 如果有错则服务器端会忽略后面的所有消息直到Sync，所以每个消息后面可以先检查是否收到ErrorResponse，如果没收到再发送后续的消息。
 # Sync会关闭事务(提交或回滚)，然后返回ReadyForQuery。每个Sync都会有一个ReadyForQuery对应。
 # 
+# Parse -> ParseComplete
+# Bind -> BindComplete
+# Describe (portal) -> NoData or RowDescription  如果不发送Describe那么就不会有NoData或者RowDescription
+# Execute -> CommandComplete or [DataRow... + CommandComplete], 也可能ErrorResponse
+# Close -> CloseComplete
+# Sync -> ReadyForQuery
+#
+# 如果是copy语句:
+#   对于Describe消息服务器会发回NoData而不是RowDescription。
+#   对于Execute消息:
+#     CopyIn  : 
+#       服务器发送CopyInResponse
+#       客户端发送CopyData... + CopyDone/CopyFail。服务器在接收CopyData时可能会发送ErrorResponse，然后就会忽略所有后面的消息直到Sync。
+#       服务器发送CommandComplete/ErrorResponse (分别对应于CopyDone和CopyFail)
+#     CopyOut : 
+#       服务器发送CopyOutResponse + CopyData... + CopyDone。同样服务器可能会发送ErrorResponse，然后就会忽略所有后面的消息直到Sync。
+#       服务器发送CommandComplete/ErrorResponse。
+#   前面是针对扩展查询协议，对于simple查询协议，服务器发送ErrorResponse后不需要客户端再发送Sync后才会发送ReadyForQuery。
+# 
 # param_cnt/param_oids指定参数的数据类型的oid，如果oid=0则系统会自己推导出类型。
 # 这里指定的参数个数可以小于查询语句中实际的参数个数，没有指定的参数由系统自己推导出类型。
 class Parse(Msg):
@@ -535,6 +554,8 @@ class CopyData(Msg):
 class CopyDone(Msg):
     pass
 # just base class for Copy In/Out/Both Response
+# col_cnt必须等于CopyData中的列数。
+# 如果overall_fmt=0也就是文本格式，那么col_fc_list中必须都是0。
 class CopyResponse(Msg):
     _formats = '>b >h -0>h'
     _fields = 'overall_fmt col_cnt col_fc_list'
