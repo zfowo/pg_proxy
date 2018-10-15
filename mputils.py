@@ -22,6 +22,7 @@ def assert_no_attr(obj, *attnames):
 # 如果iterfn/getfn为空串，则函数名为get_<restype>s和get_<restype>，如果restype=None则报错。
 # 如果restype为None，那么iterfn/getfn不能为空串，此时不会创建namedtuple类型。
 # f对属性中的每个数据先做处理一下再传给restype或者直接返回。
+# 
 def SeqAccess(cls=None, *, attname, iterfn=None, getfn=None, restype=None, resfields='', f=lambda x:x):
     if cls is None:
         return functools.partial(SeqAccess, attname=attname, iterfn=iterfn, getfn=getfn, restype=restype, resfields=resfields, f=f)
