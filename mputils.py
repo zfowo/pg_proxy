@@ -17,6 +17,7 @@ def assert_no_attr(obj, *attnames):
     for an in attnames:
         if hasattr(obj, an):
             raise ValueError('%s already has attribute %s' % (obj, an))
+# 
 # 如果iterfn/getfn为None，那么就用__iter__/__getitem__，如果getfn是None，那么还要增加__len__函数。
 # 如果iterfn/getfn为空串，则函数名为get_<restype>s和get_<restype>，如果restype=None则报错。
 # 如果restype为None，那么iterfn/getfn不能为空串，此时不会创建namedtuple类型。
