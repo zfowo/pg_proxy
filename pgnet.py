@@ -432,7 +432,7 @@ class pgtrans():
 # 另外rowdesc中的列名可能是有同名的。
 class QueryResult():
     class rowtype():
-        # r : row data。如果是tuple/list类型则是解析过的，如果是str类型则是原始的DataRow消息包。
+        # r : row data。如果是tuple/list类型则是解析过的，如果是bytes类型则是原始的DataRow消息包。
         # qres : QueryResult which contains the row data
         def __init__(self, r, qres):
             self.r = r
@@ -452,6 +452,8 @@ class QueryResult():
                 raise AttributeError('no attribute %s' % name)
             return self[name]
         def __repr__(self):
+            if type(self.r) is bytes: # 原始DataRow消息包
+                return str(self.r);
             ret = '('
             for idx, _ in enumerate(self.qres.rowdesc):
                 ret += '%s, ' % (self[idx], )
