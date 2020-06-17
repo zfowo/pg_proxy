@@ -3,7 +3,7 @@
 -- 用plpython3u编写，因为需要读写本地文件，以及访问pg的内部函数(非pg_proc函数)。
 -- 在创建好下面这些函数后，必须从PUBLIC收回所有权限。revoke all on function ... from public
 -- 
--- 当主库down掉后，需要执行下面这些：
+-- 当主库down掉后，需要执行下面这些操作：
 --   1. 把数据最新的一个从库提升为主库。
 --   2. 调用z_change_recovery_conf修改其他从库的recovery.conf，把primary_conninfo中的host/port指向新的主库。
 --   3. 用z_change_recovery_conf的返回值在新的主库上创建其他从库用到的物理复制slot。
