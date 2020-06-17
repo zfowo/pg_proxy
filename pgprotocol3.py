@@ -580,7 +580,11 @@ class DataRow(Msg):
     _formats = '>24X'
     _fields = 'col_vals'
     def _parse(self):
-        self.col_vals, sz = get_24X(self.buf, self.sidx + 5)
+        colcnt = get_short(self.buf, self.idx + 5)
+        if (colcnt < 0): # is unsaferow
+            self.col_vals = self.buf[self.sidx:self.eidx]
+        else:
+            self.col_vals, sz = get_24X(self.buf, self.sidx + 5)
     def _tobytes(self):
         return put_24X(self.col_vals)
     # 参数必须是字节串或者None

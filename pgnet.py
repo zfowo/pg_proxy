@@ -99,7 +99,10 @@ class connbase():
             fe = self.is_fe()
             prefix_str = 'BE' if fe else 'FE'
             for msg in msg_list:
-                print('%s: %s' % (prefix_str, msg.to_msg(fe=not fe)))
+                if type(msg) is p.RawMsg and msg.msg_type == p.BeMsgType.MT_DataRow:
+                    print('%s: DataRow(%s)' % (prefix_str, bytes(msg)));
+                else:
+                    print('%s: %s' % (prefix_str, msg.to_msg(fe=not fe)))
         if msg_list:
             if type(msg_list) is msgs_type:
                 self.send_buf += bytes(msg_list)
@@ -429,7 +432,7 @@ class pgtrans():
 # 另外rowdesc中的列名可能是有同名的。
 class QueryResult():
     class rowtype():
-        # r : row data
+        # r : row data。如果是tuple/list类型则是解析过的，如果是str类型则是原始的DataRow消息包。
         # qres : QueryResult which contains the row data
         def __init__(self, r, qres):
             self.r = r
