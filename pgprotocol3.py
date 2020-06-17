@@ -281,7 +281,7 @@ class Parse(Msg):
         self.stmt, sidx = get_cstr(self.buf, sidx)
         self.query, sidx = get_cstr(self.buf, sidx)
         self.param_cnt = get_short(self.buf, sidx); sidx += 2
-        self.params = get_nint(self.buf, sidx, self.param_cnt)
+        self.param_oids = get_nint(self.buf, sidx, self.param_cnt)
     def _tobytes(self):
         return b''.join((self.stmt, b'\x00', self.query, b'\x00', put_short(self.param_cnt), put_nint(self.param_oids)))
     # query/stmt必须是格式为client_encoding的字节串。其他地方也一样。
@@ -302,7 +302,7 @@ class Bind(Msg):
         self.fc_list = get_nshort(self.buf, sidx, self.fc_cnt); sidx += 2*self.fc_cnt
         self.params, sz = get_24X(self.buf, sidx); sidx += sz
         self.res_fc_cnt = get_short(self.buf, sidx); sidx += 2
-        self.res_fc_list = get_nshort(self.buf, sidx)
+        self.res_fc_list = get_nshort(self.buf, sidx, self.res_fc_cnt)
     def _tobytes(self):
         return b''.join((self.portal, b'\x00', self.stmt, b'\x00', put_short(self.fc_cnt), put_nshort(self.fc_list), 
                         put_24X(self.params), put_short(self.res_fc_cnt), put_nshort(self.res_fc_list)))
@@ -315,12 +315,21 @@ class Bind(Msg):
                    params=params, res_fc_cnt=len(res_fc_list), res_fc_list=res_fc_list)
 # 当需要创建大量Bind消息然后发送出去的话，用该类可以提高性能。
 class SimpleBind():
-    def __init__(self, params):
+    def __init__(self, params, resfc = None):
         self.params = params
+        self.resfc = resfc
+        if resfc is not None and type(resfc) is not int:
+            raise ValueError('resfc should be int value or None')
     def tobytes(self):
-        data = b'\x00\x00\x00\x00' + put_24X(self.params) + b'\x00\x00'
+        data = b'\x00\x00\x00\x00' + put_24X(self.params)
+        if self.resfc is None:
+            data = data + b'\x00\x00'
+        else:
+            data = data + b'\x00\x01' + struct.pack('>h', self.resfc);
         header = MsgType.MT_Bind + struct.pack('>i', len(data)+4)
         return header + data
+    def __bytes__(self):
+        return self.tobytes()
 class Execute(Msg):
     _formats = '>x >i'
     _fields = 'portal max_num'
@@ -329,7 +338,7 @@ class Execute(Msg):
         self.portal, sidx = get_cstr(self.buf, sidx)
         self.max_num = get_int(self.buf, sidx)
     def _tobytes(self):
-        return b''.join((self.portal, b'\x00', put_nint(self.max_num)))
+        return b''.join((self.portal, b'\x00', put_int(self.max_num)))
     @classmethod
     def make(cls, portal=b'', max_num=0):
         return cls(portal=portal, max_num=max_num)
@@ -580,7 +589,7 @@ class DataRow(Msg):
     _formats = '>24X'
     _fields = 'col_vals'
     def _parse(self):
-        colcnt = get_short(self.buf, self.idx + 5)
+        colcnt = get_short(self.buf, self.sidx + 5)
         if (colcnt < 0): # is unsaferow
             self.col_vals = self.buf[self.sidx:self.eidx]
         else:

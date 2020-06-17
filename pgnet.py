@@ -330,17 +330,17 @@ class pgconn(beconn):
     # 
     # 当args_list很大时，发送消息后必须检查是否可读，否则会发不了数据，因为服务器端也会不停的往客户端写消息，
     # 当服务器端写buffer满了之后就阻塞了，这样就读不了客户端发送的消息。造成死锁。
-    def query2(self, sql, args_list, discard_qr=False):
+    def query2(self, sql, args_list, discard_qr=False, resfc=None):
         processer = Query2Processer(self, discard_qr)
         sql = self.encode(sql)
         self.write_msgs((p.Parse.make(sql),))
         processer.process()
         for args in args_list:
-            x = (self.encode(arg) for arg in args)
+            x = [self.encode(arg) for arg in args]
             if discard_qr:
-                self.write_msgs((p.SimpleBind(x), p.Execute.Default))
+                self.write_msgs((p.SimpleBind(x, resfc), p.Execute.Default))
             else:
-                self.write_msgs((p.SimpleBind(x), p.Describe.DefaultPortal, p.Execute.Default))
+                self.write_msgs((p.SimpleBind(x, resfc), p.Describe.DefaultPortal, p.Execute.Default))
             processer.process()
         self.write_msgs((p.Close.stmt(), p.Sync()))
         while not processer.process(synced=True):
